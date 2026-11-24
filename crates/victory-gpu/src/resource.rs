@@ -1125,7 +1125,9 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    pub(crate) state: std::sync::atomic::AtomicU32,
+    /// The states its subresources are in when the last list submitted so
+    /// far has run.
+    pub(crate) states: std::sync::Mutex<crate::states::States>,
     /// The bytes the host gives it.
     bytes: u64,
     /// Whether its contents come from title memory ([`fills`]): counted in
@@ -1553,10 +1555,17 @@ impl HostTexture {
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
             texture,
-            state: std::sync::atomic::AtomicU32::new(state),
+            states: std::sync::Mutex::new(crate::states::States::All(state)),
             bytes,
             filled: false,
         }
+    }
+
+    /// The state of its first subresource, which is that of all of it where
+    /// they are not told apart.
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(crate) fn state(&self) -> u32 {
+        self.states.lock().unwrap_or_else(|e| e.into_inner()).at(0)
     }
 }
 
@@ -1586,10 +1595,21 @@ pub(crate) fn placed_textures() -> u64 {
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let (host, _) = hosted(this, true)?;
-    let before = host
-        .state
-        .swap(wanted, std::sync::atomic::Ordering::Relaxed);
+    let mut states = host.states.lock().unwrap_or_else(|e| e.into_inner());
+    let before = std::mem::replace(&mut *states, crate::states::States::All(wanted)).at(0);
     (before != wanted).then(|| (host.texture.as_raw(), before))
+}
+
+/// Whether `this`, which may be anything, is a resource of ours.
+#[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    let at = this.cast::<usize>();
+    !this.is_null()
+        && at.is_aligned()
+        && crate::texture::committed(this.cast(), size_of::<usize>())
+        // SAFETY: committed memory, aligned; a resource begins with the
+        // address of its functions.
+        && unsafe { at.read() } == RESOURCE_FUNCTIONS.0.as_ptr() as usize
 }
 
 /// The host GPU's copy of a title resource, if it has one: made now if
@@ -2906,7 +2926,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_stencil_planes_twin_reaches_the_plane() {
-        use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
         let Some(host) = crate::host::host() else {
@@ -3051,7 +3070,7 @@ mod tests {
         host.execute(&[&list]);
 
         // The stencil plane read back from the state the list left it in.
-        let state = host_copy(depth).unwrap().state.load(Relaxed);
+        let state = host_copy(depth).unwrap().state();
         let state = D3D12_RESOURCE_STATES(state as i32);
         let back = host.new_list().unwrap();
         // SAFETY: an open list and live resources; a whole subresource.
@@ -3095,7 +3114,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_depth_planes_twin_is_drawn_into_the_plane() {
-        use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
         use windows::Win32::Graphics::Direct3D12::*;
@@ -3336,7 +3354,7 @@ float4 lit() : SV_Target { return 1.0; }
                 host.device.CreateGraphicsPipelineState(&desc).unwrap();
             (signature, pipeline)
         };
-        let state = host_copy(depth).unwrap().state.load(Relaxed);
+        let state = host_copy(depth).unwrap().state();
         let state = D3D12_RESOURCE_STATES(state as i32);
         let colour = host.rtv(Some(&target), None);
         let depth_view = host.dsv(

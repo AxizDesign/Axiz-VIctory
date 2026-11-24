@@ -381,6 +381,19 @@ pub(crate) fn release_held(all: bool) {
                             // until they are settled.
                             host.execute_late(lists, order);
                         } else {
+                            // With the parts behind it whose waits are met
+                            // already, where they read nothing it writes:
+                            // one wait for the card, one copy back.
+                            let (mut lists, mut order) = (lists, order);
+                            while !all && joinable(&lists, &order, &held) {
+                                let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
+                                held.drain(..waits);
+                                let Held::Run(more, then) = held.remove(0) else {
+                                    unreachable!("a run, as `joinable` saw");
+                                };
+                                order.extend(then.into_iter().map(|i| i + lists.len()));
+                                lists.extend(more);
+                            }
                             let ran = {
                                 let runs: Vec<&crate::host::HostList> =
                                     order.iter().map(|&i| lists[i].host()).collect();
@@ -427,6 +440,23 @@ pub(crate) fn release_held(all: bool) {
             break;
         }
     }
+}
+
+/// Whether what a queue holds begins with a submission that may run together
+/// with `lists`: every wait before it is met, and it can be prepared before
+/// they have run.
+#[cfg(windows)]
+fn joinable(lists: &[crate::list::Detached], order: &[usize], held: &[Held]) -> bool {
+    let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
+    let Some(Held::Run(next, then)) = held.get(waits) else {
+        return false;
+    };
+    if !held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met())) {
+        return false;
+    }
+    let first: Vec<_> = order.iter().map(|&i| lists[i].host()).collect();
+    let second: Vec<_> = then.iter().map(|&i| next[i].host()).collect();
+    crate::host::independent(&first, &second)
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
@@ -839,7 +869,7 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         #[cfg(feature = "diagnostics")]
-        let state = texture.state.load(Ordering::Relaxed);
+        let state = texture.state();
         let shown = host.present(&texture, frame);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

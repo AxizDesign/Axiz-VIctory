@@ -15,7 +15,7 @@
 //! descriptors, buffer views in tables); buffers read through directly
 //! indexed heaps keep what their first use copied.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -2653,21 +2653,82 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+///
+/// Buffers lie inside others, and a search for the innermost one that holds
+/// a range walks down from the last that starts at or below it: a big buffer
+/// with many in it is far down (the walk was given up after 64, and the
+/// range then had a window of its own beside the big buffer's copy). So they
+/// are also kept by size, where one that holds a range starts at most its
+/// own size below it.
+struct Buffers {
+    entries: BTreeMap<(u64, usize), Entry>,
+    /// By the power of two their length is at least.
+    sizes: [BTreeSet<(u64, usize)>; 64],
+}
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
+impl Buffers {
+    const fn new() -> Self {
+        Buffers {
+            entries: BTreeMap::new(),
+            sizes: [const { BTreeSet::new() }; 64],
+        }
+    }
+
+    fn class(start: u64, end: u64) -> usize {
+        (end - start).max(1).ilog2() as usize
+    }
+
+    fn insert(&mut self, key: (u64, usize), end: u64) {
+        self.remove(&key);
+        self.sizes[Self::class(key.0, end)].insert(key);
+        self.entries.insert(key, Entry { end, shadow: None });
+    }
+
+    fn remove(&mut self, key: &(u64, usize)) {
+        if let Some(old) = self.entries.remove(key) {
+            self.sizes[Self::class(key.0, old.end)].remove(key);
+        }
+    }
+
+    /// The buffers that may reach `from`, of each size, last started first.
+    fn reaching(&self, from: u64, before: (u64, usize)) -> impl Iterator<Item = &(u64, usize)> {
+        self.sizes.iter().enumerate().filter(|(_, set)| !set.is_empty()).flat_map(move |(class, set)| {
+            // Shorter than twice the class's size.
+            let most = 2u64.checked_shl(class as u32).unwrap_or(u64::MAX);
+            let low = (from.saturating_sub(most), 0);
+            set.range(low.min(before)..=before).rev()
+        })
+    }
+
+    /// The last started buffer that holds `[address, end)`.
+    fn holding(&self, address: u64, end: u64) -> Option<(u64, usize)> {
+        self.reaching(end, (address, usize::MAX))
+            .filter(|key| self.entries.get(key).is_some_and(|e| e.end >= end))
+            .max()
+            .copied()
+    }
+
+    /// The buffers that have bytes of `[from, to)`.
+    fn touching(&self, from: u64, to: u64) -> Vec<(u64, usize)> {
+        if from >= to {
+            return Vec::new();
+        }
+        self.reaching(from, (to - 1, usize::MAX))
+            .filter(|key| self.entries.get(key).is_some_and(|e| e.end > from))
+            .copied()
+            .collect()
+    }
+}
+
+static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers::new());
+
+fn buffers() -> std::sync::MutexGuard<'static, Buffers> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
-        (start, resource),
-        Entry {
-            end: start + len,
-            shadow: None,
-        },
-    );
+    buffers().insert((start, resource), start + len);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
@@ -2679,12 +2740,10 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end > address)
-        .map(|(k, e)| (k.0, e.end - k.0))
+    let map = buffers();
+    let key = map.holding(address, address + 1)?;
+    let end = map.entries.get(&key)?.end;
+    Some((key.0, end - key.0))
 }
 
 /// Title memory `[at, at + len)` is about to show something else or be
@@ -2704,10 +2763,11 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
-        // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+        for key in map.touching(at, end) {
+            if let Some(entry) = map.entries.get_mut(&key)
+                && entry.shadow.as_ref().is_some_and(|s| s.place.is_some())
+            {
                 gone.extend(entry.shadow.take());
             }
         }
@@ -2723,7 +2783,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
+    let mut spans: Vec<(u64, u64, bool)> = buffers().entries.iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
@@ -2764,17 +2824,12 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    let key = map.holding(address, end);
     let Some(key) = key else {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
-    let entry = map.get_mut(&key)?;
+    let entry = map.entries.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -3157,6 +3212,7 @@ mod window_tests {
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
     let mut all: Vec<(u64, u64, u64)> = buffers()
+        .entries
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
@@ -3183,4 +3239,38 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod buffers_tests {
+    use super::Buffers;
+
+    /// The innermost buffer that holds a range is found however many start
+    /// between it and the range; one that does not reach its end is not it.
+    #[test]
+    fn a_big_buffer_is_found_behind_many_small_ones() {
+        let mut b = Buffers::new();
+        b.insert((0x1000_0000, 1), 0x2000_0000);
+        for n in 0..1000u64 {
+            b.insert((0x1000_0000 + n * 0x100, 2 + n as usize), 0x1000_0000 + n * 0x100 + 0x80);
+        }
+        assert_eq!(b.holding(0x1800_0000, 0x1800_1000), Some((0x1000_0000, 1)));
+        assert_eq!(b.holding(0x1000_0110, 0x1000_0120), Some((0x1000_0100, 3)), "the innermost");
+        assert_eq!(b.holding(0x1000_0110, 0x1000_0200), Some((0x1000_0000, 1)), "past its end");
+        assert_eq!(b.holding(0x1fff_fff0, 0x2000_0001), None);
+        assert_eq!(b.holding(0x0fff_ffff, 0x1000_0001), None);
+        // Two at one place: the later resource, as before.
+        b.insert((0x3000_0000, 7), 0x3000_1000);
+        b.insert((0x3000_0000, 9), 0x3000_1000);
+        assert_eq!(b.holding(0x3000_0000, 0x3000_0010), Some((0x3000_0000, 9)));
+        b.remove(&(0x3000_0000, 9));
+        assert_eq!(b.holding(0x3000_0000, 0x3000_0010), Some((0x3000_0000, 7)));
+        // One registered anew with another length.
+        b.insert((0x3000_0000, 7), 0x3000_0008);
+        assert_eq!(b.holding(0x3000_0000, 0x3000_0010), None);
+        let mut touched = b.touching(0x1000_0070, 0x1000_0180);
+        touched.sort_unstable();
+        assert_eq!(touched, [(0x1000_0000, 1), (0x1000_0000, 2), (0x1000_0100, 3)]);
+        assert_eq!(b.holding(u64::MAX - 8, u64::MAX), None);
+    }
 }

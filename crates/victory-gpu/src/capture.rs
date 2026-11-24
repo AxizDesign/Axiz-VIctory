@@ -360,7 +360,6 @@ pub(crate) fn note_target(resource: crate::object::This) {
 
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
@@ -371,7 +370,7 @@ pub(crate) fn dump_targets(frame: u64) {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
-        let state = copy.state.load(Relaxed);
+        let state = copy.state();
         dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
     }
 }

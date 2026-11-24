@@ -93,6 +93,19 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
     .host()
 }
 
+/// The comparison sampler that filters as `desc` does, with its function
+/// (never, if it has none).
+pub(crate) fn comparison(desc: D3D12_SAMPLER_DESC) -> D3D12_SAMPLER_DESC {
+    // The reduction is in bits 7 and 8: none, comparison, minimum, maximum.
+    const REDUCTION: i32 = 3 << 7;
+    const COMPARISON: i32 = 1 << 7;
+    D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER(desc.Filter.0 & !REDUCTION | COMPARISON),
+        ComparisonFunc: D3D12_COMPARISON_FUNC(desc.ComparisonFunc.0.max(1)),
+        ..desc
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +128,11 @@ mod tests {
         assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
         w[16] = 1;
         assert_eq!(console(&w).Filter.0, 0x5);
+        // Its comparison sampler filters alike, whatever the reduction was.
+        assert_eq!(comparison(console(&w)).Filter.0, 0x85);
+        w[16] = 4;
+        w[5] = 2;
+        let c = comparison(console(&w));
+        assert_eq!((c.Filter.0, c.ComparisonFunc), (0x85, D3D12_COMPARISON_FUNC_LESS_EQUAL));
     }
 }

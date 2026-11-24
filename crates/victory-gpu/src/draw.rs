@@ -14,6 +14,7 @@ use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+use crate::states::Subs;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -157,7 +158,7 @@ pub(crate) struct State {
     vertex: [VertexView; 32],
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
-    targets: Vec<usize>,
+    targets: Vec<(usize, Subs)>,
     depth: usize,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
@@ -393,9 +394,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.constants(address, len)
 }
 
 macro_rules! once {
@@ -539,7 +538,7 @@ impl State {
                 rtvs.push(host.rtv(None, Some(&null)));
                 continue;
             };
-            self.targets.push(record.resource as usize);
+            self.targets.push((record.resource as usize, record.target_subs(texture)));
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
@@ -761,6 +760,95 @@ impl State {
             .find(|h| h.index(handle).is_some())
     }
 
+    /// `ClearUnorderedAccessView`: fills what the view at `handle` (in a
+    /// heap that is set; `cpu` is the same one for the CPU) shows with
+    /// `values` (floats or integers), or the `rects` of it. False if there
+    /// is nothing of the host's to clear.
+    pub(crate) fn clear_unordered(
+        &mut self,
+        list: &HostList,
+        (handle, cpu): (u64, u64),
+        values: [u32; 4],
+        float: bool,
+        rects: &[RECT],
+    ) -> bool {
+        let Some(view) = crate::descriptor::view(handle).or_else(|| crate::descriptor::view(cpu)) else {
+            return false;
+        };
+        if !matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
+            return false;
+        }
+        let Some(heap) = self.heap_of(handle).filter(|h| !h.samplers()) else {
+            return false;
+        };
+        let Some(host) = heap.host() else {
+            return false;
+        };
+        // The view in a slot of the host heap for the clear, and one the
+        // CPU reads it from.
+        let Some(slot) = host.dynamic(1) else {
+            return false;
+        };
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, slot, 1));
+        let Some((cpu, resource)) = crate::descriptor::host::clear_view(&view) else {
+            return false;
+        };
+        host.make_at(slot, &view);
+        STORES.set(true);
+        readable(list, ResourceType::Uav, &view);
+        self.set_host_heaps(list);
+        list.keep(&resource);
+        // Buffers without a format are raw on the host, which has integer
+        // clears only of those: of the same bits.
+        // SAFETY (the query): a live resource.
+        let buffer = unsafe { resource.GetDesc() }.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+        let raw = buffer && !crate::descriptor::host::typed_view(&view);
+        // SAFETY: an open list with the slot's heap set; both descriptors
+        // are of the resource.
+        unsafe {
+            if float && !raw {
+                let values = values.map(f32::from_bits);
+                list.list.ClearUnorderedAccessViewFloat(
+                    host.gpu_handle(slot),
+                    cpu,
+                    &resource,
+                    &values,
+                    rects,
+                );
+            } else {
+                list.list.ClearUnorderedAccessViewUint(
+                    host.gpu_handle(slot),
+                    cpu,
+                    &resource,
+                    &values,
+                    rects,
+                );
+            }
+        }
+        // It is there for whatever the title's next barrier waits for.
+        list.twins_written();
+        true
+    }
+
+    /// Gives the host list the host heaps of the title's, if it has others.
+    fn set_host_heaps(&mut self, list: &HostList) {
+        if self.host_heaps == self.heaps {
+            return;
+        }
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .filter_map(|&h| crate::descriptor::heap(h as This).host())
+            .map(|h| Some(h.heap.clone()))
+            .collect();
+        heaps.iter().flatten().for_each(|h| list.keep(h));
+        // SAFETY: an open list and shader-visible heaps.
+        unsafe { list.list.SetDescriptorHeaps(&heaps) };
+        self.host_heaps = self.heaps;
+        self.host_roots = [0; 2];
+    }
+
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
@@ -830,8 +918,8 @@ impl State {
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+        for (t, subs) in &self.targets {
+            list.ensure(*t as This, subs, RENDER_TARGET);
         }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
@@ -867,20 +955,7 @@ impl State {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
-        }
+        self.set_host_heaps(list);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {
@@ -1752,7 +1827,7 @@ impl State {
                     format!("{t:#x} {}x{} f{}", d.Width, d.Height, d.Format.0)
                 })
             };
-            let targets: Vec<String> = self.targets.iter().filter_map(|&t| described(t)).collect();
+            let targets: Vec<String> = self.targets.iter().filter_map(|t| described(t.0)).collect();
             let _ = write!(text, " targets {targets:?} depth {:?} state [{}]", described(self.depth), p.state);
             // The title's scissor and viewport at this draw (the first of
             // each): the title draws what it sees through a
@@ -2029,11 +2104,10 @@ impl State {
                             host.constant_at(index, 0, 0);
                             continue;
                         }
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        let Some(gpu) = list.constants(address, u64::from(size)) else {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
@@ -2084,7 +2158,7 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_made(t as This))
+            .filter_map(|t| crate::resource::host_made(t.0 as This))
             .map(|t| {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
@@ -2477,8 +2551,8 @@ impl State {
                 max,
                 &bounded,
                 at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                counter.is_some().then_some(&bounded),
+                crate::indirect::count_at(stride, max),
             )
         };
         if kind == MESH {
@@ -2593,7 +2667,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
     }
     match (view, kind) {
-        (View::Shader(resource, _), ResourceType::Srv) => {
+        (View::Shader(resource, desc), ResourceType::Srv) => {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
@@ -2616,7 +2690,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            let subs = crate::descriptor::host::view_subs(*resource as This, desc.as_ref(), false);
+            // (A depth target only tested is read whole.)
+            let subs = if state == SHADER_RESOURCE { subs } else { Subs::All };
+            list.ensure(*resource as This, &subs, state);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -2630,12 +2707,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 }
             }
         }
-        (View::Unordered(resource, _, _), ResourceType::Uav) => {
+        (View::Unordered(resource, _, desc), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
-                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+                let subs = crate::descriptor::host::view_subs(*resource as This, desc.as_ref(), true);
+                list.ensure(*resource as This, &subs, UNORDERED_ACCESS);
             }
         }
         _ => {}

@@ -549,6 +549,15 @@ pub(crate) fn probe_view_limit() {
     });
 }
 
+/// A host sampler heap has its title's samplers in the first slots and the
+/// same ones as comparison samplers this many further (2,048 slots are the
+/// most the host has): the console compares when the instruction says so,
+/// with any sampler, and the host only with a comparison one.
+/// shortcut: the translator does not pick the second ones yet, so the first
+/// ones still are comparison samplers where [`crate::sampler`] takes them
+/// for such; once it does, they are plain (`Fields::host`).
+pub(crate) const COMPARISON_SLOTS: u32 = 1024;
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -582,7 +591,14 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
+        let extra = if !sampler {
+            DYNAMIC
+        } else if count <= COMPARISON_SLOTS {
+            2 * COMPARISON_SLOTS - count
+        } else {
+            tracing::warn!(count, "a sampler heap too big for the host to have each sampler as a comparison one too");
+            0
+        };
         let (heap, count, size) = match make(count + extra) {
             Ok(heap) => (heap, count, count + extra),
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
@@ -633,7 +649,7 @@ impl HostHeap {
             cpu,
             step,
             count,
-            dynamic: extra,
+            dynamic: if sampler { 0 } else { extra },
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             copies_run: Mutex::default(),
@@ -1097,6 +1113,30 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// Makes the comparison sampler that goes with the sampler in slot
+    /// `index` (view heaps have none): [`COMPARISON_SLOTS`] further.
+    fn make_comparison(&self, index: u32, view: &View) {
+        if !self.sampler || self.count > COMPARISON_SLOTS || index >= self.count {
+            return;
+        }
+        let desc = match view {
+            // SAFETY: 13 words in the host's layout.
+            View::Sampler(words) => unsafe {
+                std::ptr::from_ref(words)
+                    .cast::<D3D12_SAMPLER_DESC>()
+                    .read_unaligned()
+            },
+            View::ConsoleSampler(words) => crate::sampler::console(words),
+            _ => return,
+        };
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our sampler heap, which has twice the slots.
+        unsafe {
+            host.device
+                .CreateSampler(&crate::sampler::comparison(desc), self.cpu(index + COMPARISON_SLOTS))
+        };
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
@@ -1322,6 +1362,7 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+            self.make_comparison(index, &view);
         }
         Some(view)
     }
@@ -2215,6 +2256,93 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Which subresources of a title texture's host copy a shader view or
+/// (`unordered`) unordered access view with description `desc` is of.
+pub(crate) fn view_subs(
+    resource: crate::object::This,
+    desc: Option<&[u32; 10]>,
+    unordered: bool,
+) -> crate::states::Subs {
+    use crate::states::{Subs, shape};
+    let Some(w) = desc else {
+        return Subs::All;
+    };
+    let Some(of) = crate::resource::host_resource(resource)
+        // SAFETY: a live resource.
+        .and_then(|t| shape(&unsafe { t.GetDesc() }))
+    else {
+        return Subs::All;
+    };
+    let (mips, slices) = if unordered {
+        // Format, dimension, then mip, first slice and slices.
+        match w[1] {
+            2 | 4 => ((w[2], 1), (0, 1)),
+            3 | 5 => ((w[2], 1), (w[3], w[4])),
+            8 => ((w[2], 1), (0, 1)),
+            _ => return Subs::All,
+        }
+    } else {
+        // Format, dimension, mapping, a pad, then first mip and mips, first
+        // slice and slices.
+        match w[1] {
+            2 | 4 => ((w[4], w[5]), (0, 1)),
+            3 | 5 => ((w[4], w[5]), (w[6], w[7])),
+            6 => ((0, 1), (0, 1)),
+            7 => ((0, 1), (w[4], w[5])),
+            8 => ((w[4], w[5]), (0, 1)),
+            9 => ((w[4], w[5]), (0, 6)),
+            10 => ((w[4], w[5]), (w[6], w[7].saturating_mul(6))),
+            _ => return Subs::All,
+        }
+    };
+    Subs::part(mips, slices, of)
+}
+
+/// Whether a view names a format.
+pub(crate) fn typed_view(view: &View) -> bool {
+    match view {
+        View::Shader(_, desc) | View::Unordered(_, _, desc) => desc.is_some_and(|d| !matches!(d[0], 0 | 39)),
+        View::Placed(_, _, desc) => !matches!(desc[0], 0 | 39),
+        _ => false,
+    }
+}
+
+/// Unordered access `view` in a slot only the CPU reads, as a clear wants it
+/// beside the shader-visible one, and the resource it views. The slot is one
+/// of a ring: a clear takes the descriptor when it is recorded.
+pub(crate) fn clear_view(view: &View) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource)> {
+    const SLOTS: u32 = 256;
+    static RING: std::sync::OnceLock<Option<(ID3D12DescriptorHeap, u32)>> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let (heap, step) = RING
+        .get_or_init(|| {
+            let host = host()?;
+            // SAFETY: plain creation.
+            unsafe {
+                let heap = host
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: SLOTS,
+                        ..Default::default()
+                    })
+                    .ok()?;
+                let step = host
+                    .device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                Some((heap, step))
+            }
+        })
+        .as_ref()?;
+    let slot = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % SLOTS;
+    // SAFETY: a live heap.
+    let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+    let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: start.ptr + slot as usize * *step as usize,
+    };
+    Some((at, make(view, at)??))
+}
+
 /// A view that reads zeros, for slots whose view the host cannot make.
 /// shortcut: slots with no view at all (kind unknown) get this null 2D
 /// view; null buffer views there did not stop the world's low-address
@@ -2499,5 +2627,26 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// Every sampler of a heap has its comparison one in the same heap, and
+    /// the device takes both.
+    #[test]
+    fn samplers_have_comparison_ones() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        for count in [1, 16, COMPARISON_SLOTS] {
+            let heap = HostHeap::new(true, count).unwrap();
+            // SAFETY: a live heap.
+            assert_eq!(unsafe { heap.heap.GetDesc() }.NumDescriptors, 2 * COMPARISON_SLOTS);
+            assert_eq!(heap.dynamic(1), None);
+            let mut words = [0u32; 27];
+            words[6..9].copy_from_slice(&[3, 3, 3]);
+            heap.make_comparison(count - 1, &View::ConsoleSampler(words));
+        }
+        assert!(HostHeap::new(true, 2 * COMPARISON_SLOTS).is_some(), "without comparison ones");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
