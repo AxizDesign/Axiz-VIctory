@@ -751,6 +751,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-pso"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "miniz_oxide",
+ "serde",
+ "tempfile",
+ "toml",
+ "victory-core",
+ "victory-shader",
+ "windows",
+]
+
+[[package]]
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
