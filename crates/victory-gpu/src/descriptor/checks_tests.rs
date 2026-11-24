@@ -127,7 +127,7 @@ fn views_are_cut_to_the_texture_or_refused() {
         let mut v = view(first, n);
         let ok = shader_view_fits(&d, &mut v);
         // SAFETY: a 2D view.
-        assert_eq!(ok.then(|| unsafe { v.Anonymous.Texture2D.MipLevels }), left);
+        assert_eq!(ok.then_some(unsafe { v.Anonymous.Texture2D.MipLevels }), left);
     }
     // Another dimension, samples, too few layers for a cube.
     let mut v = view(0, 1);
