@@ -9213,10 +9213,18 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
+            // The channels the mask names come from consecutive VGPRs; the
+            // others are stored as zero. With 16-bit data only the count of
+            // the mask's bits is said to matter, so a mask other than its
+            // low bits, which compilers do not write, is left refused.
+            // shortcut: stored as floats whatever the view's format is (the
+            // console converts by it); integer views keep the bits on the
+            // adapters tested (`image_store_tests`).
+            if *dmask == 0 || *dmask > 0xF {
+                return Err("an image store without channels");
+            }
+            if *d16 && *dmask & (*dmask + 1) != 0 {
+                return Err("a 16-bit image store of some channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -9227,7 +9235,13 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
-            for k in 0..4u8 {
+            let mut named = 0..4u8;
+            for ch in 0..4u8 {
+                if dmask >> ch & 1 == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
+                let k = named.next().unwrap_or(0);
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;

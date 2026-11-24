@@ -990,6 +990,9 @@ pub enum View<'a> {
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
+    /// A texture UAV (width, height) in a format of this many bytes a texel,
+    /// zeroed; rows come back padded to a dword.
+    FormatUav(u32, u32, DXGI_FORMAT, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A constant buffer of these dwords.
@@ -1153,6 +1156,8 @@ impl Host {
             let mut keep = Vec::new();
             // UAVs: (resource, dwords or texture size, readback buffer).
             let mut uavs = Vec::new();
+            // Formats and texel bytes of `View::FormatUav`s, by place in `uavs`.
+            let mut texels = std::collections::HashMap::new();
             for (i, v) in d.views.iter().enumerate() {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
@@ -1298,6 +1303,27 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 1, rb));
                     }
+                    View::FormatUav(w, h, format, texel) => {
+                        let t = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &texture_as(
+                                w,
+                                h,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                format,
+                            ),
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )?;
+                        dev.CreateUnorderedAccessView(&t, None, None, at);
+                        let pitch = (w * texel).next_multiple_of(256);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        texels.insert(uavs.len(), (format, texel));
+                        uavs.push((t, Some((w, h)), texel.div_ceil(4), rb));
+                    }
                     View::Cbv(data) => {
                         let b = upload(data)?;
                         dev.CreateConstantBufferView(
@@ -1394,7 +1420,7 @@ impl Host {
             }
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
-            for (r, size, n, rb) in &uavs {
+            for (k, (r, size, n, rb)) in uavs.iter().enumerate() {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
                     r,
@@ -1402,14 +1428,15 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
                 match size {
-                    Some((w, h)) => list.CopyTextureRegion(
-                        &footprint_as(rb, *w, *h, *n),
-                        0,
-                        0,
-                        0,
-                        &subresource(r),
-                        None,
-                    ),
+                    Some((w, h)) => {
+                        let mut to = footprint_as(rb, *w, *h, *n);
+                        if let Some(&(format, texel)) = texels.get(&k) {
+                            let f = &mut to.Anonymous.PlacedFootprint.Footprint;
+                            f.Format = format;
+                            f.RowPitch = (w * texel).next_multiple_of(256);
+                        }
+                        list.CopyTextureRegion(&to, 0, 0, 0, &subresource(r), None);
+                    }
                     None => list.CopyBufferRegion(rb, 0, r, 0, u64::from(*n) * 4),
                 }
             }
@@ -1424,18 +1451,18 @@ impl Host {
                 std::thread::yield_now();
             }
             let mut out = Vec::new();
-            for (_, size, n, rb) in &uavs {
+            for (k, (_, size, n, rb)) in uavs.iter().enumerate() {
                 let mut p = std::ptr::null_mut();
                 rb.Map(0, None, Some(&mut p)).map_err(err)?;
                 let words = match size {
                     Some((w, h)) => {
-                        let words = *n as usize;
-                        let pitch = (*w as usize * 4 * words).next_multiple_of(256);
+                        let texel = texels.get(&k).map_or(*n * 4, |t| t.1) as usize;
+                        let pitch = (*w as usize * texel).next_multiple_of(256);
                         (0..*h as usize)
                             .flat_map(|y| {
                                 std::slice::from_raw_parts(
                                     p.cast::<u8>().add(y * pitch).cast::<u32>(),
-                                    *w as usize * words,
+                                    (*w as usize * texel).div_ceil(4),
                                 )
                                 .to_vec()
                             })
