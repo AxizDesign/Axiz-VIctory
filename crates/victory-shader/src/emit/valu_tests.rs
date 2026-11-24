@@ -112,7 +112,12 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    lower_cs(&words, threads, lds_bytes)
+}
 
+/// Lowers a whole synthetic compute program as it stands: 4 dwords of root
+/// constants in `s0..s3`, the descriptor table of the raw UAV in `s4`.
+fn lower_cs(words: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -1262,5 +1267,109 @@ fn v_cmp_class_f16_matches_rdna2() {
             "{backend}: v_cmp_class_f16(-hi({:#010x}), {:#05x}) = {got}, want {want}",
             inp[0], inp[1],
         );
+    });
+}
+
+/// A root constant that no instruction reads arrives at a join only:
+/// `s1 = s0 == 1 ? s2 : s1`, as a compiler leaves the untaken side of a
+/// uniform `if` in the register the parameter came in.
+#[test]
+fn a_root_constant_can_arrive_through_a_join_only() {
+    let words = [
+        s_mov_b32(5, 0x80), // s5 = 0
+        s_load_dwordx4(8, 4)[0],
+        s_load_dwordx4(8, 4)[1],
+        0xBF06_0000 | 0x81 << 8, // s_cmp_eq_u32 s0, 1
+        0xBF84_0001,             // s_cbranch_scc0 +1
+        s_mov_b32(1, 2),         // s_mov_b32 s1, s2
+        vop1(0x001, 0, sgpr(1)), // v_mov_b32 v0, s1
+        buffer_store_dword(0, 8, 0)[0],
+        buffer_store_dword(0, 8, 0)[1],
+        S_ENDPGM,
+    ];
+    let shader = lower_cs(&words, 1, 0);
+    let cases = [[1, 11, 22, 0], [0, 11, 22, 0], [2, 5, 9, 0]];
+    run_cases(&shader, &cases, |label, _, k, got| {
+        let want = if k[0] == 1 { k[2] } else { k[1] };
+        assert_eq!(got, want, "{label}: {k:?}");
+    });
+}
+
+/// With the clamp bit, unsigned adds and subtracts saturate (what LLVM
+/// emits for `uadd.sat` and `usub.sat`).
+#[test]
+fn clamped_unsigned_adds_and_subtracts_saturate() {
+    // VOP3 `op v0, v1, v2 clamp`.
+    let clamped =
+        |op: u16| build_valu_cs(&vop3_mod(op, 0, vgpr(1), vgpr(2), 0, 0, 0, 0, true));
+    let cases = [
+        [5, 7, 0, 0],
+        [0xFFFF_FFF0, 0x20, 0, 0],
+        [3, 10, 0, 0],
+        [u32::MAX, u32::MAX, 0, 0],
+        [0, 0, 0, 0],
+    ];
+    type Saturating = fn(u32, u32) -> u32;
+    let ops: [(u16, &str, Saturating); 3] = [
+        (0x125, "v_add_nc_u32", |a, b| a.saturating_add(b)),
+        (0x126, "v_sub_nc_u32", |a, b| a.saturating_sub(b)),
+        (0x127, "v_subrev_nc_u32", |a, b| b.saturating_sub(a)),
+    ];
+    for (op, name, want) in ops {
+        run_cases(&clamped(op), &cases, |label, _, k, got| {
+            assert_eq!(got, want(k[0], k[1]), "{label}: {name} {k:x?} clamp");
+        });
+    }
+}
+
+/// `v_mad_u64_u32` and `v_mad_i64_i32`: a 32 x 32-bit product plus a 64-bit
+/// addend, 64 bits wide (what LLVM emits for multiply-adds and wide
+/// multiplies), with the unsigned one's carry out in a lane mask.
+#[test]
+fn mad_64_multiplies_32_bits_and_adds_64() {
+    // `op v[5:6], sdst, v1, v2, v[3:4]`, then `v_mov_b32 v0, v<pick>`.
+    let mad_of = |op: u32, sdst: u32, tail: &[u32]| {
+        let mut words = vec![
+            0x35 << 26 | op << 16 | sdst << 8 | 5,
+            u32::from(vgpr(1)) | u32::from(vgpr(2)) << 9 | u32::from(vgpr(3)) << 18,
+        ];
+        words.extend_from_slice(tail);
+        build_valu_cs(&words)
+    };
+    let mad = |sdst: u32, tail: &[u32]| mad_of(0x176, sdst, tail);
+    const NULL: u32 = 125;
+    const VCC: u32 = 106;
+    let low = [vop1(0x001, 0, vgpr(5))];
+    let high = [vop1(0x001, 0, vgpr(6))];
+    let cases = [
+        [3, 5, 7, 0],
+        [0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0],
+        [0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 1],
+        [0x8000_0000, 2, 0x10, 0x20],
+        [0xFFFF_FFFE, 3, 5, 0xFFFF_FFFF],
+    ];
+    let addend = |k: [u32; 4]| u64::from(k[2]) | u64::from(k[3]) << 32;
+    let sum = |k: [u32; 4]| (u64::from(k[0]) * u64::from(k[1])).wrapping_add(addend(k));
+    run_cases(&mad(NULL, &low), &cases, |label, _, k, got| {
+        assert_eq!(got, sum(k) as u32, "{label}: v_mad_u64_u32 low {k:x?}");
+    });
+    run_cases(&mad(NULL, &high), &cases, |label, _, k, got| {
+        assert_eq!(got, (sum(k) >> 32) as u32, "{label}: v_mad_u64_u32 high {k:x?}");
+    });
+    let signed = |k: [u32; 4]| {
+        (i64::from(k[0] as i32) * i64::from(k[1] as i32)).wrapping_add(addend(k) as i64) as u64
+    };
+    run_cases(&mad_of(0x177, NULL, &low), &cases, |label, _, k, got| {
+        assert_eq!(got, signed(k) as u32, "{label}: v_mad_i64_i32 low {k:x?}");
+    });
+    run_cases(&mad_of(0x177, NULL, &high), &cases, |label, _, k, got| {
+        assert_eq!(got, (signed(k) >> 32) as u32, "{label}: v_mad_i64_i32 high {k:x?}");
+    });
+    // The carry out: `v_mov_b32 v7, 1`, then `v_cndmask_b32 v0, 0, v7` (v7
+    // where VCC is set).
+    let carry = [vop1(0x001, 7, 0x81), 0x01 << 25 | 7 << 9 | 0x80];
+    run_cases(&mad(VCC, &carry), &cases, |label, _, k, got| {
+        let (_, over) = (u64::from(k[0]) * u64::from(k[1])).overflowing_add(addend(k));
+        assert_eq!(got, u32::from(over), "{label}: v_mad_u64_u32 carry {k:x?}");
     });
 }

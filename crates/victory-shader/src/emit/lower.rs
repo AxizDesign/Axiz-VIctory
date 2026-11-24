@@ -338,10 +338,10 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
-fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+fn all_lane_blocks(p: &Program, st: &Structured, res: &Resources) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
-    for (_, region) in lane_regions(st)? {
+    for (_, region) in lane_regions(st, &group_bits(p, st, res))? {
         for b in (0..n).filter(|&b| region[b]) {
             all[b] = false;
         }
@@ -351,8 +351,9 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
 /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
-/// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+/// ([`Structured::wide`]), nor those on scalar conditions, nor those on compares that give
+/// every lane of the group the same bit (`same`: [`group_bits`]). None with an indirect exit.
+fn lane_regions(st: &Structured, same: &HashSet<Value>) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -393,7 +394,12 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
+        let together = |a: &Atom| match *a {
+            Atom::Uniform(_) => true,
+            Atom::Lane(v) => same.contains(&v),
+            _ => false,
+        };
+        if st.wide.contains(&d) || st.bools.support(when).iter().all(together) {
             continue; // a wave-wide or uniform branch: all lanes go the same way
         }
         // blocks reachable from the lane branch that do not post-dominate it
@@ -415,15 +421,85 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
 /// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
 /// of them is a branch whose wave-wide meaning is not known ([`Structured::wave_any`]).
-pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
+pub(super) fn branches_around(
+    p: &Program,
+    st: &Structured,
+    res: &Resources,
+    needs: &[usize],
+) -> Option<Vec<usize>> {
     let mut out = Vec::new();
-    for (d, region) in lane_regions(st)? {
+    for (d, region) in lane_regions(st, &group_bits(p, st, res))? {
         if needs.iter().any(|&b| region.get(b).copied().unwrap_or(false)) {
             st.wave_any.get(d).copied().flatten()?;
             out.push(d);
         }
     }
     Some(out)
+}
+
+/// Whether every operand of a vector instruction is the same in every thread of the group
+/// (`same`: the scalars and copies [`group_bits`] found). Its operands only: it also reads
+/// EXEC and the old contents of what it writes, neither of which bears on what a lane that
+/// runs it gets.
+fn operands_same(inst: &Inst, same: &HashSet<Value>) -> bool {
+    let Fields::Valu(v) = &inst.fields else {
+        return false;
+    };
+    let held = |r: Reg| inst.read(r).is_some_and(|x| same.contains(&x));
+    v.src.iter().all(|op| match *op {
+        Operand::Scalar { code, .. } if code == NULL => true,
+        Operand::Scalar { code, dwords } => (0..dwords).all(|i| held(Reg::S(code + i))),
+        Operand::Vector { reg, dwords } => (0..dwords).all(|i| held(Reg::V(reg + i))),
+        // (`vccz`, `execz`, `scc` and `lds_direct` are no values of the group)
+        Operand::Const(c) => crate::resource::inline(c).is_some(),
+        Operand::Literal(_) => true,
+        Operand::Attr { .. } => false,
+    })
+}
+
+/// VALU compare results whose bit is the same in every lane of the thread group, wherever
+/// the compare stands: its operands are root parameters, constants, and what scalar
+/// instructions and unguarded copies make of those. A branch on such bits alone parts no
+/// lanes although each lane takes it by its own bit ([`lane_regions`]): the whole group goes
+/// one way, so the blocks behind it are still blocks every thread reaches and two host waves
+/// may meet there. Float conditions always come this way, there being no scalar float
+/// compare, and so does any condition the compiler found cheaper in a VGPR.
+/// shortcut: nothing joined by a phi counts, nor does the thread group's id.
+fn group_bits(p: &Program, st: &Structured, res: &Resources) -> HashSet<Value> {
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    // (a lane mask is the same as a number in no two waves: a wave may lack lanes)
+    let mut same: HashSet<Value> =
+        res.params.iter().map(|&(v, _, _)| v).filter(|&v| !is_mask(v)).collect();
+    let mut bits = HashSet::new();
+    for b in crate::ir::reverse_postorder(&p.blocks) {
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let name = inst.name();
+            let plain = matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none());
+            let compare = plain && name.starts_with("v_cmp") && !name.starts_with("v_cmpx");
+            let copy = plain && name == "v_mov_b32" && st.guards[b][i].is_none();
+            // (not what a wave says of itself: its registers, its lane counts and numbers)
+            let scalar = matches!(inst.fields, Fields::Sop { .. } | Fields::Smem { .. })
+                && !(name.starts_with("s_getreg")
+                    || name.starts_with("s_bcnt")
+                    || name.starts_with("s_ff1")
+                    || name.contains("saveexec"));
+            let alike = if compare || copy {
+                operands_same(inst, &same)
+            } else {
+                scalar && inst.reads.iter().all(|r| same.contains(&r.1))
+            };
+            if !alike {
+                continue;
+            }
+            let written = inst.writes.iter().map(|w| w.1);
+            if compare {
+                bits.extend(written);
+            } else {
+                same.extend(written.filter(|&v| !is_mask(v)));
+            }
+        }
+    }
+    bits
 }
 
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
@@ -1303,7 +1379,7 @@ impl<'a> Lower<'a> {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
-                    if let Some(all) = all_lane_blocks(x.st) {
+                    if let Some(all) = all_lane_blocks(p, x.st, x.res) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
@@ -1362,7 +1438,7 @@ impl<'a> Lower<'a> {
                     }
                     if s.lds_dwords > 0 && group > 32 {
                         why.push("LDS in a group over 32");
-                        match all_lane_blocks(x.st) {
+                        match all_lane_blocks(p, x.st, x.res) {
                             None => why.push("an indirect exit"),
                             Some(all) if lds_meetings(p, x.st, &all).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
@@ -1404,7 +1480,7 @@ impl<'a> Lower<'a> {
                 .iter()
                 .enumerate()
                 .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
-            let all = all_lane_blocks(x.st);
+            let all = all_lane_blocks(p, x.st, x.res);
             (0..p.blocks.len())
                 .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
                 .filter(|&b| {
@@ -1991,7 +2067,7 @@ impl<'a> Lower<'a> {
         let every = if halves {
             self.all_lanes(self.cur_ir)
         } else {
-            all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
+            all_lane_blocks(self.x.p, self.x.st, self.x.res).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
         };
         if !every {
             if halves {
@@ -3869,7 +3945,13 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        // Where an instruction has a saturating form, `integer` has already
+        // clamped its result.
+        let saturates = matches!(
+            inst.name(),
+            "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32"
+        );
+        if v.omod != 0 || v.clamp && !saturates {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -6526,15 +6608,24 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
-            "v_mad_u64_u32" => {
+            "v_mad_u64_u32" | "v_mad_i64_i32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out
-                // of the sum is this lane's bit of the mask it names.
+                // of the unsigned sum is this lane's bit of the mask it names.
+                let signed = name == "v_mad_i64_i32";
+                let named = match v.carry {
+                    Some(Operand::Scalar { code, .. }) => inst.write(Reg::S(code)),
+                    _ => None,
+                };
+                if signed && named.is_some() {
+                    return Err("the carry out of v_mad_i64_i32");
+                }
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let x = self.src64(inst, 2)?;
                 let i64t = self.s.m.int(64);
                 self.s.flags |= flags::INT64;
-                let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
-                let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                let wide = if signed { Cast::SExt } else { Cast::ZExt };
+                let a = self.s.m.cast(c, wide, a, i64t);
+                let b = self.s.m.cast(c, wide, b, i64t);
                 let product = self.s.m.bin(c, Bin::Mul, a, b);
                 let r = self.s.m.bin(c, Bin::Add, product, x);
                 let carry = self.s.m.cmp(c, pred::IULT, r, x);
@@ -6544,9 +6635,7 @@ impl<'a> Lower<'a> {
                 let (lo, hi) = self.split64(r);
                 self.write(inst, Reg::V(reg), lo, guard);
                 self.write(inst, Reg::V(reg + 1), hi, guard);
-                if let Some(Operand::Scalar { code, .. }) = v.carry
-                    && let Some(w) = inst.write(Reg::S(code))
-                {
+                if let Some(w) = named {
                     self.lane_bits.insert(w, carry);
                 }
                 for &(_, w) in &inst.writes {
@@ -7970,6 +8059,7 @@ impl<'a> Lower<'a> {
 
     fn integer(&mut self, inst: &Inst, name: &'static str) -> Result<V, Why> {
         let c = self.cur;
+        let clamp = matches!(&inst.fields, Fields::Valu(v) if v.clamp);
         let s = |l: &mut Self, k| l.src(inst, k);
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
         let m31 = |l: &mut Self, x: V| {
@@ -7989,7 +8079,22 @@ impl<'a> Lower<'a> {
                     "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
-                self.s.m.bin(c, op, a, b)
+                let r = self.s.m.bin(c, op, a, b);
+                // With the clamp bit, unsigned adds and subtracts saturate:
+                // a sum that wrapped is all ones, a difference that borrowed 0.
+                match name {
+                    "v_add_nc_u32" if clamp => {
+                        let wrapped = self.s.m.cmp(c, pred::IULT, r, a);
+                        let ones = k(self, u32::MAX);
+                        self.s.m.select(c, wrapped, ones, r)
+                    }
+                    "v_sub_nc_u32" | "v_subrev_nc_u32" if clamp => {
+                        let borrowed = self.s.m.cmp(c, pred::IULT, a, b);
+                        let zero = k(self, 0);
+                        self.s.m.select(c, borrowed, zero, r)
+                    }
+                    _ => r,
+                }
             }
             "v_xnor_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);

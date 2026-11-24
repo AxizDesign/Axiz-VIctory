@@ -282,7 +282,8 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     // ... and the lowering names the block, around which that branch is the one to widen
     let needs = lower::take_needs();
     let st = structure::structure(&p).expect("structure");
-    assert_eq!(lower::branches_around(&st, &needs), Some(vec![branch]));
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    assert_eq!(lower::branches_around(&p, &st, &res, &needs), Some(vec![branch]));
     // (taken, past the body, when every lane's bit is clear)
     assert_eq!(st.wave_any[branch], Some(false));
     // wave-wide, every lane runs the reduction (EXEC stays a guard on what it does there)
@@ -436,7 +437,8 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         per_lane.err()
     );
     let st = structure::structure(&p).expect("structure");
-    assert_eq!(lower::branches_around(&st, &lower::take_needs()), Some(vec![branch]));
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    assert_eq!(lower::branches_around(&p, &st, &res, &lower::take_needs()), Some(vec![branch]));
     let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -449,4 +451,55 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
+}
+
+/// A count over the wave behind a branch on a float condition no thread differs in: the code
+/// LLVM's AMD back end makes of `if (k > 0.5) n = <the wave's lanes above 40>` with `k` a root
+/// constant. There is no scalar float compare, so the condition is a vector compare into an
+/// SGPR pair, and each lane takes the branch by its own bit. All take it alike: the count's
+/// block is one every thread of the group reaches, and the two host waves meet there
+/// ([`lower::group_bits`]). The same branch on a compare of the thread's own number does part
+/// the lanes, and stops as before.
+#[test]
+fn a_branch_on_a_compare_of_root_constants_parts_no_lanes() {
+    let program = |compare: [u32; 2]| {
+        let mut words = compare.to_vec();
+        words.extend_from_slice(&[
+            0x87EA_047E, // s_and_b64 vcc, exec, s[4:5]
+            0xBF87_0003, // s_cbranch_vccnz past the count
+            0x3602_00BF, // v_and_b32 v1, 63, v0
+            0x7D82_02A8, // v_cmp_lt_u32 vcc, 40, v1
+            0xBE81_106A, // s_bcnt1_i32_b64 s1, vcc
+            0x7E00_0201, // v_mov_b32 v0, s1
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        ]);
+        native(&words)
+    };
+    let native = program([0xD40B_0004, 0x0201_E000]); // v_cmp_ngt_f32 s[4:5], s0, 0.5
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+    assert!(names.contains(&"v_cmp_ngt_f32") && names.contains(&"s_bcnt1_i32_b64"), "{names:?}");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let own = program([0xD40B_0004, 0x0201_E100]); // v_cmp_ngt_f32 s[4:5], v0, 0.5
+    let q = ir::build(&own.code, own.wave64, own.vgprs).expect("ir::build");
+    lower::take_needs();
+    let stopped = lowered(&own, &q, &HashSet::new());
+    lower::take_needs();
+    assert!(
+        matches!(&stopped, Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what)),
+        "{:?}",
+        stopped.err()
+    );
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // (s0 as a float, s1) -> what every lane stores: the lanes above 40 if s0 > 0.5, else s1
+    for (level, s1, expected) in [(1.0f32, 7u32, 23u32), (0.25, 7, 7), (0.75, 9, 23)] {
+        let Some(got) = on_the_card(&shader, [level.to_bits(), s1]) else { return };
+        assert_eq!(got, expected, "s0 = {level}, s1 = {s1}");
+    }
+    eprintln!("ran on the hardware device: one count over the console wave behind a branch all lanes take alike");
 }

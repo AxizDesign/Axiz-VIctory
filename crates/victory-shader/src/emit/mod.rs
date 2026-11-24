@@ -544,7 +544,7 @@ fn widen(
             }
             return r;
         }
-        let more: Vec<usize> = lower::branches_around(&st, &needs)
+        let more: Vec<usize> = lower::branches_around(p, &st, &res, &needs)
             .unwrap_or_default()
             .into_iter()
             .filter(|b| !wide.contains(b))
