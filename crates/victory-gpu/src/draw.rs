@@ -425,7 +425,12 @@ impl State {
         self.topology_set = true;
         let host = match topology {
             RECTANGLES => 4,
-            TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => {
+            // Without the closing line; the pipeline draws lines.
+            LINE_LOOP => {
+                once!(topology, "a line loop drawn as a line strip");
+                3
+            }
+            TRIANGLE_FAN | QUADS | QUAD_STRIP => {
                 once!(topology, "console topology drawn as a triangle list");
                 4
             }
@@ -518,6 +523,7 @@ impl State {
                     handle = format_args!("{h:#x}"),
                     "render target without a recorded view"
                 );
+                rtvs.push(host.rtv(None, Some(&null_target())));
                 continue;
             };
             let Some(texture) = crate::resource::host_resource(record.resource) else {
@@ -525,14 +531,11 @@ impl State {
                 // takes its slot: left out, the next live target would move
                 // into it and the pixel shader's outputs reach the wrong
                 // targets.
-                // shortcut: a view without a description or a format has no
-                // null view to stand for it and is left out, as before.
                 let null = record
                     .desc()
-                    .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
-                if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
-                }
+                    .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0)
+                    .unwrap_or_else(null_target);
+                rtvs.push(host.rtv(None, Some(&null)));
                 continue;
             };
             self.targets.push(record.resource as usize);
@@ -2700,6 +2703,15 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+/// The view of no target, in a target's place.
+fn null_target() -> D3D12_RENDER_TARGET_VIEW_DESC {
+    D3D12_RENDER_TARGET_VIEW_DESC {
+        Format: DXGI_FORMAT(28),
+        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

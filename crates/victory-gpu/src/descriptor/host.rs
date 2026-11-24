@@ -30,6 +30,11 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// The run of dynamic slots with a view of each numbered host copy, for
+    /// shaders that read title memory by address (`crate::memory`): its
+    /// first slot, and how many copies have their view there. Here, so that
+    /// another heap at the same address has none.
+    pub(crate) copies_run: Mutex<Option<(u32, u32)>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -631,6 +636,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            copies_run: Mutex::default(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),

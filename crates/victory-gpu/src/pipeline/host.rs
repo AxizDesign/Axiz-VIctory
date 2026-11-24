@@ -921,6 +921,7 @@ mod tests {
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
         mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        super::super::library::store_waiting();
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
         mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
         assert!(

@@ -550,15 +550,81 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
+    // Stored after the fact: the pipeline is there to be drawn with, and a
+    // store waits for a save in progress, which writes the whole library.
+    to_store(name, &pso);
+    Ok(pso)
+}
+
+/// Pipelines made and not yet stored in the library.
+static TO_STORE: Mutex<std::collections::VecDeque<(String, ID3D12PipelineState)>> =
+    Mutex::new(std::collections::VecDeque::new());
+static STORE_MORE: std::sync::Condvar = std::sync::Condvar::new();
+/// How many there are, with the one being stored.
+static STORING_NOW: AtomicU64 = AtomicU64::new(0);
+
+/// Hands `pso` to the thread that stores pipelines; stores it here if there
+/// is none.
+fn to_store(name: &str, pso: &ID3D12PipelineState) {
+    static STORING: OnceLock<bool> = OnceLock::new();
+    let storing = *STORING.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("victory-pipeline-store".into())
+            .spawn(|| {
+                loop {
+                    let next = {
+                        let mut queue = TO_STORE.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(next) = queue.pop_front() {
+                                break next;
+                            }
+                            queue = STORE_MORE.wait(queue).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    store(&next.0, &next.1);
+                    STORING_NOW.fetch_sub(1, Ordering::AcqRel);
+                }
+            })
+            .is_ok()
+    });
+    if storing {
+        STORING_NOW.fetch_add(1, Ordering::AcqRel);
+        TO_STORE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back((name.to_owned(), pso.clone()));
+        STORE_MORE.notify_one();
+    } else {
+        store(name, pso);
+    }
+}
+
+fn store(name: &str, pso: &ID3D12PipelineState) {
+    let Some(library) = library() else { return };
+    let wide = HSTRING::from(name);
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
-    Ok(pso)
+}
+
+/// Stores what waits to be stored, on this thread, and waits for a store in
+/// progress: before a last save.
+pub(super) fn store_waiting() {
+    while STORING_NOW.load(Ordering::Acquire) > 0 {
+        let next = TO_STORE.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        match next {
+            Some((name, pso)) => {
+                store(&name, &pso);
+                STORING_NOW.fetch_sub(1, Ordering::AcqRel);
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(1)),
+        }
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -573,6 +639,9 @@ pub(crate) fn save(now: bool) {
             return;
         }
         *last = Some(std::time::Instant::now());
+    }
+    if now {
+        store_waiting();
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");

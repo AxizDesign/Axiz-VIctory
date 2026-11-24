@@ -161,9 +161,9 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Whether the frame's budget is one for all threads together: a thread
-/// that waits takes what is left of it and gives back what it did not
-/// use. Counted only when a wait had ended, the budget was one per thread:
+/// Whether the frame's budget is one for all threads together: the time in
+/// which at least one thread waits counts against it, once ([`Spent`]).
+/// Counted only when a wait had ended, the budget was one per thread:
 /// each of the title's five recording threads began its first wait of a
 /// frame with nothing counted yet and waited the whole half second, 2.5 s
 /// of waiting in every frame in which pipelines were being made (runs
@@ -174,31 +174,79 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// What a frame's budget was spent on: the time in which any thread waited.
+/// (The first thread to wait took all that was left of the budget and gave
+/// back the rest afterwards: the others waited for nothing meanwhile, not
+/// even for a pipeline that loads in a millisecond, and their draws were
+/// dropped.)
+struct Spent {
+    frame: u64,
+    time: Duration,
+    /// Threads waiting now, and since when there were any (or since the
+    /// frame began, if later).
+    waiting: u32,
+    since: Option<Instant>,
+}
+
+impl Spent {
+    const fn new() -> Self {
+        Self {
+            frame: u64::MAX,
+            time: Duration::ZERO,
+            waiting: 0,
+            since: None,
+        }
+    }
+
+    /// A thread wants to wait in `frame` at `now`: how long it may, of
+    /// `budget`. [`Spent::end`] follows if that is anything.
+    fn begin(&mut self, frame: u64, budget: Duration, now: Instant) -> Duration {
+        if self.frame != frame {
+            (self.frame, self.time) = (frame, Duration::ZERO);
+            self.since = (self.waiting > 0).then_some(now);
+        }
+        let running = self.since.map_or(Duration::ZERO, |s| now.saturating_duration_since(s));
+        let left = budget.saturating_sub(self.time + running);
+        if !left.is_zero() {
+            self.waiting += 1;
+            self.since.get_or_insert(now);
+        }
+        left
+    }
+
+    fn end(&mut self, now: Instant) {
+        self.waiting -= 1;
+        if self.waiting == 0
+            && let Some(since) = self.since.take()
+        {
+            self.time += now.saturating_duration_since(since);
+        }
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
     if budget.is_zero() {
         return;
     }
-    // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    static SPENT: Mutex<Spent> = Mutex::new(Spent::new());
+    // Each thread's waits count on their own without the shared budget.
+    static ALONE: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
     let shared = shared_budget();
-    let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    let started = Instant::now();
+    let left = if shared {
+        SPENT.lock().unwrap_or_else(|e| e.into_inner()).begin(frame, budget, started)
+    } else {
+        let mut spent = ALONE.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
-        left
+        budget.saturating_sub(spent.1)
     };
     if left.is_zero() {
         return;
     }
-    let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
@@ -209,16 +257,13 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
-    let waited = started.elapsed().min(left);
-    {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    if shared {
+        SPENT.lock().unwrap_or_else(|e| e.into_inner()).end(Instant::now());
+    } else {
+        let mut spent = ALONE.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
-            if shared {
-                spent.1 = spent.1.saturating_sub(left - waited);
-            } else {
-                spent.1 += waited;
-            }
+            spent.1 += started.elapsed().min(left);
         }
     }
     #[cfg(feature = "diagnostics")]
@@ -376,6 +421,27 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// Threads waiting at the same time share the time they wait, none
+    /// takes it from the others, and a new frame starts anew.
+    #[test]
+    fn waits_at_the_same_time_count_once() {
+        let ms = Duration::from_millis;
+        let (t, mut s) = (Instant::now(), Spent::new());
+        assert_eq!(s.begin(1, ms(500), t), ms(500));
+        assert_eq!(s.begin(1, ms(500), t + ms(100)), ms(400), "the second waits too");
+        s.end(t + ms(150));
+        s.end(t + ms(200));
+        assert_eq!(s.begin(1, ms(500), t + ms(900)), ms(300), "200 ms were waited");
+        s.end(t + ms(1200));
+        assert_eq!(s.begin(1, ms(500), t + ms(1300)), ms(0));
+        // A wait that reaches into the next frame counts there from its start.
+        assert_eq!(s.begin(2, ms(500), t + ms(1400)), ms(500));
+        assert_eq!(s.begin(3, ms(500), t + ms(1500)), ms(500));
+        s.end(t + ms(1600));
+        s.end(t + ms(1700));
+        assert_eq!(s.begin(3, ms(500), t + ms(1800)), ms(300));
     }
 
     /// It is answered, waited for by no one, and the worker goes on.

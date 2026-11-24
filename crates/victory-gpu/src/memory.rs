@@ -44,7 +44,6 @@
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
@@ -68,9 +67,7 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
+
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -108,7 +105,7 @@ impl Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
-            heaps: HashMap::new(),
+
             frame: u64::MAX,
             refused: Default::default(),
         })
@@ -275,9 +272,9 @@ pub(crate) fn ready(
             m.name(u64::from(c) << 8);
         }
     }
-    let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
+    let mut run = heap.copies_run.lock().unwrap_or_else(|e| e.into_inner());
+    let (base, made) = match *run {
+        Some(run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
             let base = heap.dynamic(COPIES + 1)?;
@@ -289,7 +286,8 @@ pub(crate) fn ready(
         let (_, len) = shadow.span();
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    *run = Some((base, m.copies.len() as u32));
+    drop(run);
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date

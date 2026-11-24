@@ -53,6 +53,8 @@ enum Held {
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
     Signal(usize, u64),
+    /// Page mappings, due after the submissions held before them.
+    Map(Vec<(u64, u64, u64)>),
 }
 
 /// The queues that hold something (their addresses).
@@ -413,6 +415,7 @@ pub(crate) fn release_held(all: bool) {
                             crate::fence::set(fence as This, value);
                         }
                     }
+                    Held::Map(pieces) => map_pages(&pieces),
                 }
                 moved = true;
             }
@@ -906,26 +909,25 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// one constant page or of unmapped pages). On the queue's timeline: behind
+/// the submissions it holds, and behind what is on the card.
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
-    let Some(map) = crate::resource::page_mapper() else {
-        return E_INVALIDARG;
-    };
-    if batches.is_null() && count > 0 {
+    if crate::resource::page_mapper().is_none() || batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // Read now: the title may reuse its arrays when the call returns.
+    let mut pieces = Vec::new();
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -938,21 +940,51 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
+            match r.kind {
+                0 if inside(r.count) => pieces.push((at, source, len)),
+                1 if inside(1) => {
+                    pieces.extend((0..u64::from(r.count)).map(|k| (at + k * PAGE, source, PAGE)));
+                }
+                2 => pieces.push((at, 0, len)),
+                3 => {}
+                _ => ok = false,
+            }
             at += len;
         }
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping outside its pool is left out"));
     }
-    S_OK
+    #[cfg(windows)]
+    {
+        let held = std::cell::RefCell::new(Some(pieces));
+        if !hold(this, || Held::Map(held.take().unwrap_or_default())) {
+            map_pages(&held.take().unwrap_or_default());
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = this;
+        map_pages(&pieces);
+    }
+    if ok { S_OK } else { E_INVALIDARG }
+}
+
+/// Maps pages (address, source or 0 for none, bytes), with nothing of ours
+/// on the card that was prepared through the old mapping.
+fn map_pages(pieces: &[(u64, u64, u64)]) {
+    let Some(map) = crate::resource::page_mapper() else {
+        return;
+    };
+    #[cfg(windows)]
+    if crate::host::late() {
+        crate::host::settle_for_fence();
+    }
+    if !pieces.iter().fold(true, |ok, &(at, source, len)| map(at, source, len) && ok) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!("a page mapping failed"));
+    }
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {

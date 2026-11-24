@@ -4110,7 +4110,6 @@ impl Host {
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
-        bury(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -4140,6 +4139,8 @@ impl Host {
                 last_notes(runs)
             ));
         }
+        // After the look at the device: its report names what is still held.
+        bury(this_submission);
         submitting(3, runs.len());
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
