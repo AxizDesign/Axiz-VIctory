@@ -9068,6 +9068,9 @@ impl<'a> Lower<'a> {
             }
             4 => (6, 2),
             5 => (7, 3),
+            // Multisampled (2D and its array): loaded, one sample at a time.
+            6 if name == "image_load" => (3, 2),
+            7 if name == "image_load" => (8, 3),
             _ => return Err("an image dimension (cube loads or MSAA)"),
         };
         // Address VGPRs in order.
@@ -9729,7 +9732,17 @@ impl<'a> Lower<'a> {
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 *slot = addr_val(self, k)?;
             }
-            let mip = if name == "image_load_mip" {
+            let mip = if matches!(kind, 3 | 8) {
+                // The sample, after the coordinates. (DXIL has no writable
+                // multisampled view before shader model 6.7.)
+                // shortcut: taken as the sample's own number, as it is where
+                // the surface holds every sample (a program that maps it
+                // through the colour's FMASK first would name a fragment).
+                if uav {
+                    return Err("an unordered load of a multisampled image");
+                }
+                addr_val(self, coords)?
+            } else if name == "image_load_mip" {
                 addr_val(self, coords)?
             } else if uav {
                 // Our declarations have four channels.

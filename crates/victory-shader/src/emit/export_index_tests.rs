@@ -57,17 +57,20 @@ fn element(name: &str, kind: u8, comp: u8, row: u32, cols: u8) -> SigElement {
     }
 }
 
+/// A triangle over the whole target, for other tests' draws.
+pub(super) fn fullscreen() -> HostShader {
+    build(&[], &[])
+}
+
 /// Translates [`BODY`] and `exports` (the last of which is the last export)
 /// with the outputs `kinds` beside the position.
 fn build(exports: &[&[u32]], kinds: &[u8]) -> HostShader {
     let mut words = BODY.to_vec();
-    for (i, e) in exports.iter().enumerate() {
+    for e in exports {
         words.extend_from_slice(e);
-        if i + 1 == exports.len() {
-            let at = words.len() - 2;
-            words[at] |= 0x800; // done
-        }
     }
+    let last = words.len() - 2;
+    words[last] |= 0x800; // done
     words.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Vs,
