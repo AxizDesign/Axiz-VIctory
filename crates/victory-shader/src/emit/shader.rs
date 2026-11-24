@@ -73,6 +73,8 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// A render-target or viewport index from a vertex shader.
+    pub const LAYER_VIEWPORT: u64 = 1 << 9;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -689,6 +691,14 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        // A vertex shader with one of the two indices (as DXC collects it).
+        if !self.pixel
+            && self.threads.is_none()
+            && self.geometry.is_none()
+            && self.outputs.iter().any(|o| matches!(o.kind, 4 | 5))
+        {
+            self.flags |= flags::LAYER_VIEWPORT;
+        }
         // Entry properties: shader flags (tag 0), geometry state (1),
         // thread-group size (4), wave size (11).
         let mut props = Vec::new();
@@ -776,6 +786,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::LAYER_VIEWPORT != 0 {
+            features |= 0x2000;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }

@@ -85,6 +85,8 @@ mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod export_index_tests;
+#[cfg(all(test, windows))]
 mod image_store_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;

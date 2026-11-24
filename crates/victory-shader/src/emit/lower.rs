@@ -10369,6 +10369,10 @@ impl<'a> Lower<'a> {
             &self.s.outputs
         };
         let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
+        let indices = by_kind(4).or(by_kind(5)).is_some();
+        if indices && mesh && matches!(e.target, Target::Position(1..)) {
+            return Err("render-target or viewport index exports of a mesh shader");
+        }
         // 16-bit vertex outputs: the halves each dword carries, as (output
         // element, channel, high half) per channel.
         let halves = match e.target {
@@ -10441,13 +10445,24 @@ impl<'a> Lower<'a> {
                         .map(|id| (id, ch - outputs[id].col))
                 }
                 Target::Null | Target::Unread => None,
-                Target::Position(n @ 1..=2) => {
-                    // shortcut: without the misc vector (point size, render
-                    // target or viewport index) pos1 and pos2 carry the clip
-                    // then cull distances, in semantic order.
-                    if outputs.iter().any(|o| matches!(o.kind, 4 | 5)) {
-                        return Err("render-target or viewport index exports");
+                // With a render-target or viewport index pos1 is the misc
+                // vector: both indices in its third channel (the slice in
+                // bits 0-10, the viewport in 16-19). Point size and edge
+                // flag, its other channels, have no place on the host.
+                Target::Position(1) if indices => {
+                    if ch == 2 {
+                        for kind in [4, 5] {
+                            if let Some(id) = by_kind(kind) {
+                                stores.push((id, 0, value, None));
+                            }
+                        }
                     }
+                    None
+                }
+                Target::Position(n) if (1..=3).contains(&n) && n <= 2 + u8::from(indices) => {
+                    // shortcut: without those indices the misc vector (point
+                    // size) is taken not to be there. After it, clip then
+                    // cull distances, in semantic order.
                     let mut dists: Vec<usize> = (0..outputs.len())
                         .filter(|&i| matches!(outputs[i].kind, 6 | 7))
                         .collect();
@@ -10458,7 +10473,7 @@ impl<'a> Lower<'a> {
                         .collect();
                     // Channels past the distances the signature declares are
                     // ones the clipper does not enable (`PA_CL_VS_OUT_CNTL`).
-                    let k = usize::from(n - 1) * 4 + usize::from(ch);
+                    let k = usize::from(n - 1 - u8::from(indices)) * 4 + usize::from(ch);
                     flat.get(k).copied()
                 }
                 Target::Position(_) => return Err("clip, cull or point-size exports"),
@@ -10527,6 +10542,19 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
+            }
+            if let (Target::Position(1), kind @ (4 | 5)) =
+                (e.target, elements(self, primitive)[id].kind)
+            {
+                let c = self.cur;
+                let mask = if kind == 4 {
+                    self.s.m.i32(0x7FF)
+                } else {
+                    let k16 = self.s.m.i32(16);
+                    x = self.s.m.bin(c, Bin::LShr, x, k16);
+                    self.s.m.i32(0xF)
+                };
+                x = self.s.m.bin(c, Bin::And, x, mask);
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
