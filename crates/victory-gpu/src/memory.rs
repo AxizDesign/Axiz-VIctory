@@ -67,7 +67,6 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
-
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -105,7 +104,6 @@ impl Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
-
             frame: u64::MAX,
             refused: Default::default(),
         })

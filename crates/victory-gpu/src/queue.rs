@@ -968,7 +968,9 @@ extern "system" fn copy_page_mappings(
         let _ = this;
         map_pages(&pieces);
     }
-    if ok { S_OK } else { E_INVALIDARG }
+    // (what the console answers for such a range is not known: those inside
+    // the pool are mapped, and the call succeeds as it did)
+    S_OK
 }
 
 /// Maps pages (address, source or 0 for none, bytes), with nothing of ours
