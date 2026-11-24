@@ -88,6 +88,8 @@ mod diff_tests;
 mod image_store_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
+#[cfg(all(test, windows))]
+mod narrow_buffer_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;

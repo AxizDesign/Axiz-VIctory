@@ -14,15 +14,42 @@ use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
-/// Lowers a wave32 compute program of 32 threads (`v0`: the thread, `v1`: 0)
-/// whose image view is at heap index 0, its descriptor in `s[4:11]`; or why
-/// it is refused.
+/// [`build_with`] for an image view at heap index 0, its descriptor in
+/// `s[4:11]` (`v1`: 0).
 fn build(body: &[u32]) -> Result<HostShader, &'static str> {
-    let mut words = vec![
-        0xB001_0000, // s_movk_i32 s1, 0
+    let load = [
         0xF40C_0100,
         0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
         0x7E02_0280, // v_mov_b32 v1, 0
+    ];
+    build_with(
+        &[&load, body].concat(),
+        vec![used(ResourceType::Uav, 0, 0, 8)],
+    )
+}
+
+/// What the program reads of the table at s0: a view `entry` heap slots in.
+pub(super) fn used(kind: ResourceType, entry: u32, stride: u32, dwords: u8) -> UsedResource {
+    UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords: 8 * entry,
+        lower_bound: 0,
+        stride,
+        dwords,
+        user_data: 0,
+        slot: 0,
+    }
+}
+
+/// Lowers a wave32 compute program of 32 threads (`v0`: the thread,
+/// `s[0:1]`: the table of views, heap index 0 on); or why it is refused.
+pub(super) fn build_with(
+    body: &[u32],
+    used: Vec<UsedResource>,
+) -> Result<HostShader, &'static str> {
+    let mut words = vec![
+        0xB001_0000, // s_movk_i32 s1, 0
     ];
     words.extend_from_slice(body);
     words.push(S_ENDPGM);
@@ -38,16 +65,7 @@ fn build(body: &[u32]) -> Result<HostShader, &'static str> {
             user_data: 0,
             slot: 0,
         }],
-        used: vec![UsedResource {
-            kind: ResourceType::Uav,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 8,
-            user_data: 0,
-            slot: 0,
-        }],
+        used,
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
             threads: [32, 1, 1],
@@ -95,6 +113,11 @@ fn build(body: &[u32]) -> Result<HostShader, &'static str> {
 
 /// The dwords of the 32 texels the program leaves in a 32x1 texture.
 fn run(shader: &HostShader, format: DXGI_FORMAT, texel: u32) -> Vec<(&'static str, Vec<u32>)> {
+    run_with(shader, &[View::FormatUav(32, 1, format, texel)])
+}
+
+/// What the program leaves in the first unordered access view of `views`.
+pub(super) fn run_with(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let mut out = Vec::new();
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -114,7 +137,7 @@ fn run(shader: &HostShader, format: DXGI_FORMAT, texel: u32) -> Vec<(&'static st
                 &pso,
                 &Dispatch {
                     roots: vec![(0, Root::Constants(ud))],
-                    views: &[View::FormatUav(32, 1, format, texel)],
+                    views,
                     samplers: &[] as &[D3D12_SAMPLER_DESC],
                     groups: [1, 1, 1],
                 },

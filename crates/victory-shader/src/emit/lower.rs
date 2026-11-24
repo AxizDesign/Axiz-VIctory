@@ -9967,8 +9967,11 @@ impl<'a> Lower<'a> {
         if let (Some(element), Some(u)) = (index, used)
             && !typed
             && u.kind != ResourceType::Cbv
-            && u.stride >= 4
-            && u.stride.is_multiple_of(4)
+            && (u.stride >= 4 && u.stride.is_multiple_of(4)
+                // Bytes and halves of elements that are no whole dwords: such
+                // a view has no structured form on the host, its raw one is
+                // the only one there is.
+                || narrow.is_some() && u.stride >= 2)
         {
             let k = self.s.m.i32(u.stride);
             let at = self.s.m.bin(c, Bin::Mul, element, k);
