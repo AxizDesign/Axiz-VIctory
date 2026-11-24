@@ -17,6 +17,121 @@ fn fill(data: &mut [u32], round: u32) {
     }
 }
 
+/// Reads all of `data` and adds it up: each thread a stride of its own, the
+/// partial sums by atomics.
+const SUM: &str = "
+cbuffer Size : register(b0) { uint pieces; };
+ByteAddressBuffer data : register(t0);
+RWByteAddressBuffer sum : register(u0);
+[numthreads(64, 1, 1)] void cs(uint i : SV_DispatchThreadID) {
+    uint total = 0;
+    [loop] for (uint n = 0; n < pieces; n++) {
+        uint4 v = data.Load4(16 * (i + 4096 * n));
+        total += v.x + v.y + v.z + v.w;
+    }
+    uint before;
+    sum.InterlockedAdd(0, total, before);
+}
+";
+
+/// Shader reads of the same data in each kind of memory a buffer can be in.
+fn reads(b: &mut Bench, mib: usize, data: &[u32]) -> Result<()> {
+    let device = b.adapter.device.clone();
+    let bytes = size_of_val(data) as u64;
+    let none = D3D12_RESOURCE_FLAG_NONE;
+    let root = gpu::root_signature(
+        &device,
+        &[
+            gpu::root_constants(0, 1),
+            gpu::root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+            gpu::root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+        ],
+    )?;
+    let pipeline = gpu::compute_pipeline(&device, &root, &gpu::compile(SUM, "cs", "cs_5_1")?)?;
+    let total = gpu::buffer(
+        &device,
+        D3D12_HEAP_TYPE_DEFAULT,
+        256,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    )?;
+    let readback = gpu::buffer(&device, D3D12_HEAP_TYPE_READBACK, 256, none)?;
+    let staging = gpu::buffer(&device, D3D12_HEAP_TYPE_UPLOAD, bytes, none)?;
+    gpu::write(&staging, data)?;
+    let expected = data.iter().fold(0u32, |s, &d| s.wrapping_add(d));
+    for (name, kind) in [
+        ("default heap", Some(D3D12_HEAP_TYPE_DEFAULT)),
+        ("upload heap", Some(D3D12_HEAP_TYPE_UPLOAD)),
+        ("GPU upload heap", Some(D3D12_HEAP_TYPE_GPU_UPLOAD)),
+        ("system memory (custom heap)", None),
+    ] {
+        let made = match kind {
+            Some(kind) => gpu::buffer(&device, kind, bytes, none),
+            None => gpu::system_buffer(&device, bytes),
+        };
+        // (not every card has every kind)
+        let Ok(source) = made else { continue };
+        if kind == Some(D3D12_HEAP_TYPE_DEFAULT) {
+            b.direct.timed(1, Submit::Together, &mut |_, list| {
+                // SAFETY: both buffers have `bytes` bytes.
+                unsafe { list.CopyBufferRegion(&source, 0, &staging, 0, bytes) };
+                Ok(())
+            })?;
+        } else {
+            gpu::write(&source, data)?;
+        }
+        let groups = 64u32;
+        let pieces = (bytes / 16 / 4096) as u32;
+        let mut runs = 0u32;
+        let t = b.rounds(|| {
+            runs += 1;
+            b.direct.timed(1, Submit::Together, &mut |_, list| {
+                // SAFETY: live objects; the reads are within `source`.
+                unsafe {
+                    list.SetComputeRootSignature(&root);
+                    list.SetPipelineState(&pipeline);
+                    list.SetComputeRoot32BitConstant(0, pieces, 0);
+                    list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(2, total.GetGPUVirtualAddress());
+                    list.Dispatch(groups, 1, 1);
+                }
+                Ok(())
+            })
+        })?;
+        // The sum so far, taken and then set back to nothing.
+        b.direct.timed(1, Submit::Together, &mut |_, list| {
+            // SAFETY: both buffers have 256 bytes.
+            unsafe { list.CopyBufferRegion(&readback, 0, &total, 0, 256) };
+            Ok(())
+        })?;
+        let got: Vec<u32> = gpu::read(&readback, 1)?;
+        ensure!(
+            got[0] == expected.wrapping_mul(runs),
+            "shader reads of a {name} added up to {:#x}, not {:#x}",
+            got[0],
+            expected.wrapping_mul(runs)
+        );
+        let zero = gpu::buffer(&device, D3D12_HEAP_TYPE_UPLOAD, 256, none)?;
+        gpu::write(&zero, &[0u32; 64])?;
+        b.direct.timed(1, Submit::Together, &mut |_, list| {
+            // SAFETY: both buffers have 256 bytes; `zero` outlives the wait.
+            unsafe { list.CopyBufferRegion(&total, 0, &zero, 0, 256) };
+            Ok(())
+        })?;
+        b.row(
+            Row::new(
+                "upload",
+                &format!("shader reads {mib} MiB, {name}"),
+                "reads",
+                1,
+            )
+            .timed(&t)
+            .moving(bytes)
+            .checked("the sum of what was read"),
+        );
+    }
+    Ok(())
+}
+
 pub fn run(b: &mut Bench) -> Result<()> {
     let device = b.adapter.device.clone();
     let mib = if b.quick { 1 } else { 64 };
@@ -186,5 +301,5 @@ pub fn run(b: &mut Bench) -> Result<()> {
             .checked("every piece"),
         );
     }
-    Ok(())
+    reads(b, mib, &data)
 }

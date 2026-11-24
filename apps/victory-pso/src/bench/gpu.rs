@@ -419,6 +419,28 @@ pub fn buffer(
     committed(device, heap, &buffer_desc(bytes, flags))
 }
 
+/// A buffer in the system's memory that the CPU caches (a custom heap).
+pub fn system_buffer(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource> {
+    let mut resource: Option<ID3D12Resource> = None;
+    // SAFETY: descriptions that outlive the call.
+    unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &buffer_desc(bytes, D3D12_RESOURCE_FLAG_NONE),
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut resource,
+        )?;
+    }
+    resource.context("no resource")
+}
+
 /// A mapped buffer's bytes, unmapped when dropped.
 pub struct Mapped<'a> {
     resource: &'a ID3D12Resource,
