@@ -607,9 +607,12 @@ impl State {
     /// The pipeline, the root signatures and the heaps are set by the next
     /// draw or dispatch (`bind`, which is told here that the host list has
     /// none); root arguments, vertex and index buffers are set by every
-    /// draw anyway. The dynamic descriptor slots and the tables made in
-    /// them stay: the parts before the cut have not run yet, and they are
-    /// given back when the title's list is reset.
+    /// draw anyway. The dynamic descriptor slots stay held: the parts before
+    /// the cut have not run yet, and the slots are given back when the
+    /// title's list is reset. The tables made in them are made again for
+    /// the new host list, not used again: their constant buffer views show
+    /// the old host list's upload memory, which goes back to the pool when
+    /// its part has run (and holds the values from before the wait).
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
@@ -617,6 +620,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.fresh_tables.clear();
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -2689,4 +2693,30 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::State;
+
+    /// The tables made before a cut are not used behind it: their constant
+    /// buffer views show upload memory of the host list before the cut.
+    /// The slots stay held until the parts before it have run.
+    #[test]
+    fn tables_made_before_a_cut_are_made_again_after_it() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let mut state = State::default();
+        state.fresh_tables.insert((0x1000, 4, 7), 12);
+        // (no such heap: giving its slots back does nothing)
+        state.dynamic.push((0, 12, 4));
+        state.replay(&list);
+        assert!(state.fresh_tables.is_empty());
+        assert_eq!(state.dynamic, [(0, 12, 4)]);
+        list.close();
+    }
 }
