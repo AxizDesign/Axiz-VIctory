@@ -726,16 +726,6 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     }
 }
 
-/// An unordered access barrier on every resource: earlier shader writes
-/// finish before later work reads or writes.
-const UAV_BARRIER: Barrier = Barrier {
-    kind: 2,
-    flags: 0,
-    first: std::ptr::null(),
-    second: 0,
-    last: 0,
-};
-
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -744,7 +734,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
+        let host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
             .collect();
@@ -753,7 +743,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         if barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
-            host.push(UAV_BARRIER);
+            list.write_barrier();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
@@ -1949,11 +1939,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.write_barrier();
     }
     #[cfg(not(windows))]
     let _ = (this, count);

@@ -736,7 +736,9 @@ pub(crate) struct HostList {
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: OnceLock<Option<Budget>>,
+    /// The list as one that takes enhanced barriers, if the host has them.
+    global: OnceLock<Option<ID3D12GraphicsCommandList7>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
@@ -2836,6 +2838,7 @@ impl Host {
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                global: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -5029,24 +5032,99 @@ impl HostList {
         scratch.chunks.iter().map(|c| c.1).sum()
     }
 
+    /// What the list's shaders wrote to buffers so far is there for whatever
+    /// reads it next: shaders, indirect arguments, vertices and indices,
+    /// copies. A barrier on shader writes alone orders them against other
+    /// shader accesses; the buffers are then still in the written state for
+    /// everything else. Where the host has enhanced barriers one of them
+    /// says it for all buffers, without a state of theirs
+    /// (`VICTORY_GLOBAL_BARRIER=0`: the barrier on shader writes, as before).
+    pub(crate) fn write_barrier(&self) {
+        let global = self.global.get_or_init(|| {
+            enhanced_barriers()
+                .then(|| self.list.cast::<ID3D12GraphicsCommandList7>().ok())
+                .flatten()
+        });
+        let Some(list) = global else {
+            // SAFETY: an open list; no resource named.
+            return unsafe { self.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+        };
+        let barrier = D3D12_GLOBAL_BARRIER {
+            SyncBefore: D3D12_BARRIER_SYNC_ALL_SHADING,
+            SyncAfter: D3D12_BARRIER_SYNC_ALL_SHADING
+                | D3D12_BARRIER_SYNC_EXECUTE_INDIRECT
+                | D3D12_BARRIER_SYNC_INDEX_INPUT
+                | D3D12_BARRIER_SYNC_COPY,
+            AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            AccessAfter: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
+                | D3D12_BARRIER_ACCESS_SHADER_RESOURCE
+                | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER
+                | D3D12_BARRIER_ACCESS_VERTEX_BUFFER
+                | D3D12_BARRIER_ACCESS_INDEX_BUFFER
+                | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT
+                | D3D12_BARRIER_ACCESS_COPY_SOURCE
+                | D3D12_BARRIER_ACCESS_COPY_DEST,
+        };
+        let group = D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_GLOBAL,
+            NumBarriers: 1,
+            Anonymous: D3D12_BARRIER_GROUP_0 {
+                pGlobalBarriers: &barrier,
+            },
+        };
+        // SAFETY: an open list; the group and its barrier outlive the call.
+        unsafe { list.Barrier(&[group]) };
+    }
+
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
+        // In the card's memory: every record clamped changes it, and each
+        // change of the PC's memory is a round trip over the bus.
+        let Budget { buffer, noted, data } = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
+                let host = host()?;
+                let (noted, data) = host.shared_buffer(256)?;
+                Some(Budget {
+                    buffer: host.uav_buffer(256)?,
+                    noted,
+                    data: data as usize,
+                })
             })
             .as_ref()?;
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
+            // SAFETY: an open list and live buffers; the budget is in the
+            // common state at a list's first use of it, and the words noted
+            // by the last run are brought out before they are zeroed.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let zeros = [0, 4, 8].map(|k| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                Dest: gpu + k,
+                Value: 0,
+            });
+            let list: ID3D12GraphicsCommandList2 = self.list.cast().ok()?;
+            // SAFETY: as above.
+            unsafe {
+                list.CopyBufferRegion(noted, 0, buffer, 0, 12);
+                list.ResourceBarrier(&[transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                list.WriteBufferImmediate(3, zeros.as_ptr(), None);
+                list.ResourceBarrier(&[transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
             let at = *data;
-            // SAFETY: the list's own mapped words, written before it runs.
-            // The words after the budget hold what the clamp noted about the
-            // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all): taken, then zeroed.
+            // SAFETY: the list's own mapped words. They hold what the clamp
+            // noted about the run before the list's last one (mesh
+            // dispatches: the largest group count asked for, the groups
+            // asked in all): taken, then zeroed.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
@@ -5915,6 +5993,39 @@ impl Meter {
                 });
         });
     }
+}
+
+/// A list's indirect-work budget (`crate::indirect`): the buffer the clamp
+/// counts in, and the mapped one its notes are copied to.
+struct Budget {
+    buffer: ID3D12Resource,
+    noted: ID3D12Resource,
+    data: usize,
+}
+
+/// Whether the host has enhanced barriers and they are not switched off.
+fn enhanced_barriers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        if std::env::var_os("VICTORY_GLOBAL_BARRIER").is_some_and(|v| v == "0") {
+            return false;
+        }
+        let Some(host) = host() else {
+            return false;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        // SAFETY: a plain query into our own structure.
+        let known = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS12,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        let has = known.is_ok() && options.EnhancedBarriersSupported.as_bool();
+        tracing::info!(has, "enhanced barriers");
+        has
+    })
 }
 
 /// Where the first thing stands that was already named before it.

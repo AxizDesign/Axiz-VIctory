@@ -10,7 +10,9 @@
 //!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
-//! tail slots. Each list has a budget (2^27 vertex instances or threads,
+//! tail slots, and the count the host is given is that bound, written behind
+//! the records in the scratch buffer: it is in the state the host reads
+//! counts in, and it is the one the records were clamped by. Each list has a budget (2^27 vertex instances or threads,
 //! groups counted as 64 threads, mesh groups as 128): active records past it
 //! run empty, saturating without 32-bit wraparound so a list of thousands of
 //! garbage records cannot run for seconds either.
@@ -56,6 +58,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
+        if (id.x == 0) dst_args.Store(records * stride, eff_count);
     }
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
@@ -221,7 +224,11 @@ fn min_stride(kind: u32) -> Option<u32> {
     }
 }
 
-/// Validates record alignment and returns the scratch byte size `stride * records`.
+/// Bytes of the count behind the records in the scratch buffer.
+const COUNT: u64 = 4;
+
+/// Validates record alignment and returns the records' byte size
+/// `stride * records`, where the scratch buffer has their count.
 fn validate_layout(
     (kind, stride, records): (u32, u32, u32),
     src_offset: u64,
@@ -235,7 +242,12 @@ fn validate_layout(
         return None;
     }
     let bytes = u64::from(stride).checked_mul(u64::from(records))?;
-    (bytes <= u64::from(u32::MAX)).then_some(bytes)
+    (bytes + COUNT <= u64::from(u32::MAX)).then_some(bytes)
+}
+
+/// Where the scratch buffer of a counted call has the count to run with.
+pub(crate) fn count_at(stride: u32, records: u32) -> u64 {
+    u64::from(stride) * u64::from(records)
 }
 
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
@@ -251,8 +263,19 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes + COUNT)?);
+    earlier_writes(list);
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+}
+
+/// Waits for earlier shader writes: the title's argument and count passes.
+/// `VICTORY_BARRIER_TEST=indirect` (diagnostics) leaves the wait out.
+fn earlier_writes(list: &HostList) {
+    #[cfg(feature = "diagnostics")]
+    if crate::copystat::barrier_test() & 2 != 0 {
+        return;
+    }
+    list.write_barrier();
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -272,6 +295,7 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    earlier_writes(list);
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
@@ -348,34 +372,25 @@ fn record_clamp_as(
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
     // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
-    // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
-    // waits for every earlier shader write out (the state changes stay).
+    // Diagnostics: counted.
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
-    #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
-    let first = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
-    ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
-    let skip = usize::from(!waits);
+    let first = [transition(
+        dst,
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    )];
+    // Of the clamp's own writes only: the budget changes by atomics, which
+    // a later clamp sees in any order.
+    let second = [transition(
+        dst,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    )];
     unsafe {
-        // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        // (Earlier shader writes, the title's argument and count passes,
+        // first: `HostList::write_barrier`.)
+        l.ResourceBarrier(&first);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -386,7 +401,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second);
     }
     true
 }
@@ -408,7 +423,7 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -775,7 +790,7 @@ void main() {
         let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
         let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = warp.shared_buffer((STRIDE * 8) as u64);
-        let dst_buf = warp.default_uav(u64::from(STRIDE) * u64::from(MAX));
+        let dst_buf = warp.default_uav(count_at(STRIDE, MAX) + COUNT);
         let sig = warp.signature(KIND_DISPATCH, STRIDE);
 
         // Fill the entire source buffer with non-zero sentinel bytes, then
@@ -829,6 +844,7 @@ void main() {
             (hits_ptr as *mut u32).write_volatile(0);
             std::ptr::write_bytes(readback_ptr, 0, (STRIDE * 8) as usize);
         }
+        let (count_back, count_back_ptr, _) = warp.shared_buffer(256);
 
         // Record Call #1 (`eff_count = 3` out of `MAX = 4096`), copy the first
         // 5 records of `dst_buf` out for inspection, then record Call #2
@@ -852,8 +868,8 @@ void main() {
                 MAX,
                 &dst_buf,
                 0,
-                Some(&count_buf),
-                COUNT_OFFSET_1 as u64,
+                Some(&dst_buf),
+                count_at(STRIDE, MAX),
             );
         }
         done_on(&warp.list, &dst_buf);
@@ -869,6 +885,8 @@ void main() {
             )]);
             warp.list
                 .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, u64::from(STRIDE * 5));
+            warp.list
+                .CopyBufferRegion(&count_back, 0, &dst_buf, count_at(STRIDE, MAX), 4);
             warp.list.ResourceBarrier(&[transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -897,13 +915,16 @@ void main() {
                 MAX,
                 &dst_buf,
                 0,
-                Some(&count_buf),
-                COUNT_OFFSET_2 as u64,
+                Some(&dst_buf),
+                count_at(STRIDE, MAX),
             );
         }
         done_on(&warp.list, &dst_buf);
 
         warp.submit_and_wait();
+        // SAFETY: the work is done; a mapped buffer.
+        let counted = unsafe { count_back_ptr.cast::<u32>().read_volatile() };
+        assert_eq!(counted, 3, "the count the host runs with is the clamped one");
 
         // SAFETY: GPU execution finished; read mapped host results.
         let (hits, spent, after_src, after_count, clamped_words) = unsafe {

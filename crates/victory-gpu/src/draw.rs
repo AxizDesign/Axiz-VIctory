@@ -2468,8 +2468,8 @@ impl State {
                 max,
                 &bounded,
                 at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                counter.is_some().then_some(&bounded),
+                crate::indirect::count_at(stride, max),
             )
         };
         if kind == MESH {
