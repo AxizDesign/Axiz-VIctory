@@ -58,6 +58,9 @@ struct Case {
     /// It counts over the wave: the host must have waves of the size it was
     /// translated for (32 or 64 lanes), which the software adapter has not.
     waves: bool,
+    /// Hosts of 32-lane waves have no exact form of it: it must be translated
+    /// approximately and say so, and is not run there.
+    inexact: bool,
 }
 
 /// The whole shader of `case`: a compute function in the calling convention
@@ -132,6 +135,7 @@ const CASES: &[Case] = &[
         written: 2,
         expected: |t| (t + 0x1234) << 8 | 5,
         waves: false,
+        inexact: false,
     },
     // A wave count in an `if` the lanes below 32 take: of those lanes, the
     // ones with a thread id below 70 (36 is "unsigned less than").
@@ -162,6 +166,7 @@ end:
             wave(t, 128).filter(|l| l & 63 < 32 && *l < 70).count() as u32
         },
         waves: true,
+        inexact: false,
     },
     // An `if` on a float condition every thread shares: the wave's lanes
     // above 40 when taken (34 is "unsigned greater than"), else K1.
@@ -175,6 +180,7 @@ end:
         written: 0,
         expected: |t| wave(t, 128).filter(|l| l & 63 > 40).count() as u32,
         waves: true,
+        inexact: false,
     },
     Case {
         name: "uniform-float-if-skipped",
@@ -186,6 +192,7 @@ end:
         written: 0,
         expected: |_| 7,
         waves: true,
+        inexact: false,
     },
     // A loop each lane leaves at its own time: `turns` steps of a generator
     // no compiler folds into a formula.
@@ -217,6 +224,7 @@ done:",
         written: 0,
         expected: |t| (0..turns(t)).fold(t + 1, |x, _| xorshift(x)),
         waves: false,
+        inexact: false,
     },
     // A value every lane of the wave holds alike, fetched from the first
     // lane (what compilers use the instruction for): three times the thread
@@ -237,9 +245,13 @@ done:",
         written: 0,
         expected: |t| 3 * (t & !63) + t,
         waves: false,
+        inexact: false,
     },
     // A wave count in a loop the lanes leave at different times: at each
-    // turn, how many of the wave's lanes are still in it (32 is "equal").
+    // turn, how many of the wave's lanes are still in it (32 is "equal"). Two
+    // 32-lane host waves would have to wait for each other inside the loop,
+    // where the other may have left: D3D12 says nothing of such a barrier, and
+    // hardware may wait for ever.
     Case {
         name: "wave-count-in-loop",
         body: "entry:
@@ -269,6 +281,7 @@ done:",
                 .sum()
         },
         waves: true,
+        inexact: true,
     },
 ];
 
@@ -407,8 +420,11 @@ fn run_case(
     if !text(&o).contains("dxil.dll") {
         return Err(Some(format!("not validated: {}", text(&o).trim())));
     }
-    if let Some(form) = approximate(&o) {
-        return Err(Some(format!("translated approximately: {form}")));
+    match (approximate(&o), case.inexact && wave64 == "wave32") {
+        (Some(_), true) => return Ok(()),
+        (None, true) => return Err(Some("claims to be exact, and cannot be".to_owned())),
+        (Some(form), false) => return Err(Some(format!("translated approximately: {form}"))),
+        (None, false) => {}
     }
     let o = tool([
         OsStr::new("verify"),

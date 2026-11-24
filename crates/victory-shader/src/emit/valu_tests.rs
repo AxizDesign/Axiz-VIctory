@@ -1365,6 +1365,14 @@ fn mad_64_multiplies_32_bits_and_adds_64() {
     run_cases(&mad_of(0x177, NULL, &high), &cases, |label, _, k, got| {
         assert_eq!(got, (signed(k) >> 32) as u32, "{label}: v_mad_i64_i32 high {k:x?}");
     });
+    // A carry destination the program names and does not read takes nothing
+    // from the product.
+    run_cases(&mad_of(0x177, VCC, &low), &cases, |label, _, k, got| {
+        assert_eq!(got, signed(k) as u32, "{label}: v_mad_i64_i32 low, VCC named {k:x?}");
+    });
+    run_cases(&mad_of(0x177, VCC, &high), &cases, |label, _, k, got| {
+        assert_eq!(got, (signed(k) >> 32) as u32, "{label}: v_mad_i64_i32 high, VCC named {k:x?}");
+    });
     // The carry out: `v_mov_b32 v7, 1`, then `v_cndmask_b32 v0, 0, v7` (v7
     // where VCC is set).
     let carry = [vop1(0x001, 7, 0x81), 0x01 << 25 | 7 << 9 | 0x80];

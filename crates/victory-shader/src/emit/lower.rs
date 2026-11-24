@@ -338,83 +338,108 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
-fn all_lane_blocks(p: &Program, st: &Structured, res: &Resources) -> Option<Vec<bool>> {
-    let n = st.exits.len();
-    let mut all = vec![true; n];
-    for (_, region) in lane_regions(st, &group_bits(p, st, res))? {
-        for b in (0..n).filter(|&b| region[b]) {
-            all[b] = false;
-        }
-    }
-    Some(all)
+/// `several`: the thread group is several console waves, so that a scalar condition parts them
+/// unless it is the same in all of them ([`Alike`]).
+fn all_lane_blocks(p: &Program, st: &Structured, io: &Io, res: &Resources, several: bool) -> Option<Vec<bool>> {
+    let flow = Flow::of(st)?;
+    Some(flow.all_lanes(&flow.regions(st, &alike(p, st, io, res, several, &flow))))
 }
 
-/// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
-/// not post-dominate it, which only some lanes run. Not the branches the wave takes together
-/// ([`Structured::wide`]), nor those on scalar conditions, nor those on compares that give
-/// every lane of the group the same bit (`same`: [`group_bits`]). None with an indirect exit.
-fn lane_regions(st: &Structured, same: &HashSet<Value>) -> Option<Vec<(usize, Vec<bool>)>> {
-    let n = st.exits.len();
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (b, e) in st.exits.iter().enumerate() {
-        match *e {
-            LaneExit::Jump(t) => succ[b].push(t),
-            LaneExit::Branch { taken, not_taken, .. } => {
-                succ[b].push(taken);
-                succ[b].push(not_taken);
+/// The blocks' ways to one another as the lanes take them.
+struct Flow {
+    succ: Vec<Vec<usize>>,
+    /// Post-dominators (bitsets; a virtual exit after every end).
+    pdom: Vec<Vec<u64>>,
+}
+
+impl Flow {
+    /// None with an indirect exit.
+    fn of(st: &Structured) -> Option<Flow> {
+        let n = st.exits.len();
+        let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (b, e) in st.exits.iter().enumerate() {
+            match *e {
+                LaneExit::Jump(t) => succ[b].push(t),
+                LaneExit::Branch { taken, not_taken, .. } => {
+                    succ[b].push(taken);
+                    succ[b].push(not_taken);
+                }
+                LaneExit::End => {}
+                LaneExit::Indirect => return None,
             }
-            LaneExit::End => {}
-            LaneExit::Indirect => return None,
         }
-    }
-    // post-dominators (bitsets; a virtual exit after every End)
-    let words = n.div_ceil(64);
-    let full = vec![u64::MAX; words];
-    let mut pdom: Vec<Vec<u64>> = (0..n).map(|b| if succ[b].is_empty() { let mut v = vec![0; words]; v[b / 64] |= 1 << (b % 64); v } else { full.clone() }).collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in (0..n).rev() {
-            if succ[b].is_empty() {
-                continue;
-            }
-            let mut v = full.clone();
-            for &t in &succ[b] {
-                for w in 0..words {
-                    v[w] &= pdom[t][w];
+        let words = n.div_ceil(64);
+        let full = vec![u64::MAX; words];
+        let mut pdom: Vec<Vec<u64>> = (0..n).map(|b| if succ[b].is_empty() { let mut v = vec![0; words]; v[b / 64] |= 1 << (b % 64); v } else { full.clone() }).collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in (0..n).rev() {
+                if succ[b].is_empty() {
+                    continue;
+                }
+                let mut v = full.clone();
+                for &t in &succ[b] {
+                    for w in 0..words {
+                        v[w] &= pdom[t][w];
+                    }
+                }
+                v[b / 64] |= 1 << (b % 64);
+                if v != pdom[b] {
+                    pdom[b] = v;
+                    changed = true;
                 }
             }
-            v[b / 64] |= 1 << (b % 64);
-            if v != pdom[b] {
-                pdom[b] = v;
-                changed = true;
-            }
         }
+        Some(Flow { succ, pdom })
     }
-    let mut regions = Vec::new();
-    for (d, e) in st.exits.iter().enumerate() {
-        let LaneExit::Branch { when, .. } = *e else { continue };
-        let together = |a: &Atom| match *a {
-            Atom::Uniform(_) => true,
-            Atom::Lane(v) => same.contains(&v),
-            _ => false,
-        };
-        if st.wide.contains(&d) || st.bools.support(when).iter().all(together) {
-            continue; // a wave-wide or uniform branch: all lanes go the same way
-        }
-        // blocks reachable from the lane branch that do not post-dominate it
-        let mut seen = vec![false; n];
-        let mut stack: Vec<usize> = succ[d].clone();
-        while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+
+    /// Every branch that parts lanes (by its block) with its region: the blocks reachable from
+    /// it that do not post-dominate it, which only some lanes run. Not the branches the wave
+    /// takes together ([`Structured::wide`]), nor those that take the whole group one way
+    /// (`same`).
+    fn regions(&self, st: &Structured, same: &Alike) -> Vec<(usize, Vec<bool>)> {
+        let n = self.succ.len();
+        let mut regions = Vec::new();
+        for (d, e) in st.exits.iter().enumerate() {
+            let LaneExit::Branch { when, .. } = *e else { continue };
+            let together = |a: &Atom| match *a {
+                Atom::Uniform(v) => !same.several || same.values.contains(&v),
+                Atom::Lane(v) => same.bits.contains(&v),
+                _ => false,
+            };
+            if st.wide.contains(&d) || st.bools.support(when).iter().all(together) {
                 continue;
             }
-            seen[b] = true;
-            stack.extend(succ[b].iter().copied());
+            // blocks reachable from the branch that do not post-dominate it: itself too, when
+            // a way leads back to it without passing one that does (a loop lanes leave at
+            // different times runs it a different number of times in each)
+            let mut seen = vec![false; n];
+            let mut stack: Vec<usize> = self.succ[d].clone();
+            while let Some(b) = stack.pop() {
+                if seen[b] || b != d && self.pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+                    continue;
+                }
+                seen[b] = true;
+                stack.extend(self.succ[b].iter().copied());
+            }
+            regions.push((d, seen));
         }
-        regions.push((d, seen));
+        regions
     }
-    Some(regions)
+
+    fn all_lanes(&self, regions: &[(usize, Vec<bool>)]) -> Vec<bool> {
+        (0..self.succ.len()).map(|b| !regions.iter().any(|(_, r)| r[b])).collect()
+    }
+}
+
+/// Whether the program's thread group is several console waves.
+fn several_waves(native: &NativeProgram) -> bool {
+    let wave = if native.wave64 { 64 } else { 32 };
+    match native.io {
+        StageIo::Cs(cs) => cs.threads.iter().product::<u32>() > wave,
+        _ => false,
+    }
 }
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
@@ -422,13 +447,17 @@ fn lane_regions(st: &Structured, same: &HashSet<Value>) -> Option<Vec<(usize, Ve
 /// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
 /// of them is a branch whose wave-wide meaning is not known ([`Structured::wave_any`]).
 pub(super) fn branches_around(
+    native: &NativeProgram,
     p: &Program,
     st: &Structured,
+    io: &Io,
     res: &Resources,
     needs: &[usize],
 ) -> Option<Vec<usize>> {
+    let flow = Flow::of(st)?;
+    let same = alike(p, st, io, res, several_waves(native), &flow);
     let mut out = Vec::new();
-    for (d, region) in lane_regions(st, &group_bits(p, st, res))? {
+    for (d, region) in flow.regions(st, &same) {
         if needs.iter().any(|&b| region.get(b).copied().unwrap_or(false)) {
             st.wave_any.get(d).copied().flatten()?;
             out.push(d);
@@ -457,49 +486,110 @@ fn operands_same(inst: &Inst, same: &HashSet<Value>) -> bool {
     })
 }
 
-/// VALU compare results whose bit is the same in every lane of the thread group, wherever
-/// the compare stands: its operands are root parameters, constants, and what scalar
-/// instructions and unguarded copies make of those. A branch on such bits alone parts no
-/// lanes although each lane takes it by its own bit ([`lane_regions`]): the whole group goes
-/// one way, so the blocks behind it are still blocks every thread reaches and two host waves
-/// may meet there. Float conditions always come this way, there being no scalar float
-/// compare, and so does any condition the compiler found cheaper in a VGPR.
-/// shortcut: nothing joined by a phi counts, nor does the thread group's id.
-fn group_bits(p: &Program, st: &Structured, res: &Resources) -> HashSet<Value> {
+/// What the lanes of a thread group have in common, wherever they hold it.
+struct Alike {
+    /// Scalars, and copies of them in VGPRs.
+    values: HashSet<Value>,
+    /// VALU compare results whose bit is the same in every lane: a branch on such bits alone
+    /// parts no lanes although each lane takes it by its own bit. The whole group goes one way,
+    /// so the blocks behind it are still blocks every thread reaches and two host waves may
+    /// meet there. Float conditions always come this way, there being no scalar float compare,
+    /// and so does any condition the compiler found cheaper in a VGPR.
+    bits: HashSet<Value>,
+    /// The group is several console waves: a scalar is the same within each, not between them.
+    several: bool,
+}
+
+/// Works that out from root parameters, the thread group's id, constants, and what scalar
+/// instructions and unguarded copies make of those; a join counts where its sides agree and
+/// no branch that parts lanes lies behind it. Everything is taken to be the same until
+/// something shows it is not, so a loop's counter is: it depends on itself.
+fn alike(p: &Program, st: &Structured, io: &Io, res: &Resources, several: bool, flow: &Flow) -> Alike {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    // The host loads once per lane where the console loads once per wave: memory that changes
+    // meanwhile, of which the program's own re-reading of it is the sign, may give them
+    // different values.
+    let refreshes = insts().any(|i| matches!(i.name(), "s_dcache_inv" | "s_gl1_inv"));
+    let plain = |inst: &Inst| matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none());
+    let compares = |inst: &Inst| {
+        plain(inst) && inst.name().starts_with("v_cmp") && !inst.name().starts_with("v_cmpx")
+    };
     // (a lane mask is the same as a number in no two waves: a wave may lack lanes)
-    let mut same: HashSet<Value> =
-        res.params.iter().map(|&(v, _, _)| v).filter(|&v| !is_mask(v)).collect();
-    let mut bits = HashSet::new();
-    for b in crate::ir::reverse_postorder(&p.blocks) {
-        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-            let name = inst.name();
-            let plain = matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none());
-            let compare = plain && name.starts_with("v_cmp") && !name.starts_with("v_cmpx");
-            let copy = plain && name == "v_mov_b32" && st.guards[b][i].is_none();
-            // (not what a wave says of itself: its registers, its lane counts and numbers)
-            let scalar = matches!(inst.fields, Fields::Sop { .. } | Fields::Smem { .. })
-                && !(name.starts_with("s_getreg")
-                    || name.starts_with("s_bcnt")
-                    || name.starts_with("s_ff1")
-                    || name.contains("saveexec"));
-            let alike = if compare || copy {
-                operands_same(inst, &same)
-            } else {
-                scalar && inst.reads.iter().all(|r| same.contains(&r.1))
-            };
-            if !alike {
-                continue;
+    let ids = io.inputs.iter().filter(|i| matches!(i.1, Input::GroupId(_))).map(|i| i.0);
+    let mut same = Alike {
+        values: res
+            .params
+            .iter()
+            .map(|&(v, _, _)| v)
+            .chain(ids)
+            .chain(p.blocks.iter().flat_map(|b| b.phis.iter().map(|f| f.value)))
+            .chain(insts().flat_map(|i| i.writes.iter().map(|w| w.1)))
+            .filter(|&v| !is_mask(v))
+            .collect(),
+        bits: insts()
+            .filter(|i| compares(i))
+            .flat_map(|i| i.writes.iter().map(|w| w.1))
+            .collect(),
+        several,
+    };
+    loop {
+        let mut changed = false;
+        let all = flow.all_lanes(&flow.regions(st, &same));
+        let ran = |b: usize| all.get(b).copied().unwrap_or(false);
+        for (b, block) in p.blocks.iter().enumerate() {
+            let met = ran(b) && block.preds.iter().all(|&q| ran(q));
+            for phi in &block.phis {
+                if !(met && phi.args.iter().all(|a| same.values.contains(a))) {
+                    changed |= same.values.remove(&phi.value);
+                }
             }
-            let written = inst.writes.iter().map(|w| w.1);
-            if compare {
-                bits.extend(written);
-            } else {
-                same.extend(written.filter(|&v| !is_mask(v)));
+            for (i, inst) in block.insts.iter().enumerate() {
+                let name = inst.name();
+                let compare = compares(inst);
+                let copy = plain(inst) && name == "v_mov_b32" && st.guards[b][i].is_none();
+                let scalar = match &inst.fields {
+                    // (not what a wave says of itself: its registers, lane counts and numbers)
+                    Fields::Sop { .. } => {
+                        !(name.starts_with("s_getreg")
+                            || name.starts_with("s_bcnt")
+                            || name.starts_with("s_ff1")
+                            || name.contains("saveexec")
+                            || name.contains("wrexec"))
+                    }
+                    // (loads alone: a clock or the wave's number also reads no register)
+                    Fields::Smem { cache, .. } => {
+                        (name.starts_with("s_load_dword") || name.starts_with("s_buffer_load_dword"))
+                            && !cache.glc
+                            && !refreshes
+                    }
+                    _ => false,
+                };
+                let alike = if compare || copy {
+                    operands_same(inst, &same.values)
+                } else {
+                    scalar && inst.reads.iter().all(|r| same.values.contains(&r.1))
+                };
+                for &(_, w) in &inst.writes {
+                    if compare || !alike {
+                        changed |= same.values.remove(&w);
+                    }
+                    if compare && !alike {
+                        changed |= same.bits.remove(&w);
+                    }
+                }
             }
         }
+        if !changed {
+            return same;
+        }
     }
-    bits
+}
+
+/// [`alike`]'s bits, for tests.
+#[cfg(test)]
+pub(super) fn group_bits(p: &Program, st: &Structured, io: &Io, res: &Resources) -> HashSet<Value> {
+    alike(p, st, io, res, true, &Flow::of(st).expect("no indirect exit")).bits
 }
 
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
@@ -1379,7 +1469,7 @@ impl<'a> Lower<'a> {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
-                    if let Some(all) = all_lane_blocks(p, x.st, x.res) {
+                    if let Some(all) = all_lane_blocks(p, x.st, x.io, x.res, several_waves(x.native)) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
@@ -1438,7 +1528,7 @@ impl<'a> Lower<'a> {
                     }
                     if s.lds_dwords > 0 && group > 32 {
                         why.push("LDS in a group over 32");
-                        match all_lane_blocks(p, x.st, x.res) {
+                        match all_lane_blocks(p, x.st, x.io, x.res, several_waves(x.native)) {
                             None => why.push("an indirect exit"),
                             Some(all) if lds_meetings(p, x.st, &all).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
@@ -1480,7 +1570,9 @@ impl<'a> Lower<'a> {
                 .iter()
                 .enumerate()
                 .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
-            let all = all_lane_blocks(p, x.st, x.res);
+            // (scalar conditions taken as the source's: HLSL has such a barrier only where the
+            // whole group goes)
+            let all = all_lane_blocks(p, x.st, x.io, x.res, false);
             (0..p.blocks.len())
                 .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
                 .filter(|&b| {
@@ -2067,7 +2159,7 @@ impl<'a> Lower<'a> {
         let every = if halves {
             self.all_lanes(self.cur_ir)
         } else {
-            all_lane_blocks(self.x.p, self.x.st, self.x.res).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
+            all_lane_blocks(self.x.p, self.x.st, self.x.io, self.x.res, several_waves(self.x.native)).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
         };
         if !every {
             if halves {
@@ -6616,9 +6708,6 @@ impl<'a> Lower<'a> {
                     Some(Operand::Scalar { code, .. }) => inst.write(Reg::S(code)),
                     _ => None,
                 };
-                if signed && named.is_some() {
-                    return Err("the carry out of v_mad_i64_i32");
-                }
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let x = self.src64(inst, 2)?;
                 let i64t = self.s.m.int(64);
@@ -6636,7 +6725,12 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::V(reg), lo, guard);
                 self.write(inst, Reg::V(reg + 1), hi, guard);
                 if let Some(w) = named {
-                    self.lane_bits.insert(w, carry);
+                    if signed {
+                        // (named whether the program reads it or not: that reading stops)
+                        self.lane_fail.insert(w, "the carry out of v_mad_i64_i32");
+                    } else {
+                        self.lane_bits.insert(w, carry);
+                    }
                 }
                 for &(_, w) in &inst.writes {
                     self.vals

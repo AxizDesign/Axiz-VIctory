@@ -283,7 +283,8 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     let needs = lower::take_needs();
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    assert_eq!(lower::branches_around(&p, &st, &res, &needs), Some(vec![branch]));
+    let io = io::raise(&p, &native).expect("io::raise");
+    assert_eq!(lower::branches_around(&native, &p, &st, &io, &res, &needs), Some(vec![branch]));
     // (taken, past the body, when every lane's bit is clear)
     assert_eq!(st.wave_any[branch], Some(false));
     // wave-wide, every lane runs the reduction (EXEC stays a guard on what it does there)
@@ -438,7 +439,8 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     );
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    assert_eq!(lower::branches_around(&p, &st, &res, &lower::take_needs()), Some(vec![branch]));
+    let io = io::raise(&p, &native).expect("io::raise");
+    assert_eq!(lower::branches_around(&native, &p, &st, &io, &res, &lower::take_needs()), Some(vec![branch]));
     let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -502,4 +504,147 @@ fn a_branch_on_a_compare_of_root_constants_parts_no_lanes() {
         assert_eq!(got, expected, "s0 = {level}, s1 = {s1}");
     }
     eprintln!("ran on the hardware device: one count over the console wave behind a branch all lanes take alike");
+}
+
+/// Whether a form of the program needs the two host waves to meet where not every lane runs.
+fn stops(native: &NativeProgram) -> bool {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lower::take_needs();
+    let r = lowered(native, &p, &HashSet::new());
+    lower::take_needs();
+    match r {
+        Ok(shader) => {
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                let mut copy = shader.dxil.clone();
+                v.validate(&mut copy).expect("DXIL validation failed");
+            }
+            false
+        }
+        Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what) => true,
+        Err(e) => panic!("stopped for another reason: {e:?}"),
+    }
+}
+
+/// `v_mov_b32 v0, s<n>` and the store of v0.
+fn store_sgpr(n: u32) -> [u32; 3] {
+    [0x7E00_0200 | n, 0x38 << 26 | 0x1C << 18, 0x80 << 24 | 2 << 16]
+}
+
+#[test]
+fn a_loop_lanes_leave_at_different_times_is_no_place_to_meet() {
+    let after = |body: &[u32]| {
+        let mut words = vec![0x7E02_0280]; // v_mov_b32 v1, 0
+        words.extend_from_slice(body);
+        words.push(0xBEFE_04C1); // s_mov_b64 exec, -1
+        words.extend(store_sgpr(6));
+        native(&words)
+    };
+    // One block, closed by the branch the lanes leave by.
+    let own = [
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0x7D82_0101, // v_cmp_lt_u32 vcc, v1, v0
+        0xBE86_106A, // s_bcnt1_i32_b64 s6, vcc
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF89_FFFB, // s_cbranch_execnz to the top
+    ];
+    assert!(stops(&after(&own)), "a count in the block that closes the loop");
+    // The test and the count at the top, the way back from the bottom.
+    let top = [
+        0x7D82_0101, // v_cmp_lt_u32 vcc, v1, v0
+        0xBE86_106A, // s_bcnt1_i32_b64 s6, vcc
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF88_0002, // s_cbranch_execz past the loop
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0xBF82_FFFA, // s_branch to the top
+    ];
+    assert!(stops(&after(&top)), "a count in the block that opens the loop");
+    // A loop all lanes leave together, round a branch that parts them: they have met again
+    // by the block that closes it.
+    let together = [
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xBE87_0380, // s_mov_b32 s7, 0
+        // the top
+        0x7D82_02A8, // v_cmp_lt_u32 vcc, 40, v1
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0001, // s_cbranch_execz
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7D82_0101, // v_cmp_lt_u32 vcc, v1, v0
+        0xBE86_106A, // s_bcnt1_i32_b64 s6, vcc
+        0x8007_8107, // s_add_u32 s7, s7, 1
+        0xBF0A_8407, // s_cmp_lt_u32 s7, 4
+        0xBF85_FFF6, // s_cbranch_scc1 to the top
+    ];
+    assert!(!stops(&after(&together)), "a count where the lanes have met again");
+}
+
+#[test]
+fn several_console_waves_meet_only_behind_what_their_group_shares() {
+    // The count behind a scalar branch, of threads above 40 in their wave.
+    let count = [
+        0x3602_00BF, // v_and_b32 v1, 63, v0
+        0x7D82_02A8, // v_cmp_lt_u32 vcc, 40, v1
+        0xBE82_106A, // s_bcnt1_i32_b64 s2, vcc
+    ];
+    let behind = |condition: &[u32], threads: u32| {
+        let mut words = condition.to_vec();
+        words.push(0xBF84_0003); // s_cbranch_scc0 past the count
+        words.extend(count);
+        words.extend(store_sgpr(2));
+        native_of(&words, true, threads)
+    };
+    // The wave's own count of something: two waves of a group may go different ways.
+    let wave = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE81_106A, // s_bcnt1_i32_b64 s1, vcc
+        0xBF08_8801, // s_cmp_gt_u32 s1, 8
+    ];
+    assert!(stops(&behind(&wave, 128)), "a wave's own count decides");
+    assert!(!stops(&behind(&wave, 64)), "one wave is the group");
+    let constant = [0xBF08_8800]; // s_cmp_gt_u32 s0, 8
+    assert!(!stops(&behind(&constant, 128)), "a root constant decides");
+    // A scalar counter, joined by a phi at the loop's top.
+    let mut counted = vec![0xBE86_0380]; // s_mov_b32 s6, 0
+    counted.extend(count);
+    counted.extend([
+        0x8006_8106, // s_add_u32 s6, s6, 1
+        0xBF0A_8406, // s_cmp_lt_u32 s6, 4
+        0xBF85_FFFA, // s_cbranch_scc1 to the count
+    ]);
+    counted.extend(store_sgpr(2));
+    assert!(!stops(&native_of(&counted, true, 128)), "a scalar counter decides");
+}
+
+#[test]
+fn what_a_group_shares_is_not_what_a_wave_or_a_moment_gives() {
+    // `load` into s6, `v_mov_b32 v1, s6`, `v_cmp_ne_u32 vcc, 5, v1`: whether the group shares
+    // that bit.
+    let shared = |load: &[u32]| {
+        let mut words = load.to_vec();
+        words.extend([0x7E02_0206, 0x7D8A_0285]);
+        words.extend([0x7E04_0280, 0x0204_0281]); // v2 = 0, then 1 where VCC is set
+        let native = native(&words);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure_wide(&p, &HashSet::new()).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let bit = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "v_cmp_ne_u32")
+            .expect("the compare")
+            .writes[0]
+            .1;
+        lower::group_bits(&p, &st, &io, &res).contains(&bit)
+    };
+    let smem = |op: u32, base: u32, more: u32| [0x3D << 26 | op << 18 | 6 << 6 | base | more, 125 << 25];
+    assert!(shared(&smem(8, 4, 0)), "s_buffer_load_dword");
+    assert!(!shared(&smem(8, 4, 1 << 16)), "s_buffer_load_dword glc");
+    let mut refreshed = smem(0x20, 0, 0).to_vec();
+    refreshed[0] &= !(0x7F << 6);
+    refreshed.extend(smem(8, 4, 0));
+    assert!(!shared(&refreshed), "s_buffer_load_dword in a program with s_dcache_inv");
+    assert!(!shared(&smem(0x24, 0, 0)), "s_memtime");
+    assert!(!shared(&smem(0x2A, 0, 0)), "s_get_waveid_in_workgroup");
 }
