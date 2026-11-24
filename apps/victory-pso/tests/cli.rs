@@ -1,4 +1,4 @@
-//! The command line end to end: `fixture`, `build`, `verify`, on the software
+//! The command line end to end: `fixture`, `build`, `verify`, `bench`, on the software
 //! adapter (WARP) and, where there is one, on an NVIDIA adapter. The inputs
 //! are `fixture`'s synthetic ones; nothing of a title is read or run.
 
@@ -87,6 +87,48 @@ fn compute_fixtures_run_on_the_software_adapter() {
 #[test]
 fn compute_fixtures_run_on_an_nvidia_adapter() {
     compute_fixtures_pass("nvidia", "wave32", &["bindings", "skipped-ballot"]);
+}
+
+/// A small run of every group that opens no window; what it measured is not
+/// looked at, only that the results it checks were right. Returns false,
+/// having said why, when the adapter is not there.
+fn bench_passes(adapter: &str) -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("report.toml");
+    let o = tool([
+        OsStr::new("bench"),
+        OsStr::new("--adapter"),
+        OsStr::new(adapter),
+        OsStr::new("--quick"),
+        OsStr::new("--rounds"),
+        OsStr::new("1"),
+        OsStr::new("--out"),
+        report.as_os_str(),
+    ]);
+    if o.status.code() == Some(3) {
+        eprintln!("skipped: {}", text(&o).trim());
+        return false;
+    }
+    assert!(o.status.success(), "{adapter}: {}", text(&o));
+    let report: toml::Table = toml::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    let rows = report["row"].as_array().unwrap();
+    for group in ["draws", "upload", "sync", "pipelines", "resources"] {
+        assert!(
+            rows.iter().any(|r| r["group"].as_str() == Some(group)),
+            "no row of `{group}` on {adapter}"
+        );
+    }
+    true
+}
+
+#[test]
+fn the_bench_runs_on_the_software_adapter() {
+    assert!(bench_passes("warp"));
+}
+
+#[test]
+fn the_bench_runs_on_an_nvidia_adapter() {
+    bench_passes("nvidia");
 }
 
 #[test]

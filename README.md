@@ -193,6 +193,7 @@ victory-pso fixture <dir>
 victory-pso wrap <program.toml> --out <container>
 victory-pso build <pipeline.toml> --out <dir> [--wave64 native|wave32]
 victory-pso verify <dir> [--adapter nvidia|warp|any] [--run]
+victory-pso bench [--adapter nvidia|warp|any] [--only <groups>] [--out <report.toml>]
 ```
 
 - `fixture` writes synthetic inputs (our own GFX10 code in the console's
@@ -215,6 +216,16 @@ victory-pso verify <dir> [--adapter nvidia|warp|any] [--run]
   and wave lane counts, and creates the root signature and pipeline state.
   With `--run`, a compute pipeline is dispatched with the description's
   `[run]` bindings and its buffers are read back and compared.
+
+- `bench` times what the host's D3D12 driver does with work of its own, no
+  translated shader: draws with each kind of state change between them and
+  split over submissions, copies on each queue, fences, pipeline creation
+  (cold, again, from a blob, on threads), resources and barriers. Each row
+  has the CPU's recording, submitting and waiting and the GPU's own time
+  apart, and the results are checked, so a wrong driver fails. `--only
+  present` opens a small window; `--debug-layer` checks the program's own
+  use of D3D12 (its times then say nothing); `hooks` names overlays and
+  capture tools inside the process, whose cost would read as the driver's.
 
 `--wave64` names the host 64-lane compute programs are translated for:
 `wave32` (the default) one whose widest wave has 32 lanes, as NVIDIA's,

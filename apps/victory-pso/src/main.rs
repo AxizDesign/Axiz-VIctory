@@ -7,7 +7,8 @@
 //! description gives, and writes the DXIL with a manifest of its bindings.
 //! `verify` creates the root signature and pipeline state those define on an
 //! adapter picked through DXGI, and can run a compute pipeline and compare
-//! what it wrote. `fixture` writes synthetic inputs for both.
+//! what it wrote. `fixture` writes synthetic inputs for both. `bench` times
+//! the host's D3D12 driver on work of its own.
 //!
 //! Exit codes: 0 done; 1 an error (bad input, unsupported state, a pipeline
 //! the device refuses); 3 the adapter asked for is not there; 4 a run's
@@ -15,6 +16,8 @@
 
 #[cfg(windows)]
 mod adapter;
+#[cfg(windows)]
+mod bench;
 mod build;
 mod fixture;
 mod manifest;
@@ -99,6 +102,10 @@ enum Command {
         #[arg(long)]
         run: bool,
     },
+    /// Time what the host's D3D12 driver does with draws, copies, waits,
+    /// pipelines and resources of our own, and check the results.
+    #[cfg(windows)]
+    Bench(bench::Options),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -122,6 +129,8 @@ fn run(cli: Cli) -> Result<()> {
             };
             build::run(&description, &out, mode)
         }
+        #[cfg(windows)]
+        Command::Bench(options) => bench::run(&options),
         #[cfg(windows)]
         Command::Verify { dir, adapter, run } => verify::run(&dir, adapter, run),
         #[cfg(not(windows))]
