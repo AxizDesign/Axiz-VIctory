@@ -2010,6 +2010,13 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // A null view has no memory to copy; a view shows
+                        // at most what a constant buffer holds.
+                        let size = crate::descriptor::checks::constant_bytes(size);
+                        if address == 0 || size == 0 {
+                            host.constant_at(index, 0, 0);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;

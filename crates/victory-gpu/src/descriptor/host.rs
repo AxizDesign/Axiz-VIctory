@@ -10,6 +10,10 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use super::checks::{
+    castable, constant_bytes, constant_desc, name_shader_format, shader_view_fits, typed_buffer,
+    unordered_view_fits,
+};
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
@@ -1217,10 +1221,7 @@ impl HostHeap {
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
-        };
+        let desc = constant_desc(gpu, size);
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
@@ -1600,7 +1601,10 @@ fn buffer_srv(
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+    let typed = !raw && stride == 0;
+    if !buffer_view_ok(desc.Format, first, count, stride, raw, width)
+        || typed && !typed_buffer(desc.Format, count, false)
+    {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
             format = desc.Format.0,
@@ -1680,7 +1684,10 @@ fn buffer_uav(
     }
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+    let typed = !raw && stride == 0;
+    if !buffer_view_ok(desc.Format, first, count, stride, raw, width)
+        || typed && !typed_buffer(desc.Format, count, true)
+    {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
             format = desc.Format.0,
@@ -1707,9 +1714,8 @@ fn buffer_uav(
 /// view; the host refuses (and removes the device for) views without the
 /// resource's permission, of typed depth, and in another format than a
 /// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
-/// shortcut: such a view (sRGB of UNORM, say) reads without its
-/// conversion; cast with castable formats if colors come out wrong.
+/// family keeps it where the host casts ([`castable`]: sRGB of UNORM, say)
+/// and takes the texture's format where it does not.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -1760,6 +1766,8 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     if let Some(format) = format
         && !typeless
+        && view != own
+        && !castable(own, view)
     {
         *format = d.Format;
     }
@@ -1840,7 +1848,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+            if address == 0 || size == 0 {
+                return None;
+            }
+            let shadow = crate::shadow::find(address, u64::from(constant_bytes(size)))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 once!(
@@ -1849,10 +1860,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 );
                 return None;
             }
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
-            };
+            let desc = constant_desc(gpu, size);
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
             Some(Some(shadow.buffer.clone()))
@@ -1885,7 +1893,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                // SAFETY: a live resource.
+                let own = unsafe { texture.GetDesc() };
+                if !name_shader_format(&own, &mut desc)
+                    || !fits(texture, desc.as_mut().map(|d| &mut d.Format), false)
+                    || !desc.as_mut().is_none_or(|v| shader_view_fits(&own, v))
+                {
+                    REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    once!(
+                        texture = own.Format.0,
+                        view = desc.map_or(0, |v| v.Format.0),
+                        dimension = desc.map_or(0, |v| v.ViewDimension.0),
+                        "texture view the host would refuse left null"
+                    );
                     return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
@@ -1946,7 +1966,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 None => texture,
             };
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            // SAFETY: a live resource.
+            let own = unsafe { texture.GetDesc() };
+            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true)
+                || !desc.as_mut().is_none_or(|v| unordered_view_fits(&own, v))
+            {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.

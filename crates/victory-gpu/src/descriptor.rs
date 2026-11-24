@@ -11,6 +11,8 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+pub(crate) mod checks;
+#[cfg(windows)]
 pub(crate) mod host;
 
 const HEAP_IIDS: [Iid; 4] = [
@@ -207,8 +209,7 @@ impl RtvRecord {
     pub(crate) fn desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        self.host_desc(false)
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -216,27 +217,23 @@ impl RtvRecord {
     pub(crate) fn depth_desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        self.host_desc(true)
     }
 
     /// The description words as a host type, the format as the host has it.
-    /// Without one, a typeless host copy gets a 2D view (`dimension`) in
-    /// the title's format, which the host needs spelled out.
+    /// Without one, a typeless host copy gets a view of all of it (a depth
+    /// one if `depth`) in the title's format, which the host needs spelled
+    /// out.
     #[cfg(windows)]
-    fn host_desc<T>(&self, dimension: u32) -> Option<T> {
+    fn host_desc<T>(&self, depth: bool) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
         let mut words = if self.described != 0 {
             self.desc
         } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
+            let format = crate::resource::view_format(self.resource)?;
+            let host = crate::resource::host_resource(self.resource)?;
+            // SAFETY: a live resource.
+            checks::whole_target(&unsafe { host.GetDesc() }, format, depth)
         };
         // A target or depth view: of a target, in its stand-in format.
         words[0] = crate::resource::target_format(crate::resource::pc_format(words[0]));
