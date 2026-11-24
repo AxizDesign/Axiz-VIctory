@@ -494,6 +494,16 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// Whether `resource`'s staging buffer was sent to the host texture, and
+/// whether it holds something newer.
+#[cfg(test)]
+pub(crate) fn sent_and_dirty(resource: This) -> Option<(bool, bool)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let s = map.as_ref()?.get(&(resource as usize))?;
+    Some((s.uploaded.load(Relaxed), s.dirty.load(Relaxed)))
+}
+
 /// Records, once per list, the copy of `resource`'s staging buffer into
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy
@@ -577,21 +587,27 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    // When the list is submitted, its copy takes what the staging buffer
-    // holds by then: noted before the check below, which sets `dirty`
-    // again if it detiles (the next list then uploads once more).
-    {
-        let staging = staging.clone();
-        list.defer_host(move || {
-            staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
-        });
-    }
     // Once per submission however many of its lists sample the texture.
-    list.defer_texture(staging);
+    list.defer_texture(staging.clone());
+    // When the list is submitted, its copy takes what the staging buffer
+    // holds by then: noted after the check above, whose detiling set
+    // `dirty` for contents this very copy carries (noted before it, the
+    // next list uploaded the same bytes once more). A later list of the
+    // submission that detiles again sets `dirty` after this.
+    list.defer_host(move || staging.sent());
 }
 
 impl Staging {
+    /// A copy of the staging buffer as it is now goes to the host texture
+    /// with the submission being prepared. Under the lock of the check: one
+    /// that detiles right now is done, and its contents are in the copy.
+    fn sent(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _checked = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        self.uploaded.store(true, Relaxed);
+        self.dirty.store(false, Relaxed);
+    }
+
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.layout.size as usize)

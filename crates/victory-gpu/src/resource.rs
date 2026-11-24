@@ -2473,6 +2473,57 @@ mod tests {
         assert_eq!(t, u64::MAX, "no second subresource");
     }
 
+    /// A texture's contents go to the host once: what the submission's
+    /// check detiles is what the copy of the same submission carries, and
+    /// it goes again only after the title changed the memory.
+    #[cfg(windows)]
+    #[test]
+    fn texture_contents_are_uploaded_once_until_they_change() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        let desc = texture(64, 64, 28, 1);
+        let mut image = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                PIXEL_SHADER_RESOURCE,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut image
+            ),
+            S_OK
+        );
+        let (memory, _) = texture_memory(image).unwrap();
+        let fill = |byte: u8| {
+            let size = texture_layout(&desc).unwrap().size as usize;
+            // SAFETY: the texture's own memory, of its layout's size.
+            unsafe { memory.cast_mut().write_bytes(byte, size) };
+        };
+        // Records an upload and runs the list: what the next list will find.
+        let submit = || {
+            let list = host.new_list().unwrap();
+            crate::texture::upload(&list, image, host_resource(image).unwrap());
+            list.close();
+            host.execute(&[&list]);
+            crate::texture::sent_and_dirty(image)
+        };
+        fill(0x11);
+        assert_eq!(submit(), Some((true, false)), "first contents sent by their own list");
+        assert_eq!(submit(), Some((true, false)), "unchanged: nothing to send");
+        // The change is found by the check of a list that recorded no copy:
+        // the next list sends it, and then nothing is left.
+        fill(0x22);
+        assert_eq!(submit(), Some((true, true)));
+        assert_eq!(submit(), Some((true, false)));
+        crate::object::slot::<extern "system" fn(This) -> u32>(image, 0x10)(image);
+    }
+
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
     #[cfg(windows)]
