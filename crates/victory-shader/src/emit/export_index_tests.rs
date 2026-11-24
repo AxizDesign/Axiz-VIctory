@@ -14,7 +14,8 @@ use super::{HostShader, container, container::SigElement, emit, validator};
 use crate::native::{HwStage, NativeProgram, StageIo};
 use crate::{Container, FourCC, io, ir, resource, structure};
 
-const SLICES: u32 = 3;
+/// Instances drawn, and the target's slices unless a test asks for more.
+const INSTANCES: u32 = 3;
 const SIZE: u32 = 8;
 
 /// A full-screen triangle (`v0`: the vertex), and in `v8` the two indices as
@@ -119,6 +120,11 @@ fn build(exports: &[&[u32]], kinds: &[u8]) -> HostShader {
 /// which texels of each slice were drawn, left half and right half. The
 /// first viewport is the left half of the target, the second the right one.
 fn draw(vs: &HostShader) -> Vec<(&'static str, Vec<[bool; 2]>)> {
+    draw_into(vs, INSTANCES)
+}
+
+/// [`draw`] into a target of `slices` slices.
+fn draw_into(vs: &HostShader, slices: u32) -> Vec<(&'static str, Vec<[bool; 2]>)> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -148,7 +154,7 @@ fn draw(vs: &HostShader) -> Vec<(&'static str, Vec<[bool; 2]>)> {
         let (root, pso) = host
             .pipeline(vs, &stub_ps())
             .unwrap_or_else(|e| panic!("{label}: {e}"));
-        out.push((label, run(&host.device, &root, &pso)));
+        out.push((label, run(&host.device, &root, &pso, slices)));
     }
     out
 }
@@ -157,6 +163,7 @@ fn run(
     dev: &ID3D12Device,
     root: &ID3D12RootSignature,
     pso: &ID3D12PipelineState,
+    slices: u32,
 ) -> Vec<[bool; 2]> {
     const PITCH: u32 = 256;
     let (w, h) = (2 * SIZE, SIZE);
@@ -189,7 +196,7 @@ fn run(
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: w.into(),
             Height: h,
-            DepthOrArraySize: SLICES as u16,
+            DepthOrArraySize: slices as u16,
             MipLevels: 1,
             Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
             SampleDesc: sample,
@@ -202,7 +209,7 @@ fn run(
         D3D12_HEAP_TYPE_READBACK,
         &D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: (PITCH * h * SLICES).into(),
+            Width: (PITCH * h * slices).into(),
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -254,7 +261,7 @@ fn run(
         };
         list.RSSetScissorRects(&[all, all]);
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        list.DrawInstanced(3, SLICES, 0, 0);
+        list.DrawInstanced(3, INSTANCES, 0, 0);
         list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
             Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -267,7 +274,7 @@ fn run(
             },
             ..Default::default()
         }]);
-        for slice in 0..SLICES {
+        for slice in 0..slices {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&readback),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -307,7 +314,7 @@ fn run(
             let at = PITCH * (h * slice + y) + 16 * x;
             p.cast::<u8>().add(at as usize).cast::<f32>().read()
         };
-        let out = (0..SLICES)
+        let out = (0..slices)
             .map(|slice| {
                 [0, SIZE].map(|x0| {
                     let drawn: Vec<bool> = (0..h)
@@ -360,5 +367,17 @@ fn clip_distances_without_indices_stay_at_pos1() {
     let clip: &[u32] = &[0xF800_00D1, 0x0000_0009]; // exp pos1 v9, off, off, off
     for (label, drawn) in draw(&build(&[clip], &[6])) {
         assert_eq!(drawn, [NONE, NONE, NONE], "{label}");
+    }
+}
+
+#[test]
+fn the_indices_are_all_of_their_bits_and_no_others() {
+    // Slices 256 to 258, so a bit above the low eight counts, with every
+    // bit around the two indices set (11 to 15, 20 to 31).
+    let junk: &[u32] = &[0x3810_10FF, 0xFFF0_F900]; // v_or_b32 v8, 0xfff0f900, v8
+    for (label, drawn) in draw_into(&build(&[junk, MISC], &[4, 5]), 259) {
+        let (low, high) = drawn.split_at(256);
+        assert!(low.iter().all(|&d| d == NONE), "{label}: a low slice drawn");
+        assert_eq!(high, [LEFT, RIGHT, LEFT], "{label}");
     }
 }
