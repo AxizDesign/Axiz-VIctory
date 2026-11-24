@@ -164,6 +164,13 @@ fn submit(lists: &[This]) {
     );
 }
 
+/// With submissions sent ahead: what they write back is there.
+fn settled() {
+    if crate::host::late() {
+        crate::host::settle_for_fence();
+    }
+}
+
 fn bytes(buffer: This) -> &'static mut [u8] {
     let (data, _) = buffer_bytes(buffer).unwrap();
     // SAFETY: a title buffer of `BYTES` bytes, never released here.
@@ -172,6 +179,7 @@ fn bytes(buffer: This) -> &'static mut [u8] {
 
 /// The texels of the four rows, without the padding between rows.
 fn texels(buffer: This) -> Vec<u8> {
+    settled();
     bytes(buffer)
         .chunks(PITCH)
         .flat_map(|row| row[..16].to_vec())

@@ -155,6 +155,10 @@ fn submit(queue: This, lists: &[This]) {
         lists.len() as u32,
         lists.as_ptr(),
     );
+    // (With submissions sent ahead: what they write back is there.)
+    if crate::host::late() {
+        crate::host::settle_for_fence();
+    }
 }
 
 fn words(at: *const u8) -> Vec<u32> {
@@ -400,4 +404,61 @@ fn a_mip_is_copied_into_another() {
 
 fn slots_at(slots: &[u64]) -> u64 {
     slots.as_ptr() as u64
+}
+
+/// A texture copied into a buffer, and the buffer copied by the next
+/// submission, with nothing in between that waits for the first: the copy
+/// is of the texture's bytes, also where submissions are sent ahead.
+#[test]
+fn the_next_submission_copies_what_a_texture_was_copied_into() {
+    if crate::host::host().is_none() {
+        return; // no host GPU here
+    }
+    let queue = title_queue();
+    let null = std::ptr::null();
+    let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 28, 1, 0, 0, 1, 0];
+    // SAFETY: plain numbers in the descriptions' layouts.
+    let (desc, heap) = unsafe {
+        (
+            std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(words),
+            std::mem::transmute::<[u32; 5], crate::resource::HeapProperties>([1, 0, 0, 0, 0]),
+        )
+    };
+    let iid = guid(
+        0x696442be,
+        0xa72e,
+        0x4059,
+        [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+    );
+    let mut texture = null;
+    assert_eq!(
+        crate::resource::create_committed(null, &heap, 0, &desc, 0x4, null.cast(), &iid, &mut texture),
+        S_OK
+    );
+    let (a, _) = buffer();
+    let (b, b_at) = buffer();
+    let slots = vec![0u64; 32];
+    crate::descriptor::create_rtv(null, texture, &[28, 4, 0, 0, 0, 0], slots_at(&slots));
+    let (first, second) = (title_list(), title_list());
+    type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const u8);
+    slot::<Clear>(first, 0x1a0)(first, slots_at(&slots), &[0.0, 0.0, 1.0, 1.0], 0, null.cast());
+    // Resource, kind, then the place: a subresource; rows of 256 bytes.
+    let from = [texture as u64, 0, 0, 0, 0, 0];
+    let to = [a as u64, 1, 0, 28 | 64 << 32, 64 | 1 << 32, 256];
+    type Region = extern "system" fn(This, *const u64, u32, u32, u32, *const u64, *const u8);
+    slot::<Region>(first, 0x80)(first, to.as_ptr(), 0, 0, 0, from.as_ptr(), null.cast());
+    copy(second, (b, 0), (a, 0));
+    close(first);
+    close(second);
+    for list in [first, second] {
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+    }
+    if crate::host::late() {
+        crate::host::settle_for_fence();
+    }
+    assert_eq!(words_of(b_at), [0xffff_0000; 64]);
+}
+
+fn words_of(at: *const u8) -> Vec<u32> {
+    words(at)
 }

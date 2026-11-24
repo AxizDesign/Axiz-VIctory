@@ -1952,6 +1952,16 @@ struct Flight {
     back: Vec<Declared>,
 }
 
+impl Flight {
+    /// The title memory its lists copy textures into.
+    fn backs(&self) -> Vec<(usize, usize)> {
+        self.order
+            .iter()
+            .flat_map(|&i| self.lists[i].host().deferred().back_ranges())
+            .collect()
+    }
+}
+
 /// One thing in the line of what waits for the card, in order.
 enum Late {
     Run(Flight),
@@ -1966,6 +1976,9 @@ struct Line {
     /// The title memory the flights' shaders may write (address, end), in
     /// order and joined.
     written: Vec<(usize, usize)>,
+    /// The title memory the flights copy textures into, likewise: it is
+    /// there once they are settled, and in no host copy.
+    backs: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -1992,6 +2005,7 @@ unsafe impl Send for Line {}
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
+    backs: Vec::new(),
     lists: 0,
     target: 0,
     settling: false,
@@ -2048,23 +2062,13 @@ pub(crate) fn independent(first: &[&HostList], second: &[&HostList]) -> bool {
     let mut done = Vec::new();
     for list in first {
         let deferred = list.deferred();
-        let backs = deferred.backs.iter().filter(|b| b.2[1] > 0);
         let values = deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes));
         join_ranges(&mut shaders, deferred.written.0.iter().map(|(&from, &to)| (from, to)));
-        join_ranges(
-            &mut done,
-            backs
-                .map(|&(_, at, [row, rows, pitch])| (at, at + (rows - 1) * pitch + row))
-                .chain(values),
-        );
+        join_ranges(&mut done, deferred.back_ranges().into_iter().chain(values));
     }
-    let refreshed = second.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            Step::Refresh(_, at, len) => touches(&done, *at, *at + *len),
-            _ => false,
-        })
-    });
-    !refreshed && blocked_by(&shaders, second, false).is_none() && blocked_by(&done, second, false).is_none()
+    !refreshes(&done, second)
+        && blocked_by(&shaders, second, false).is_none()
+        && blocked_by(&done, second, false).is_none()
 }
 
 /// `ranges` with `more`, in order, joined where they overlap or touch.
@@ -2097,14 +2101,29 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
-    let written = {
-        let line = line();
-        if line.written.is_empty() {
-            return None;
-        }
-        line.written.clone()
-    };
-    blocked_by(&written, runs, true)
+    blocked_in(&line(), runs, true)
+}
+
+fn blocked_in(line: &Line, runs: &[&HostList], count: bool) -> Option<usize> {
+    if let Some(why) = blocked_by(&line.written, runs, count) {
+        return Some(why);
+    }
+    if line.backs.is_empty() {
+        return None;
+    }
+    // Buffers too: a host copy refreshed now would have the bytes from
+    // before, and keep them.
+    blocked_by(&line.backs, runs, count).or_else(|| refreshes(&line.backs, runs).then_some(WHY_READ))
+}
+
+/// Whether `runs` bring host copies up to date with any of `ranges`.
+fn refreshes(ranges: &[(usize, usize)], runs: &[&HostList]) -> bool {
+    runs.iter().any(|list| {
+        list.deferred().copies.iter().any(|step| match step {
+            Step::Refresh(_, at, len) => touches(ranges, *at, *at + *len),
+            _ => false,
+        })
+    })
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
@@ -3520,6 +3539,7 @@ impl Host {
             let Line {
                 line: items,
                 written,
+                backs,
                 lists,
                 settling,
                 poke,
@@ -3533,13 +3553,17 @@ impl Host {
             written.clear();
             *lists = 0;
             let mut ranges = Vec::new();
+            let mut textures = Vec::new();
             for item in items.iter() {
                 if let Late::Run(flight) = item {
+                    textures.extend(flight.backs());
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
                 }
             }
             join_ranges(written, ranges);
+            backs.clear();
+            join_ranges(backs, textures);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -3732,18 +3756,20 @@ impl Host {
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, backs, lists: flying, target, .. } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
             *flying += order.len();
             *target = *submitted;
-            items.push(Late::Run(Flight {
+            let flight = Flight {
                 number: sent.number,
                 fence: *target,
                 lists,
                 order,
                 card: sent.card,
                 back: sent.back,
-            }));
+            };
+            join_ranges(backs, flight.backs());
+            items.push(Late::Run(flight));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
         };
@@ -3834,6 +3860,7 @@ impl Host {
                 }
                 line.settling = true;
                 line.written.clear();
+                line.backs.clear();
                 line.lists = 0;
                 std::mem::take(&mut line.line)
             };
@@ -3973,7 +4000,7 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| blocked_in(line, runs, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -6239,11 +6266,18 @@ impl Ranges {
 }
 
 impl Deferred {
+    /// The title memory textures are copied into.
+    fn back_ranges(&self) -> Vec<(usize, usize)> {
+        self.backs
+            .iter()
+            .filter(|b| b.2[1] > 0)
+            .map(|&(_, at, [row, rows, pitch])| (at, at + (rows - 1) * pitch + row))
+            .collect()
+    }
+
     /// Whether a texture is copied into any of `[from, to)`.
     fn read_back(&self, from: usize, to: usize) -> bool {
-        self.backs.iter().any(|&(_, at, [row, rows, pitch])| {
-            rows > 0 && at < to && at + (rows - 1) * pitch + row > from
-        })
+        self.back_ranges().iter().any(|&(a, b)| a < to && b > from)
     }
 }
 
@@ -6267,10 +6301,8 @@ fn first_stale(runs: &[&HostList]) -> Option<usize> {
         if stale {
             return Some(i);
         }
-        for &(_, at, [row, rows, pitch]) in &deferred.backs {
-            if rows > 0 {
-                written.add(at, at + (rows - 1) * pitch + row);
-            }
+        for (from, to) in deferred.back_ranges() {
+            written.add(from, to);
         }
         for (&from, &to) in &deferred.written.0 {
             written.add(from, to);
