@@ -1271,7 +1271,7 @@ impl Drop for Counted {
 /// A chunk of upload memory for lists' scratch data: the buffer, its
 /// mapping and its host GPU address.
 struct Chunk {
-    _buffer: ID3D12Resource,
+    buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
 }
@@ -1350,6 +1350,30 @@ impl<T> Spare<T> {
     }
 }
 
+/// Read-back buffers no list holds, at most `BACKS_MOST` bytes of them.
+static BACKS: Mutex<Spare<ID3D12Resource>> = Mutex::new(Spare::new());
+const BACKS_MOST: u64 = 64 << 20;
+
+/// The bytes a read-back buffer for `size` has: few sizes, so that they fit
+/// each other's uses.
+fn back_size(size: u64) -> u64 {
+    size.max(64 << 10).next_power_of_two()
+}
+
+/// A list is done with read-back buffers (it was reset, or let go, after its
+/// submissions ran).
+fn give_back_buffers(buffers: impl Iterator<Item = ID3D12Resource>) {
+    let mut freed = Vec::new();
+    {
+        let mut spare = BACKS.lock().unwrap_or_else(|e| e.into_inner());
+        for buffer in buffers {
+            // SAFETY: a live buffer.
+            let size = unsafe { buffer.GetDesc() }.Width;
+            freed.extend(spare.give(buffer, size, BACKS_MOST));
+        }
+    }
+}
+
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
@@ -1370,7 +1394,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
-        _buffer: buffer,
+        buffer,
         data: data as usize,
         gpu,
     })
@@ -1594,6 +1618,9 @@ struct Deferred {
     gpu_written: std::collections::HashSet<(usize, usize, usize)>,
     /// All title memory the list's shaders may write.
     written: Ranges,
+    /// Constants taken from title memory since the last title copy (address,
+    /// bytes), and where they are ([`HostList::constants`]).
+    constants: std::collections::HashMap<(u64, u64), u64>,
     /// Host copies (by id) shaders of the list were given to write since
     /// they were last moved out of that state.
     in_written_state: std::collections::HashSet<u64>,
@@ -1624,6 +1651,7 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
+        give_back_buffers(std::mem::take(&mut self.backs).into_iter().map(|b| b.0));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -4934,6 +4962,7 @@ impl HostList {
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
         deferred.gpu_written.clear();
+        deferred.constants.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -4996,20 +5025,25 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
-        Some((buffer, data))
+    /// `size` bytes of upload memory a texture can be copied from (placed as
+    /// footprints are), alive until the list is reset: the buffer, where in
+    /// it they begin, and their mapping.
+    pub(crate) fn upload(&self, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let (buffer, at, _, data) =
+            self.scratch_in(size, u64::from(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT))?;
+        Some((buffer, at, data))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_in(len, 256).map(|(_, _, gpu, data)| (gpu, data))
+    }
+
+    /// `len` bytes of upload memory until the list is reset, `align` (a
+    /// power of two, at least 256) into their buffer: the buffer, where in
+    /// it, the host GPU address and the CPU pointer.
+    fn scratch_in(&self, len: u64, align: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
@@ -5018,12 +5052,14 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().hold_upload(buffer, len);
-            return Some((gpu, data));
+            self.deferred().hold_upload(buffer.clone(), len);
+            return Some((buffer, 0, gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
-        while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].1 {
+        while s.current < s.chunks.len()
+            && s.used.next_multiple_of(align) + len > s.chunks[s.current].1
+        {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -5036,10 +5072,23 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, gpu) = (s.chunks[s.current].0.data, s.chunks[s.current].0.gpu);
-        let at = s.used;
-        s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let at = s.used.next_multiple_of(align);
+        s.used = at + len;
+        let chunk = &s.chunks[s.current].0;
+        Some((chunk.buffer.clone(), at, chunk.gpu + at, (chunk.data + at as usize) as *mut u8))
+    }
+
+    /// `len` bytes of title memory at `address` as constants: a copy in the
+    /// list's upload memory, filled at submission, its host GPU address. The
+    /// same one for the same bytes until a title copy intervenes.
+    pub(crate) fn constants(&self, address: u64, len: u64) -> Option<u64> {
+        if let Some(&gpu) = self.deferred().constants.get(&(address, len)) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, address as *const u8, len as usize);
+        self.deferred().constants.insert((address, len), gpu);
+        Some(gpu)
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -5305,6 +5354,7 @@ impl HostList {
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
         deferred.gpu_written.clear();
+        deferred.constants.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -5747,6 +5797,11 @@ impl Host {
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        // One of those of its size no list holds any more, or a new one.
+        let size = back_size(size);
+        if let Some(buffer) = BACKS.lock().unwrap_or_else(|e| e.into_inner()).take(size) {
+            return Some(buffer);
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()

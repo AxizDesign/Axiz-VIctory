@@ -393,9 +393,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.constants(address, len)
 }
 
 macro_rules! once {
@@ -2097,11 +2095,10 @@ impl State {
                             host.constant_at(index, 0, 0);
                             continue;
                         }
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        let Some(gpu) = list.constants(address, u64::from(size)) else {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {

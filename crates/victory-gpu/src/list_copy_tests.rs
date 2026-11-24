@@ -8,6 +8,7 @@ use crate::list::{create_allocator, create_list};
 use crate::object::{This, guid, slot};
 use crate::resource::{buffer_bytes, create_committed};
 
+#[allow(clippy::upper_case_acronyms)]
 type HRESULT = i32;
 
 /// `HeapProperties`, `ResourceDesc` and a copy location, as a title lays
