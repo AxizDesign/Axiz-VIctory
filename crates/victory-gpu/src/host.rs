@@ -2038,6 +2038,35 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     ranges.get(at).is_some_and(|r| r.0 < to)
 }
 
+/// Whether `second` can be prepared before `first` has run: nothing it reads
+/// of title memory on the CPU (copies, constants, textures, work of any
+/// kind) may be what `first` writes there.
+pub(crate) fn independent(first: &[&HostList], second: &[&HostList]) -> bool {
+    // What shaders write is in the host copies a later list reads; what
+    // comes to title memory when a list is done is in none of them.
+    let mut shaders = Vec::new();
+    let mut done = Vec::new();
+    for list in first {
+        let deferred = list.deferred();
+        let backs = deferred.backs.iter().filter(|b| b.2[1] > 0);
+        let values = deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes));
+        join_ranges(&mut shaders, deferred.written.0.iter().map(|(&from, &to)| (from, to)));
+        join_ranges(
+            &mut done,
+            backs
+                .map(|&(_, at, [row, rows, pitch])| (at, at + (rows - 1) * pitch + row))
+                .chain(values),
+        );
+    }
+    let refreshed = second.iter().any(|list| {
+        list.deferred().copies.iter().any(|step| match step {
+            Step::Refresh(_, at, len) => touches(&done, *at, *at + *len),
+            _ => false,
+        })
+    });
+    !refreshed && blocked_by(&shaders, second, false).is_none() && blocked_by(&done, second, false).is_none()
+}
+
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
@@ -6853,6 +6882,31 @@ mod repeat_tests {
         assert_eq!(first_repeat([1, 2, 1, 2].into_iter()), Some(2));
         assert_eq!(first_repeat([1, 1].into_iter()), Some(1));
         assert_eq!(first_repeat(std::iter::empty::<u8>()), None);
+    }
+
+    /// Lists that only touch other memory can be prepared together; one that
+    /// reads what the first writes cannot: a range shaders write, a value
+    /// written when the list is done.
+    #[test]
+    fn what_reads_what_a_list_writes_is_not_prepared_before_it_has_run() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let [writer, value, reader, other] = [0; 4].map(|_| host.new_list().unwrap());
+        let memory = vec![0u8; 4096];
+        let at = memory.as_ptr() as usize;
+        writer.deferred().written.add(at, at + 256);
+        value.deferred().writes.push((at + 512, crate::queue::Written::Value(1), 8));
+        let mut out = vec![0u8; 256];
+        reader.defer_fill(out.as_mut_ptr(), at as *const u8, 1024);
+        other.defer_fill(out.as_mut_ptr(), (at + 2048) as *const u8, 256);
+        assert!(!super::independent(&[&writer], &[&reader]));
+        assert!(!super::independent(&[&value], &[&other, &reader]));
+        assert!(super::independent(&[&writer, &value], &[&other]));
+        assert!(super::independent(&[&other], &[&reader]));
+        for list in [writer, value, reader, other] {
+            list.close();
+        }
     }
 
     /// A list named twice by a submission runs twice, the device lives, and

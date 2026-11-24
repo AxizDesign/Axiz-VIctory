@@ -1557,6 +1557,7 @@ impl HostTexture {
 
     /// The state of its first subresource, which is that of all of it where
     /// they are not told apart.
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn state(&self) -> u32 {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).at(0)
     }
@@ -1591,6 +1592,18 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
     let mut states = host.states.lock().unwrap_or_else(|e| e.into_inner());
     let before = std::mem::replace(&mut *states, crate::states::States::All(wanted)).at(0);
     (before != wanted).then(|| (host.texture.as_raw(), before))
+}
+
+/// Whether `this`, which may be anything, is a resource of ours.
+#[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    let at = this.cast::<usize>();
+    !this.is_null()
+        && at.is_aligned()
+        && crate::texture::committed(this.cast(), size_of::<usize>())
+        // SAFETY: committed memory, aligned; a resource begins with the
+        // address of its functions.
+        && unsafe { at.read() } == RESOURCE_FUNCTIONS.0.as_ptr() as usize
 }
 
 /// The host GPU's copy of a title resource, if it has one: made now if

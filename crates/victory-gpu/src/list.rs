@@ -1989,12 +1989,48 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// A group of enhanced barriers: what they are of, and how many.
+#[repr(C)]
+struct BarrierGroup {
+    kind: u32,
+    count: u32,
+    barriers: *const u8,
+}
+
+/// An enhanced barrier on a texture, as the PC lays it out (the console's
+/// buffer barriers are the PC's 40 bytes; taken to hold for these too).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TextureBarrier {
+    sync: [u32; 2],
+    access: [u32; 2],
+    /// Before, after.
+    layout: [u32; 2],
+    resource: This,
+    /// First mip (or a subresource's index, if there are no mips), mips,
+    /// first slice, slices, first plane, planes.
+    part: [u32; 6],
+    flags: u32,
+}
+const _: () = assert!(size_of::<TextureBarrier>() == 64);
+
+/// The host state a texture layout is, if it is one.
+fn layout_state(layout: u32) -> Option<u32> {
+    // In the order the layouts are numbered: common, generic read, render
+    // target, unordered access, depth write, depth read, shader resource,
+    // copies and resolves.
+    const STATES: [u32; 11] = [
+        0x0, 0xac0, 0x4, 0x8, 0x10, 0x20, 0xc0, 0x800, 0x400, 0x2000, 0x1000,
+    ];
+    STATES.get(layout as usize).copied()
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
-/// global barriers with layouts instead of states. Every host use of a
-/// title texture (clears, copies) moves its host copy to the state it needs
-/// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+/// global barriers with layouts instead of states. Each orders shader
+/// writes before what comes (the title's buffer barriers order compute
+/// passes); a texture's also moves it to its layout, for shaders that read
+/// it by an index they compute, whose uses are not seen here.
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2008,9 +2044,59 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         list.write_barrier();
+        if !groups.is_null() {
+            // SAFETY: the title passes `count` groups.
+            let groups = unsafe { std::slice::from_raw_parts(groups.cast::<BarrierGroup>(), count as usize) };
+            for group in groups {
+                texture_barriers(list, group);
+            }
+        }
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
+}
+
+/// The texture barriers of `group`, if it is one of those.
+#[cfg(windows)]
+fn texture_barriers(list: &crate::host::HostList, group: &BarrierGroup) {
+    const TEXTURE: u32 = 1;
+    if group.kind != TEXTURE || group.count == 0 || group.barriers.is_null() {
+        return;
+    }
+    // SAFETY: the title passes `count` barriers.
+    let barriers = unsafe {
+        std::slice::from_raw_parts(group.barriers.cast::<TextureBarrier>(), group.count as usize)
+    };
+    let mut host = Vec::new();
+    for b in barriers {
+        // The layout of the structure is inferred: one that does not name a
+        // resource of ours is not one.
+        if !crate::resource::is_resource(b.resource) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("a texture barrier that names no resource is left out"));
+            continue;
+        }
+        let Some(copy) = crate::resource::host_copy(b.resource) else {
+            continue;
+        };
+        let [before, after] = b.layout.map(layout_state);
+        let Some(after) = after else {
+            continue;
+        };
+        let [first, mips, slice, slices, ..] = b.part;
+        // SAFETY: a live resource.
+        let shape = crate::states::shape(&unsafe { copy.texture.GetDesc() });
+        let subs = match shape {
+            None => Subs::All,
+            Some(of) if mips == 0 => Subs::one(first, of.0 * of.1),
+            Some(of) => Subs::part((first, mips), (slice, slices), of),
+        };
+        host.extend(list.moved(&copy, &subs, before, after));
+    }
+    if !host.is_empty() {
+        // SAFETY: an open list and live textures.
+        unsafe { list.list.ResourceBarrier(&host) };
+    }
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and

@@ -363,6 +363,25 @@ fn a_mip_is_copied_into_another() {
     let copy = |to: &Location, from: &Location| slot::<Copy>(list, 0x80)(list, to, 0, 0, 0, from, null.cast());
     clear(0, [1.0, 0.0, 0.0, 1.0]);
     clear(1, [0.0, 1.0, 0.0, 1.0]);
+    // (Once as an enhanced barrier: the same mip there and back; and one on
+    // something that is no texture, which is left out.)
+    let layouts = |resource: This, before: u32, after: u32| {
+        let mut words = [0u64; 8];
+        words[2] = u64::from(before) | u64::from(after) << 32;
+        words[3] = resource as u64;
+        // Mip 1, one of them, slice 0, one.
+        (words[4], words[5]) = (1 | 1 << 32, 1 << 32);
+        words
+    };
+    const IN_TARGET: u32 = 2;
+    const IN_SHADERS: u32 = 6;
+    let barriers = [
+        layouts(texture, IN_TARGET, IN_SHADERS),
+        layouts(texture, IN_SHADERS, IN_TARGET),
+        layouts(words.as_ptr().cast(), IN_TARGET, IN_SHADERS),
+    ];
+    let group = [1u64 | 3 << 32, barriers.as_ptr() as u64];
+    super::barrier_groups(list, 1, group.as_ptr().cast());
     barrier(1, TARGET, COPY_SOURCE);
     barrier(0, TARGET, COPY_DEST);
     copy(&at_sub(0), &at_sub(1));
