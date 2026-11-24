@@ -549,6 +549,15 @@ pub(crate) fn probe_view_limit() {
     });
 }
 
+/// A host sampler heap has its title's samplers in the first slots and the
+/// same ones as comparison samplers this many further (2,048 slots are the
+/// most the host has): the console compares when the instruction says so,
+/// with any sampler, and the host only with a comparison one.
+/// shortcut: the translator does not pick the second ones yet, so the first
+/// ones still are comparison samplers where [`crate::sampler`] takes them
+/// for such; once it does, they are plain (`Fields::host`).
+pub(crate) const COMPARISON_SLOTS: u32 = 1024;
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -582,7 +591,14 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
+        let extra = if !sampler {
+            DYNAMIC
+        } else if count <= COMPARISON_SLOTS {
+            2 * COMPARISON_SLOTS - count
+        } else {
+            tracing::warn!(count, "a sampler heap too big for the host to have each sampler as a comparison one too");
+            0
+        };
         let (heap, count, size) = match make(count + extra) {
             Ok(heap) => (heap, count, count + extra),
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
@@ -633,7 +649,7 @@ impl HostHeap {
             cpu,
             step,
             count,
-            dynamic: extra,
+            dynamic: if sampler { 0 } else { extra },
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             copies_run: Mutex::default(),
@@ -1097,6 +1113,30 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// Makes the comparison sampler that goes with the sampler in slot
+    /// `index` (view heaps have none): [`COMPARISON_SLOTS`] further.
+    fn make_comparison(&self, index: u32, view: &View) {
+        if !self.sampler || self.count > COMPARISON_SLOTS || index >= self.count {
+            return;
+        }
+        let desc = match view {
+            // SAFETY: 13 words in the host's layout.
+            View::Sampler(words) => unsafe {
+                std::ptr::from_ref(words)
+                    .cast::<D3D12_SAMPLER_DESC>()
+                    .read_unaligned()
+            },
+            View::ConsoleSampler(words) => crate::sampler::console(words),
+            _ => return,
+        };
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our sampler heap, which has twice the slots.
+        unsafe {
+            host.device
+                .CreateSampler(&crate::sampler::comparison(desc), self.cpu(index + COMPARISON_SLOTS))
+        };
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
@@ -1322,6 +1362,7 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+            self.make_comparison(index, &view);
         }
         Some(view)
     }
@@ -2586,5 +2627,26 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// Every sampler of a heap has its comparison one in the same heap, and
+    /// the device takes both.
+    #[test]
+    fn samplers_have_comparison_ones() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        for count in [1, 16, COMPARISON_SLOTS] {
+            let heap = HostHeap::new(true, count).unwrap();
+            // SAFETY: a live heap.
+            assert_eq!(unsafe { heap.heap.GetDesc() }.NumDescriptors, 2 * COMPARISON_SLOTS);
+            assert_eq!(heap.dynamic(1), None);
+            let mut words = [0u32; 27];
+            words[6..9].copy_from_slice(&[3, 3, 3]);
+            heap.make_comparison(count - 1, &View::ConsoleSampler(words));
+        }
+        assert!(HostHeap::new(true, 2 * COMPARISON_SLOTS).is_some(), "without comparison ones");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
