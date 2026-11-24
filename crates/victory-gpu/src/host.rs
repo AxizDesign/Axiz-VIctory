@@ -1491,8 +1491,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
-/// per range sent up.
+/// once, and not in a pass per range sent up (on by default;
+/// `VICTORY_CARD_REHASH_RUNS=0`: a pass per range).
 ///
 /// These passes are ours, they run on the card before every submission's
 /// lists, and no timing so far names them: each walks its 64 KiB pieces
@@ -1503,7 +1503,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -1588,6 +1588,9 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Buffer ranges declared as written by shaders since the last title
+    /// copy, likewise.
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -3035,6 +3038,11 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    // All the copies, then one wait for them, then all the
+                    // hashing: a copy's wait and its hashing in between made
+                    // the card finish one copy before it began the next.
+                    let mut copied = Vec::new();
+                    let mut hashed = Vec::new();
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3047,24 +3055,32 @@ impl Host {
                         let Some(before) = before else {
                             continue;
                         };
+                        if !ranges.is_empty() {
+                            copied.push(transition(
+                                &shadow.buffer,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            ));
+                        }
+                        hashed.push((shadow, ranges, before, size));
+                    }
+                    if !copied.is_empty() {
+                        list.ResourceBarrier(&copied);
+                    }
+                    if !hashed.is_empty() {
+                        list.SetComputeRootSignature(&work.root);
+                        list.SetPipelineState(&work.pso);
+                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    }
+                    for (shadow, ranges, before, size) in hashed {
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
                         // of each 64 KiB piece. The pieces just sent up are
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
-                        }
-                        list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
@@ -3603,7 +3619,15 @@ impl Host {
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
-        let _ = self.submit(runs, false);
+        // A list named twice runs in two submissions: a list, and the
+        // prelude that brings its textures to their first states, may not
+        // be sent again before the card has run it.
+        let mut rest = runs;
+        while let Some(again) = first_repeat(rest.iter().map(|l| std::ptr::from_ref(*l))) {
+            let _ = self.submit(&rest[..again], false);
+            rest = &rest[again..];
+        }
+        let _ = self.submit(rest, false);
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -3614,6 +3638,13 @@ impl Host {
     /// for reuse then, as a queue does for the lists it ran.
     pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
         if order.is_empty() {
+            crate::list::recycle(lists, &order);
+            return;
+        }
+        if first_repeat(order.iter().copied()).is_some() {
+            // A list named twice is waited for in between.
+            let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            self.execute(&runs);
             crate::list::recycle(lists, &order);
             return;
         }
@@ -3975,15 +4006,26 @@ impl Host {
             settled += settling.elapsed();
         }
         let card = self.card_before(runs, flown);
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            lists.push(Some(check));
-        }
+        let check = [card.as_ref().and_then(|c| c.check.clone())];
+        let check: &[_] = if check[0].is_some() { &check } else { &[] };
+        // The compare in a call of its own behind the lists: it reads what
+        // they wrote as shader resources, and a buffer written without a
+        // state of its own leaves the written state where the call ends.
+        let send = |lists: &[Option<ID3D12CommandList>], last: bool| {
+            // SAFETY: closed lists.
+            unsafe {
+                self.queue.ExecuteCommandLists(lists);
+                if last && !check.is_empty() {
+                    self.queue.ExecuteCommandLists(check);
+                }
+            }
+        };
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
+                send(&lists, true);
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
@@ -4024,7 +4066,7 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                send(group, i + 1 == groups.len());
                 self.card_sent();
                 let waited = self
                     .queue
@@ -4872,6 +4914,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -4908,9 +4951,15 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        // Dispatches declare the same ranges thousands of times: once is
+        // enough until title memory changes in between.
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -5054,8 +5103,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.gpu_written.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -5865,13 +5916,28 @@ impl Meter {
     }
 }
 
+/// Where the first thing stands that was already named before it.
+fn first_repeat<T: std::hash::Hash + Eq>(things: impl Iterator<Item = T>) -> Option<usize> {
+    let mut seen = std::collections::HashSet::new();
+    things.enumerate().find_map(|(i, t)| (!seen.insert(t)).then_some(i))
+}
+
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// Shows `shown` (the host copy of a title texture) as frame `frame`
+    /// (saved if captures are on). `None` if nothing was shown; else, in
+    /// diagnostics builds, whether the frame was black.
+    pub(crate) fn present(
+        &self,
+        shown: &std::sync::Arc<crate::resource::HostTexture>,
+        frame: u64,
+    ) -> Option<bool> {
+        let texture = &shown.texture;
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
+        if desc.SampleDesc.Count > 1 {
+            tracing::warn!(samples = desc.SampleDesc.Count, "cannot present this texture");
+            return None;
+        }
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
@@ -5904,7 +5970,6 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -5935,15 +6000,24 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            // The list's first use of the texture: it is brought there from
+            // the state it is in when the list is sent, behind the lists
+            // before it, and stays there until its next use.
+            copy.settle(shown, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
+            let one = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: std::mem::transmute_copy(resource),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            list.CopyTextureRegion(&one(&back), 0, 0, 0, &one(texture), None);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -5952,14 +6026,11 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT,
+            )]);
             copy.close();
             match slot {
                 Some(i) => {
@@ -5972,7 +6043,20 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let presented = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if presented.is_err() {
+                if let Err(e) = self.device.GetDeviceRemovedReason() {
+                    fail(format_args!("the host device was lost at a present ({e})"));
+                }
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(error = %presented.message(), "a present failed; the swap chain is resized")
+                });
+                // A swap chain that changed under us (a switch to or from
+                // full screen) shows nothing until it is resized: the next
+                // present does that.
+                (p.width, p.height) = (0, 0);
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -6010,6 +6094,11 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            // Alt+Enter stays the title's: DXGI would switch the swap chain
+            // under us.
+            if let Err(e) = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) {
+                tracing::debug!(error = %e, "Alt+Enter is left to DXGI");
+            }
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -6377,6 +6466,39 @@ mod trail {
         assert!(text.contains("pipeline library: no call running"));
         assert!(text.contains(&format!("thing {} done", super::TRAIL_MOST + 4)));
         assert!(!text.contains("thing 4 done"), "the oldest entries are dropped");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod repeat_tests {
+    use super::{first_repeat, host};
+
+    #[test]
+    fn repeats_are_found_where_they_stand() {
+        assert_eq!(first_repeat([1, 2, 3].into_iter()), None);
+        assert_eq!(first_repeat([1, 2, 1, 2].into_iter()), Some(2));
+        assert_eq!(first_repeat([1, 1].into_iter()), Some(1));
+        assert_eq!(first_repeat(std::iter::empty::<u8>()), None);
+    }
+
+    /// A list named twice by a submission runs twice, the device lives, and
+    /// what it fills is filled each time.
+    #[test]
+    fn a_list_named_twice_runs_twice() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = runs.clone();
+        list.defer_host(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        list.close();
+        host.execute(&[&list, &list, &list]);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 3);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
 
