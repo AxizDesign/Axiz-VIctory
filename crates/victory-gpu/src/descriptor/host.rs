@@ -2215,6 +2215,51 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Whether a view names a format.
+pub(crate) fn typed_view(view: &View) -> bool {
+    match view {
+        View::Shader(_, desc) | View::Unordered(_, _, desc) => desc.is_some_and(|d| !matches!(d[0], 0 | 39)),
+        View::Placed(_, _, desc) => !matches!(desc[0], 0 | 39),
+        _ => false,
+    }
+}
+
+/// Unordered access `view` in a slot only the CPU reads, as a clear wants it
+/// beside the shader-visible one, and the resource it views. The slot is one
+/// of a ring: a clear takes the descriptor when it is recorded.
+pub(crate) fn clear_view(view: &View) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource)> {
+    const SLOTS: u32 = 256;
+    static RING: std::sync::OnceLock<Option<(ID3D12DescriptorHeap, u32)>> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let (heap, step) = RING
+        .get_or_init(|| {
+            let host = host()?;
+            // SAFETY: plain creation.
+            unsafe {
+                let heap = host
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: SLOTS,
+                        ..Default::default()
+                    })
+                    .ok()?;
+                let step = host
+                    .device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                Some((heap, step))
+            }
+        })
+        .as_ref()?;
+    let slot = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % SLOTS;
+    // SAFETY: a live heap.
+    let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+    let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: start.ptr + slot as usize * *step as usize,
+    };
+    Some((at, make(view, at)??))
+}
+
 /// A view that reads zeros, for slots whose view the host cannot make.
 /// shortcut: slots with no view at all (kind unknown) get this null 2D
 /// view; null buffer views there did not stop the world's low-address

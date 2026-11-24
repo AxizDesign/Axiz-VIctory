@@ -295,8 +295,10 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 /// its place in the part: a queue waiting for it starts later than on the
 /// console, never earlier, and nothing can wait for itself that way (a
 /// part has no wait after its first work).
+///
+/// Without a wait the parts are one submission's lists.
 #[cfg(windows)]
-fn cut(this: This, wait: ValueWait) {
+fn cut(this: This, wait: Option<ValueWait>) {
     if this.is_null() {
         return;
     }
@@ -307,7 +309,7 @@ fn cut(this: This, wait: ValueWait) {
         return;
     };
     if current.untouched() {
-        list.gate.push(wait);
+        list.gate.extend(wait);
         return;
     }
     let Some(fresh) = fresh_list() else {
@@ -315,7 +317,7 @@ fn cut(this: This, wait: ValueWait) {
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!("no host list for the part after a wait: the wait moves to the part's start"));
-        list.gate.push(wait);
+        list.gate.extend(wait);
         return;
     };
     current.close();
@@ -324,7 +326,7 @@ fn cut(this: This, wait: ValueWait) {
         tracing::info!(parts = list.earlier.len() + 2, "a list is cut at a wait for a memory value");
     }
     if let Some(done) = list.host.replace(fresh) {
-        let waits = std::mem::replace(&mut list.gate, vec![wait]);
+        let waits = std::mem::replace(&mut list.gate, wait.into_iter().collect());
         list.earlier.push(Part { waits, host: done });
     }
     // What the title set so far, on the new host list.
@@ -809,18 +811,27 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        buffer_copy(list, to, from, len as usize);
+        buffer_copy(this, list, to, from, len as usize);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
 /// A copy between title buffers: at submission, on the CPU, or, of what
-/// shaders of this list wrote before it, in its place on the GPU.
+/// shaders of this list wrote before it, in its place on the GPU. Of a
+/// texture copied into the source before it, behind a cut: title memory has
+/// that when the part before the cut has run.
 #[cfg(windows)]
-fn buffer_copy(list: &crate::host::HostList, to: *mut u8, from: *mut u8, len: usize) {
+fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *mut u8, len: usize) {
     let at = from as usize;
     if list.wrote(at, at + len) && list.gpu_copy(to as u64, from as u64, len as u64) {
+        return;
+    }
+    if list.reads_back(at, at + len) && crate::queue::cuts() {
+        cut(this, None);
+        if let Some(list) = host_list(this) {
+            list.defer_copy(to, from, len);
+        }
         return;
     }
     list.defer_copy(to, from, len);
@@ -873,7 +884,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            buffer_copy(list, to, from, a.min(b) as usize);
+            buffer_copy(this, list, to, from, a.min(b) as usize);
         }
     }
     #[cfg(not(windows))]
@@ -1296,6 +1307,9 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
+        if list.wrote(src as usize, src as usize + len) && list.gpu_copy(dst, src, len as u64) {
+            return;
+        }
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
@@ -1307,6 +1321,64 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
+}
+
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, (gpu, cpu), resource, values, false, (count, rects));
+}
+
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, (gpu, cpu), resource, values, true, (count, rects));
+}
+
+fn clear_uav(
+    this: This,
+    handles: (u64, u64),
+    resource: This,
+    values: *const [u32; 4],
+    float: bool,
+    (count, rects): (u32, *const Rect),
+) {
+    // SAFETY: the title passes four values.
+    let Some(&values) = (unsafe { values.as_ref() }) else {
+        return;
+    };
+    let mut cleared = false;
+    #[cfg(windows)]
+    {
+        let rects: &[windows::Win32::Foundation::RECT] = if rects.is_null() || count == 0 {
+            &[]
+        } else {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        };
+        with_state(this, |list, s| {
+            cleared = s.clear_unordered(list, handles, values, float, rects);
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (this, handles, values, float, count, rects);
+    if !cleared {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(?resource, float, "an unordered access clear dropped"));
+    }
+    let _ = resource;
 }
 
 /// `DriverHintX(feature, value)`: no hints for the host.
@@ -1917,7 +1989,7 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
     // The list is cut here, and the wait stands before what follows.
     #[cfg(windows)]
     if crate::queue::cuts() {
-        cut(this, wait);
+        cut(this, Some(wait));
         return;
     }
     VALUE_WAITS
@@ -2106,7 +2178,12 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
+const MORE_METHODS: [(usize, *const ()); 11] = [
+    // Between the clears of targets (51, 52) and ExecuteIndirect (59), in
+    // the PC's order: unordered access clears of integers and of floats,
+    // then a discard, three markers. (Inferred from those neighbours.)
+    (53, clear_uav_uint as *const ()),         // 0x1a8
+    (54, clear_uav_float as *const ()),        // 0x1b0
     (28, query_mark as *const ()),             // 0xe0 BeginQuery
     (29, query_mark as *const ()),             // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0

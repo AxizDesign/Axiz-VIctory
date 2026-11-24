@@ -5102,6 +5102,12 @@ impl HostList {
         self.deferred().written.touch(from, to)
     }
 
+    /// Whether the list copies a texture into any of `[from, to)`, which
+    /// title memory has once the list has run.
+    pub(crate) fn reads_back(&self, from: usize, to: usize) -> bool {
+        self.deferred().read_back(from, to)
+    }
+
     /// A copy of `len` bytes between two title buffers in its place among
     /// the list's commands, between their host copies: the source is what
     /// shaders of this list wrote, which title memory holds only when the
@@ -6145,9 +6151,18 @@ impl Ranges {
     }
 }
 
+impl Deferred {
+    /// Whether a texture is copied into any of `[from, to)`.
+    fn read_back(&self, from: usize, to: usize) -> bool {
+        self.backs.iter().any(|&(_, at, [row, rows, pitch])| {
+            rows > 0 && at < to && at + (rows - 1) * pitch + row > from
+        })
+    }
+}
+
 /// Where a submission of `runs` has to be cut: the first list with a copy
 /// (done on the CPU, before anything of its submission runs) of memory that
-/// shaders of a list before it may write.
+/// a list before it writes, by a shader or with a copy of a texture.
 fn first_stale(runs: &[&HostList]) -> Option<usize> {
     if runs.len() < 2 {
         return None;
@@ -6164,6 +6179,11 @@ fn first_stale(runs: &[&HostList]) -> Option<usize> {
             });
         if stale {
             return Some(i);
+        }
+        for &(_, at, [row, rows, pitch]) in &deferred.backs {
+            if rows > 0 {
+                written.add(at, at + (rows - 1) * pitch + row);
+            }
         }
         for (&from, &to) in &deferred.written.0 {
             written.add(from, to);

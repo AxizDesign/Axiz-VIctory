@@ -14,7 +14,12 @@ fn buffer() -> (This, *mut u8) {
     let words: [u32; 14] = [1, 0, 0, 0, LEN as u32, 0, 1, 0x1_0001, 0, 1, 0, 1, 4, 0];
     // SAFETY: plain numbers in the descriptions' layouts.
     let (desc, heap): (crate::resource::ResourceDesc, crate::resource::HeapProperties) =
-        unsafe { (std::mem::transmute(words), std::mem::transmute([1u32, 0, 0, 0, 0])) };
+        unsafe {
+            (
+                std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(words),
+                std::mem::transmute::<[u32; 5], crate::resource::HeapProperties>([1, 0, 0, 0, 0]),
+            )
+        };
     let iid = guid(
         0x696442be,
         0xa72e,
@@ -215,4 +220,62 @@ fn copies_see_what_shaders_wrote_before_them() {
     assert_eq!(words(b_at), written(), "in a later list of the submission");
     // SAFETY: a plain device query.
     assert!(unsafe { crate::host::host().unwrap().device.GetDeviceRemovedReason() }.is_ok());
+}
+
+/// Unordered access clears fill what their view shows, of integers and of
+/// floats, and nothing else; a handle without a view clears nothing.
+#[test]
+fn unordered_clears_fill_the_view() {
+    if crate::host::host().is_none() {
+        return; // no host GPU here
+    }
+    let queue = title_queue();
+    let (a, a_at) = buffer();
+    // SAFETY: a buffer of `LEN` bytes.
+    unsafe { a_at.write_bytes(0x11, LEN) };
+    let null = std::ptr::null();
+    // Eight views, seen by shaders.
+    let mut heap_desc = [0u32; 16];
+    (heap_desc[1], heap_desc[2]) = (8, 1);
+    let iid = guid(
+        0x8efb471d,
+        0x616c,
+        0x4f49,
+        [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+    );
+    let mut heap = null;
+    assert_eq!(
+        crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+        S_OK
+    );
+    let start = crate::descriptor::heap(heap).start;
+    let handle = |n: u64| start + n * 32;
+    // R32_UINT from element 4, 8 of them; R32_FLOAT from 16, 8; raw from 64, 16.
+    let view = |format: u32, first: u32, count: u32, flags: u32| [format, 1, first, 0, count, 0, 0, 0, flags, 0];
+    crate::descriptor::create_uav(null, a, null, &view(42, 4, 8, 0), handle(0));
+    crate::descriptor::create_uav(null, a, null, &view(41, 16, 8, 0), handle(1));
+    crate::descriptor::create_uav(null, a, null, &view(39, 64, 16, 1), handle(2));
+    let list = title_list();
+    slot::<extern "system" fn(This, u32, *const This)>(list, 0x100)(list, 1, &heap);
+    type Clear = extern "system" fn(This, u64, u64, This, *const [u32; 4], u32, *const u8);
+    let clear = |at: usize, n: u64, values: [u32; 4]| {
+        slot::<Clear>(list, at)(list, handle(n), handle(n), a, &values, 0, null.cast());
+    };
+    clear(0x1a8, 0, [0xABCD_0001; 4]);
+    clear(0x1b0, 1, [1.5f32.to_bits(); 4]);
+    clear(0x1b0, 2, [2.0f32.to_bits(); 4]);
+    clear(0x1a8, 5, [7; 4]);
+    close(list);
+    submit(queue, &[list]);
+    // SAFETY: inside the buffer.
+    let got = unsafe { std::slice::from_raw_parts(a_at.cast::<u32>(), 96) };
+    for (i, &word) in got.iter().enumerate() {
+        let wanted = match i {
+            4..12 => 0xABCD_0001,
+            16..24 => 1.5f32.to_bits(),
+            64..80 => 2.0f32.to_bits(),
+            _ => 0x1111_1111,
+        };
+        assert_eq!(word, wanted, "dword {i}");
+    }
 }

@@ -752,6 +752,95 @@ impl State {
             .find(|h| h.index(handle).is_some())
     }
 
+    /// `ClearUnorderedAccessView`: fills what the view at `handle` (in a
+    /// heap that is set; `cpu` is the same one for the CPU) shows with
+    /// `values` (floats or integers), or the `rects` of it. False if there
+    /// is nothing of the host's to clear.
+    pub(crate) fn clear_unordered(
+        &mut self,
+        list: &HostList,
+        (handle, cpu): (u64, u64),
+        values: [u32; 4],
+        float: bool,
+        rects: &[RECT],
+    ) -> bool {
+        let Some(view) = crate::descriptor::view(handle).or_else(|| crate::descriptor::view(cpu)) else {
+            return false;
+        };
+        if !matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
+            return false;
+        }
+        let Some(heap) = self.heap_of(handle).filter(|h| !h.samplers()) else {
+            return false;
+        };
+        let Some(host) = heap.host() else {
+            return false;
+        };
+        // The view in a slot of the host heap for the clear, and one the
+        // CPU reads it from.
+        let Some(slot) = host.dynamic(1) else {
+            return false;
+        };
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, slot, 1));
+        let Some((cpu, resource)) = crate::descriptor::host::clear_view(&view) else {
+            return false;
+        };
+        host.make_at(slot, &view);
+        STORES.set(true);
+        readable(list, ResourceType::Uav, &view);
+        self.set_host_heaps(list);
+        list.keep(&resource);
+        // Buffers without a format are raw on the host, which has integer
+        // clears only of those: of the same bits.
+        // SAFETY (the query): a live resource.
+        let buffer = unsafe { resource.GetDesc() }.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+        let raw = buffer && !crate::descriptor::host::typed_view(&view);
+        // SAFETY: an open list with the slot's heap set; both descriptors
+        // are of the resource.
+        unsafe {
+            if float && !raw {
+                let values = values.map(f32::from_bits);
+                list.list.ClearUnorderedAccessViewFloat(
+                    host.gpu_handle(slot),
+                    cpu,
+                    &resource,
+                    &values,
+                    rects,
+                );
+            } else {
+                list.list.ClearUnorderedAccessViewUint(
+                    host.gpu_handle(slot),
+                    cpu,
+                    &resource,
+                    &values,
+                    rects,
+                );
+            }
+        }
+        // It is there for whatever the title's next barrier waits for.
+        list.twins_written();
+        true
+    }
+
+    /// Gives the host list the host heaps of the title's, if it has others.
+    fn set_host_heaps(&mut self, list: &HostList) {
+        if self.host_heaps == self.heaps {
+            return;
+        }
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .filter_map(|&h| crate::descriptor::heap(h as This).host())
+            .map(|h| Some(h.heap.clone()))
+            .collect();
+        heaps.iter().flatten().for_each(|h| list.keep(h));
+        // SAFETY: an open list and shader-visible heaps.
+        unsafe { list.list.SetDescriptorHeaps(&heaps) };
+        self.host_heaps = self.heaps;
+        self.host_roots = [0; 2];
+    }
+
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
@@ -858,20 +947,7 @@ impl State {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
-        }
+        self.set_host_heaps(list);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {
