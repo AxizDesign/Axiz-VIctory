@@ -648,3 +648,32 @@ fn what_a_group_shares_is_not_what_a_wave_or_a_moment_gives() {
     assert!(!shared(&smem(0x24, 0, 0)), "s_memtime");
     assert!(!shared(&smem(0x2A, 0, 0)), "s_get_waveid_in_workgroup");
 }
+
+#[test]
+fn a_read_after_a_cache_invalidation_is_a_read_of_its_own() {
+    // The same dword twice, with what `between` is between, and the sum stored.
+    let reads = |between: &[u32]| {
+        let load = |v: u32| [0x38 << 26 | 0x0C << 18, 0x80 << 24 | 2 << 16 | v << 8];
+        let mut words = load(1).to_vec();
+        words.extend_from_slice(between);
+        words.extend(load(2));
+        words.push(0x4A00_0501); // v_add_nc_u32 v0, v1, v2
+        words.extend([0x38 << 26 | 0x1C << 18, 0x80 << 24 | 2 << 16]);
+        let native = native(&words);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+        let census = super::census::take(&shader.dxil).expect("counted");
+        let count = |kind: &str| {
+            let at = super::census::KINDS.iter().position(|&k| k == kind).unwrap();
+            census.counts[at]
+        };
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        (count("buffer_load"), count("barrier"))
+    };
+    assert_eq!(reads(&[]), (1, 0), "nothing between: one read serves both");
+    assert_eq!(reads(&[0xE1C4_0000, 0]), (2, 1), "buffer_gl0_inv");
+    assert_eq!(reads(&[0xE1C8_0000, 0]), (2, 1), "buffer_gl1_inv");
+}

@@ -9836,7 +9836,12 @@ impl<'a> Lower<'a> {
         };
         let name = inst.name();
         if name == "buffer_gl0_inv" || name == "buffer_gl1_inv" {
-            // The host has no console buffer cache to invalidate.
+            // What is read from here on is read anew: no read before may stand in for it. A
+            // fence of all unordered memory, the one barrier every stage has (its waits for
+            // other threads are none).
+            let mode = self.s.m.i32(2);
+            let void = self.s.t.void;
+            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
             return Ok(());
         }
         if *lds || *tfe {
@@ -11176,9 +11181,8 @@ mod tests {
     }
 
     #[test]
-    fn buffer_cache_invalidations_lower_as_no_ops() {
-        // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
-        // host to invalidate its cached view of a buffer.
+    fn buffer_cache_invalidations_lower() {
+        // MUBUF opcode 0x071/0x072 with no data operand.
         assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
         assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
     }
