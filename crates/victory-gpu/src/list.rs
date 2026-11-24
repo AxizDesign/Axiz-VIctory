@@ -809,10 +809,21 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        buffer_copy(list, to, from, len as usize);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
+}
+
+/// A copy between title buffers: at submission, on the CPU, or, of what
+/// shaders of this list wrote before it, in its place on the GPU.
+#[cfg(windows)]
+fn buffer_copy(list: &crate::host::HostList, to: *mut u8, from: *mut u8, len: usize) {
+    let at = from as usize;
+    if list.wrote(at, at + len) && list.gpu_copy(to as u64, from as u64, len as u64) {
+        return;
+    }
+    list.defer_copy(to, from, len);
 }
 
 /// Whether one of two resources is a target in a stand-in format and the
@@ -862,7 +873,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            buffer_copy(list, to, from, a.min(b) as usize);
         }
     }
     #[cfg(not(windows))]
@@ -2155,6 +2166,10 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+
+#[cfg(all(test, windows))]
+#[path = "copy_tests.rs"]
+mod copy_tests;
 
 #[cfg(test)]
 mod tests {

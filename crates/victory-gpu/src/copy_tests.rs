@@ -1,0 +1,218 @@
+//! Buffer copies in their place among a list's commands.
+
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::core::s;
+
+use crate::host::HostList;
+use crate::object::{S_OK, This, guid, slot};
+
+const LEN: usize = 0x1_0000;
+
+fn buffer() -> (This, *mut u8) {
+    // A 64 KiB buffer on a default heap, as title descriptions are laid out.
+    let words: [u32; 14] = [1, 0, 0, 0, LEN as u32, 0, 1, 0x1_0001, 0, 1, 0, 1, 4, 0];
+    // SAFETY: plain numbers in the descriptions' layouts.
+    let (desc, heap): (crate::resource::ResourceDesc, crate::resource::HeapProperties) =
+        unsafe { (std::mem::transmute(words), std::mem::transmute([1u32, 0, 0, 0, 0])) };
+    let iid = guid(
+        0x696442be,
+        0xa72e,
+        0x4059,
+        [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+    );
+    let mut made = std::ptr::null();
+    let null = std::ptr::null();
+    let hr = crate::resource::create_committed(null, &heap, 0, &desc, 0, null.cast(), &iid, &mut made);
+    assert_eq!(hr, S_OK);
+    let (data, len) = crate::resource::buffer_bytes(made).unwrap();
+    assert_eq!(len, LEN as u64);
+    (made, data)
+}
+
+fn title_list() -> This {
+    let null = std::ptr::null();
+    let allocator_iid = guid(
+        0x6102dee4,
+        0xaf59,
+        0x4b09,
+        [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+    );
+    let list_iid = guid(
+        0x5b160d0f,
+        0xac1b,
+        0x4185,
+        [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+    );
+    let (mut allocator, mut list) = (null, null);
+    assert_eq!(super::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+    assert_eq!(super::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
+    list
+}
+
+fn title_queue() -> This {
+    let iid = guid(
+        0x0ec870a6,
+        0x5d7e,
+        0x4c22,
+        [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+    );
+    let desc = [0u32; 4];
+    let mut queue = std::ptr::null();
+    assert_eq!(
+        crate::queue::create(std::ptr::null(), desc.as_ptr().cast(), &iid, &mut queue),
+        S_OK
+    );
+    queue
+}
+
+/// A shader that writes 0xC0DE0000 + i to the first 64 dwords.
+fn writer() -> (ID3D12RootSignature, ID3D12PipelineState) {
+    const SOURCE: &str = r#"
+        RWByteAddressBuffer o : register(u0);
+        [RootSignature("UAV(u0)")]
+        [numthreads(64, 1, 1)]
+        void main(uint3 id : SV_DispatchThreadID) { o.Store(id.x * 4, 0xC0DE0000u + id.x); }
+    "#;
+    let device = &crate::host::host().unwrap().device;
+    let mut code = None;
+    // SAFETY: source and names outlive the call; the blob's own bytes.
+    unsafe {
+        D3DCompile(
+            SOURCE.as_ptr().cast(),
+            SOURCE.len(),
+            s!("writer"),
+            None,
+            None,
+            s!("main"),
+            s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            None,
+        )
+        .unwrap();
+        let code = code.unwrap();
+        let bytes = std::slice::from_raw_parts(
+            code.GetBufferPointer().cast::<u8>(),
+            code.GetBufferSize(),
+        );
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+        let pso = device
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        (root, pso)
+    }
+}
+
+/// Records, as a title dispatch would, a shader that writes 256 bytes at
+/// `address`.
+fn dispatch(list: &HostList, work: &(ID3D12RootSignature, ID3D12PipelineState), address: u64) {
+    let shadow = crate::shadow::find(address, 256).unwrap();
+    shadow.refresh(list, address, 256);
+    shadow.gpu_writes(list, address, 256);
+    list.keep(&shadow.buffer);
+    list.keep(&work.0);
+    list.keep(&work.1);
+    // SAFETY: an open list and live objects.
+    unsafe {
+        list.list.SetComputeRootSignature(&work.0);
+        list.list.SetPipelineState(&work.1);
+        list.list
+            .SetComputeRootUnorderedAccessView(0, shadow.gpu(address));
+        list.list.Dispatch(1, 1, 1);
+    }
+}
+
+type Copy = extern "system" fn(This, This, u64, This, u64, u64);
+
+fn copy(list: This, to: (This, u64), from: (This, u64)) {
+    slot::<Copy>(list, 0x78)(list, to.0, to.1, from.0, from.1, 256);
+}
+
+fn close(list: This) {
+    assert_eq!(
+        slot::<extern "system" fn(This) -> crate::object::HRESULT>(list, 0x48)(list),
+        S_OK
+    );
+}
+
+fn submit(queue: This, lists: &[This]) {
+    slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(
+        queue,
+        lists.len() as u32,
+        lists.as_ptr(),
+    );
+}
+
+fn words(at: *const u8) -> Vec<u32> {
+    // SAFETY: at least 256 bytes of a buffer of ours.
+    unsafe { std::slice::from_raw_parts(at.cast::<u32>(), 64) }.to_vec()
+}
+
+fn written() -> Vec<u32> {
+    (0..64).map(|i| 0xC0DE_0000 + i).collect()
+}
+
+/// A copy of what a shader wrote before it copies that: in the same list
+/// (between two buffers, and within one), and in a later list of the same
+/// submission. A copy before any such write is of title memory.
+#[test]
+fn copies_see_what_shaders_wrote_before_them() {
+    if crate::host::host().is_none() {
+        return; // no host GPU here
+    }
+    let work = writer();
+    let queue = title_queue();
+    let (a, a_at) = buffer();
+    let (b, b_at) = buffer();
+    // SAFETY: buffers of `LEN` bytes.
+    unsafe {
+        a_at.write_bytes(0x11, LEN);
+        b_at.write_bytes(0x22, LEN);
+    }
+
+    // In the same list.
+    let list = title_list();
+    let host = super::host_list(list).unwrap();
+    copy(list, (b, 0x1000), (a, 0));
+    dispatch(host, &work, a_at as u64);
+    copy(list, (b, 0), (a, 0));
+    copy(list, (a, 0x2000), (a, 0));
+    // Of a copy made on the GPU: there too.
+    copy(list, (b, 0x3000), (b, 0));
+    close(list);
+    submit(queue, &[list]);
+    assert_eq!(words(a_at), written(), "what the shader wrote");
+    // SAFETY (each): inside the buffers.
+    unsafe {
+        assert_eq!(words(b_at), written(), "between two buffers");
+        assert_eq!(words(a_at.add(0x2000)), written(), "within one");
+        assert_eq!(words(b_at.add(0x3000)), written(), "of a copy");
+        assert_eq!(words(b_at.add(0x1000)), [0x1111_1111; 64], "before the dispatch");
+        assert_eq!(words(b_at.add(0x100)), [0x2222_2222; 64], "nothing past the copy");
+    }
+
+    // In two lists of one submission.
+    // SAFETY: as above.
+    unsafe {
+        a_at.write_bytes(0x33, LEN);
+        b_at.write_bytes(0x44, LEN);
+    }
+    let (first, second) = (title_list(), title_list());
+    dispatch(super::host_list(first).unwrap(), &work, a_at as u64);
+    copy(second, (b, 0), (a, 0));
+    close(first);
+    close(second);
+    submit(queue, &[first, second]);
+    assert_eq!(words(b_at), written(), "in a later list of the submission");
+    // SAFETY: a plain device query.
+    assert!(unsafe { crate::host::host().unwrap().device.GetDeviceRemovedReason() }.is_ok());
+}

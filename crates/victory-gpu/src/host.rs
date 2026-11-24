@@ -1593,6 +1593,11 @@ struct Deferred {
     /// Buffer ranges declared as written by shaders since the last title
     /// copy, likewise.
     gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// All title memory the list's shaders may write.
+    written: Ranges,
+    /// Host copies (by id) shaders of the list were given to write since
+    /// they were last moved out of that state.
+    in_written_state: std::collections::HashSet<u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -3624,9 +3629,10 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // A list named twice runs in two submissions: a list, and the
         // prelude that brings its textures to their first states, may not
-        // be sent again before the card has run it.
+        // be sent again before the card has run it. So does a list whose
+        // copies read what a list before it wrote.
         let mut rest = runs;
-        while let Some(again) = first_repeat(rest.iter().map(|l| std::ptr::from_ref(*l))) {
+        while let Some(again) = first_cut(rest) {
             let _ = self.submit(&rest[..again], false);
             rest = &rest[again..];
         }
@@ -3644,10 +3650,16 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         }
-        if first_repeat(order.iter().copied()).is_some() {
-            // A list named twice is waited for in between.
+        let cut = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.execute(&runs);
+            let cut = first_cut(&runs).is_some();
+            if cut {
+                // Waited for in between.
+                self.execute(&runs);
+            }
+            cut
+        };
+        if cut {
             crate::list::recycle(lists, &order);
             return;
         }
@@ -4958,6 +4970,8 @@ impl HostList {
         // Dispatches declare the same ranges thousands of times: once is
         // enough until title memory changes in between.
         let mut deferred = self.deferred();
+        deferred.written.add(address, address + len);
+        deferred.in_written_state.insert(shadow.id());
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) {
             deferred
@@ -5040,30 +5054,35 @@ impl HostList {
     /// says it for all buffers, without a state of theirs
     /// (`VICTORY_GLOBAL_BARRIER=0`: the barrier on shader writes, as before).
     pub(crate) fn write_barrier(&self) {
+        if !self.global_barrier(
+            (D3D12_BARRIER_SYNC_ALL_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS),
+            (BUFFER_USES, BUFFER_READS | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST),
+        ) {
+            // SAFETY: an open list; no resource named.
+            unsafe { self.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+        }
+    }
+
+    /// One enhanced barrier for all memory, from what was done (where, how)
+    /// to what comes; false if the host has none.
+    fn global_barrier(
+        &self,
+        (sync_before, before): (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS),
+        (sync_after, after): (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS),
+    ) -> bool {
         let global = self.global.get_or_init(|| {
             enhanced_barriers()
                 .then(|| self.list.cast::<ID3D12GraphicsCommandList7>().ok())
                 .flatten()
         });
         let Some(list) = global else {
-            // SAFETY: an open list; no resource named.
-            return unsafe { self.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+            return false;
         };
         let barrier = D3D12_GLOBAL_BARRIER {
-            SyncBefore: D3D12_BARRIER_SYNC_ALL_SHADING,
-            SyncAfter: D3D12_BARRIER_SYNC_ALL_SHADING
-                | D3D12_BARRIER_SYNC_EXECUTE_INDIRECT
-                | D3D12_BARRIER_SYNC_INDEX_INPUT
-                | D3D12_BARRIER_SYNC_COPY,
-            AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
-            AccessAfter: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
-                | D3D12_BARRIER_ACCESS_SHADER_RESOURCE
-                | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER
-                | D3D12_BARRIER_ACCESS_VERTEX_BUFFER
-                | D3D12_BARRIER_ACCESS_INDEX_BUFFER
-                | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT
-                | D3D12_BARRIER_ACCESS_COPY_SOURCE
-                | D3D12_BARRIER_ACCESS_COPY_DEST,
+            SyncBefore: sync_before,
+            SyncAfter: sync_after,
+            AccessBefore: before,
+            AccessAfter: after,
         };
         let group = D3D12_BARRIER_GROUP {
             Type: D3D12_BARRIER_TYPE_GLOBAL,
@@ -5074,6 +5093,97 @@ impl HostList {
         };
         // SAFETY: an open list; the group and its barrier outlive the call.
         unsafe { list.Barrier(&[group]) };
+        true
+    }
+
+    /// Whether shaders of this list may have written any of `[from, to)`
+    /// (title addresses) by now.
+    pub(crate) fn wrote(&self, from: usize, to: usize) -> bool {
+        self.deferred().written.touch(from, to)
+    }
+
+    /// A copy of `len` bytes between two title buffers in its place among
+    /// the list's commands, between their host copies: the source is what
+    /// shaders of this list wrote, which title memory holds only when the
+    /// list has run. What it writes goes back to title memory as what
+    /// shaders write does. False if the host cannot (nothing recorded).
+    /// shortcut: a constant buffer later in the list that lies in what was
+    /// copied is still taken from title memory as it was.
+    pub(crate) fn gpu_copy(&self, dst: u64, src: u64, len: u64) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let (Some(from), Some(to)) = (crate::shadow::find(src, len), crate::shadow::find(dst, len)) else {
+            return false;
+        };
+        // Within one buffer by way of another: a buffer is not a copy's
+        // source and its destination at once.
+        let through = if from.id() == to.id() {
+            let Some(buffer) = host().and_then(|h| h.uav_buffer(len)) else {
+                return false;
+            };
+            self.keep(&buffer);
+            Some(buffer)
+        } else {
+            None
+        };
+        from.refresh(self, src, len);
+        to.refresh(self, dst, len);
+        let states = [self.buffer_state(&from), self.buffer_state(&to)];
+        to.gpu_writes(self, dst, len);
+        // The state of a buffer is not followed through every use: the
+        // barrier on writes waits for all of them, the transitions say the
+        // state a shader's write leaves, or none.
+        self.write_barrier();
+        let (common, source, dest) = (
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        let (a, b) = (from.offset(src), to.offset(dst));
+        let l = &self.list;
+        // SAFETY: an open list; the ranges lie in the host copies, which
+        // the list holds through the steps declared above.
+        unsafe {
+            match &through {
+                None => {
+                    l.ResourceBarrier(&[
+                        transition(&from.buffer, states[0], source),
+                        transition(&to.buffer, states[1], dest),
+                    ]);
+                    l.CopyBufferRegion(&to.buffer, b, &from.buffer, a, len);
+                    l.ResourceBarrier(&[
+                        transition(&from.buffer, source, common),
+                        transition(&to.buffer, dest, common),
+                    ]);
+                }
+                Some(buffer) => {
+                    l.ResourceBarrier(&[transition(&from.buffer, states[0], source)]);
+                    l.CopyBufferRegion(buffer, 0, &from.buffer, a, len);
+                    l.ResourceBarrier(&[
+                        transition(&from.buffer, source, dest),
+                        transition(buffer, dest, source),
+                    ]);
+                    l.CopyBufferRegion(&to.buffer, b, buffer, 0, len);
+                    l.ResourceBarrier(&[transition(&to.buffer, dest, common)]);
+                }
+            }
+        }
+        let mut deferred = self.deferred();
+        for shadow in [&from, &to] {
+            deferred.in_written_state.remove(&shadow.id());
+        }
+        true
+    }
+
+    /// The state the list's commands so far leave a buffer's host copy in,
+    /// as far as that is followed: written by shaders, or none.
+    fn buffer_state(&self, shadow: &crate::shadow::Shadow) -> D3D12_RESOURCE_STATES {
+        if self.deferred().in_written_state.contains(&shadow.id()) {
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        }
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -5993,6 +6103,80 @@ impl Meter {
                 });
         });
     }
+}
+
+/// Where buffers are used, and the ways they are read.
+const BUFFER_USES: D3D12_BARRIER_SYNC = D3D12_BARRIER_SYNC(
+    D3D12_BARRIER_SYNC_ALL_SHADING.0
+        | D3D12_BARRIER_SYNC_EXECUTE_INDIRECT.0
+        | D3D12_BARRIER_SYNC_INDEX_INPUT.0
+        | D3D12_BARRIER_SYNC_COPY.0,
+);
+const BUFFER_READS: D3D12_BARRIER_ACCESS = D3D12_BARRIER_ACCESS(
+    D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0
+        | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER.0
+        | D3D12_BARRIER_ACCESS_VERTEX_BUFFER.0
+        | D3D12_BARRIER_ACCESS_INDEX_BUFFER.0
+        | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT.0
+        | D3D12_BARRIER_ACCESS_COPY_SOURCE.0,
+);
+
+/// Address ranges, joined where they touch, by their starts.
+#[derive(Default)]
+struct Ranges(std::collections::BTreeMap<usize, usize>);
+
+impl Ranges {
+    fn add(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let (mut from, mut to) = (from, to);
+        while let Some((&a, &b)) = self.0.range(..=to).next_back()
+            && b >= from
+        {
+            self.0.remove(&a);
+            (from, to) = (from.min(a), to.max(b));
+        }
+        self.0.insert(from, to);
+    }
+
+    fn touch(&self, from: usize, to: usize) -> bool {
+        self.0.range(..to).next_back().is_some_and(|(_, &b)| b > from)
+    }
+}
+
+/// Where a submission of `runs` has to be cut: the first list with a copy
+/// (done on the CPU, before anything of its submission runs) of memory that
+/// shaders of a list before it may write.
+fn first_stale(runs: &[&HostList]) -> Option<usize> {
+    if runs.len() < 2 {
+        return None;
+    }
+    let copies = |list: &HostList| list.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..)));
+    let last = runs.iter().rposition(|l| copies(l))?;
+    let mut written = Ranges::default();
+    for (i, list) in runs[..=last].iter().enumerate() {
+        let deferred = list.deferred();
+        let stale = !written.0.is_empty()
+            && deferred.copies.iter().any(|s| match s {
+                &Step::Copy(_, src, len) => written.touch(src, src + len),
+                _ => false,
+            });
+        if stale {
+            return Some(i);
+        }
+        for (&from, &to) in &deferred.written.0 {
+            written.add(from, to);
+        }
+    }
+    None
+}
+
+/// Where `runs` has to be cut in two submissions, if anywhere.
+fn first_cut(runs: &[&HostList]) -> Option<usize> {
+    let again = first_repeat(runs.iter().map(|l| std::ptr::from_ref(*l)));
+    let stale = first_stale(&runs[..again.unwrap_or(runs.len())]);
+    stale.or(again)
 }
 
 /// A list's indirect-work budget (`crate::indirect`): the buffer the clamp
