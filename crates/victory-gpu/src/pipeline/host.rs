@@ -1136,6 +1136,7 @@ mod tests {
         );
         let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
             .expect("depth-bounds PSO made");
+        super::super::library::store_waiting();
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
         graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
             .expect("depth-bounds PSO made again");
