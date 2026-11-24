@@ -211,18 +211,24 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
-    let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
-        let state = crate::host::legal_state(texture, COPY_SOURCE);
-        let barrier = crate::host::transition(
-            texture,
-            D3D12_RESOURCE_STATES(before as i32),
-            D3D12_RESOURCE_STATES(state as i32),
-        );
+    let Some(written) = crate::resource::host_copy(source) else {
+        return false;
+    };
+    let barriers = list.moved(&written, &crate::states::Subs::All, None, COPY_SOURCE);
+    // What the list had it in, by part, where that is another state.
+    let before: Vec<(u32, u32)> = barriers
+        .iter()
+        .map(|b| {
+            // SAFETY: transition barriers.
+            let t = unsafe { &*b.Anonymous.Transition };
+            (t.Subresource, t.StateBefore.0 as u32)
+        })
+        .collect();
+    if !barriers.is_empty() {
         // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
-        before
-    });
-    if !first && before.is_none() {
+        unsafe { list.list.ResourceBarrier(&barriers) };
+    }
+    if !first && before.is_empty() {
         return true;
     }
     crate::list::ensure_state(list, placed, COPY_DEST);
@@ -271,10 +277,14 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // A draw that also writes the source (a view of it handled before
     // this one) needs it in that state again; the next read of the alias
     // then copies once more, as it must after a write.
-    if let Some(before) = before
-        && before & TARGET_OR_UNORDERED != 0
-    {
-        crate::list::ensure_state(list, source, before);
+    for (sub, state) in before {
+        if state & TARGET_OR_UNORDERED != 0 {
+            let subs = match sub {
+                u32::MAX => crate::states::Subs::All,
+                sub => crate::states::Subs::Some(vec![sub]),
+            };
+            list.ensure(source, &subs, state);
+        }
     }
     true
 }

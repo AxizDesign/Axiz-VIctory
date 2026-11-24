@@ -839,7 +839,7 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         #[cfg(feature = "diagnostics")]
-        let state = texture.state.load(Ordering::Relaxed);
+        let state = texture.state();
         let shown = host.present(&texture, frame);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

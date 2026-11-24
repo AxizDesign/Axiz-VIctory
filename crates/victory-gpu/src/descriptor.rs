@@ -220,6 +220,50 @@ impl RtvRecord {
         self.host_desc(true)
     }
 
+    /// Which subresources of `texture` the target view is of.
+    #[cfg(windows)]
+    pub(crate) fn target_subs(
+        &self,
+        texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    ) -> crate::states::Subs {
+        use crate::states::{Subs, shape};
+        // SAFETY: a live resource.
+        let Some(of) = shape(&unsafe { texture.GetDesc() }) else {
+            return Subs::All;
+        };
+        let w = &self.desc;
+        let (mip, slices) = match (self.described, w[1]) {
+            (0, _) | (_, 6) => (0, (0, u32::MAX)),
+            (_, 3 | 5) => (w[2], (w[3], w[4])),
+            (_, 7) => (0, (w[2], w[3])),
+            // (3D: a mip of it, whatever depth slices the view names)
+            _ => (w[2], (0, 1)),
+        };
+        Subs::part((mip, 1), slices, of)
+    }
+
+    /// [`RtvRecord::target_subs`] of a depth view.
+    #[cfg(windows)]
+    pub(crate) fn depth_subs(
+        &self,
+        texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    ) -> crate::states::Subs {
+        use crate::states::{Subs, shape};
+        // SAFETY: a live resource.
+        let Some(of) = shape(&unsafe { texture.GetDesc() }) else {
+            return Subs::All;
+        };
+        // Format, dimension, flags, then as a target view one number on.
+        let w = &self.desc;
+        let (mip, slices) = match (self.described, w[1]) {
+            (0, _) | (_, 5) => (0, (0, u32::MAX)),
+            (_, 2 | 4) => (w[3], (w[4], w[5])),
+            (_, 6) => (0, (w[3], w[4])),
+            _ => (w[3], (0, 1)),
+        };
+        Subs::part((mip, 1), slices, of)
+    }
+
     /// The description words as a host type, the format as the host has it.
     /// Without one, a typeless host copy gets a view of all of it (a depth
     /// one if `depth`) in the title's format, which the host needs spelled

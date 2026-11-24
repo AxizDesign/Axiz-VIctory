@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::states::{States, Subs, Uses};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -725,7 +726,7 @@ pub(crate) struct HostList {
     /// submission, in `prelude`. Holding the copies keeps every texture the
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
-    states: Mutex<States>,
+    states: Mutex<ListStates>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
@@ -776,10 +777,8 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+type ListStates =
+    std::collections::HashMap<usize, (Uses, std::sync::Arc<crate::resource::HostTexture>)>;
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -4515,58 +4514,70 @@ impl HostList {
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
-    /// Moves a title texture's host copy to `wanted` (a host state) in this
-    /// list: the host texture and the state it leaves, if that is a change.
-    /// The list's first use of a texture records nothing: its prelude brings
-    /// the texture there at submission.
-    pub(crate) fn transition(
+    /// Moves `subs` of host texture `copy` to `wanted` (a host state) in this
+    /// list: the barriers to record. The list's first use of a subresource
+    /// records nothing, its prelude brings it there at submission; unless
+    /// the state it comes from is told (`from`), which the prelude then
+    /// brings it to.
+    pub(crate) fn moved(
         &self,
-        resource: crate::object::This,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        subs: &Subs,
+        from: Option<u32>,
         wanted: u32,
-    ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
-        let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+    ) -> Vec<D3D12_RESOURCE_BARRIER> {
+        // SAFETY: a live resource.
+        let d = unsafe { copy.texture.GetDesc() };
+        let flags = d.Flags.0 as u32;
+        let wanted = legal_for(flags, wanted);
+        let from = from.map(|f| legal_for(flags, f));
+        let (count, subs) = match crate::states::shape(&d) {
+            Some((mips, slices)) => (mips * slices, subs),
+            None => (1, &Subs::All),
+        };
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        let changes = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
-                None
+                let mut uses = None;
+                let changes = Uses::go(&mut uses, count, subs, from, wanted);
+                if let Some(uses) = uses {
+                    v.insert((uses, copy.clone()));
+                }
+                changes
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                let slot = &mut o.get_mut().0;
+                let mut uses = Some(slot.clone());
+                let changes = Uses::go(&mut uses, count, subs, from, wanted);
+                if let Some(uses) = uses {
+                    *slot = uses;
+                }
+                changes
             }
+        };
+        crate::states::barriers(&copy.texture, &changes)
+    }
+
+    /// Moves `subs` of a title texture's host copy to `wanted` in this list
+    /// and records the barriers.
+    pub(crate) fn ensure(&self, resource: crate::object::This, subs: &Subs, wanted: u32) {
+        if let Some(copy) = crate::resource::host_copy(resource) {
+            self.record(&self.moved(&copy, subs, None, wanted));
         }
     }
 
-    /// Moves host texture `copy` to `wanted` (a host state) in this list,
-    /// as [`HostList::transition`] does a title resource's host copy, and
-    /// records the barrier: for textures that are not a title resource's
-    /// host copy (colour twins) and for the copies between the two.
-    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
-        let wanted = legal_state(&copy.texture, wanted);
-        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy.clone()));
-                None
-            }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some(before)
-            }
-        };
-        drop(states);
-        if let Some(before) = before {
-            let barrier = transition(
-                &copy.texture,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATES(wanted as i32),
-            );
-            // SAFETY: an open list and a live texture.
-            unsafe { self.list.ResourceBarrier(&[barrier]) };
+    fn record(&self, barriers: &[D3D12_RESOURCE_BARRIER]) {
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live textures.
+            unsafe { self.list.ResourceBarrier(barriers) };
         }
+    }
+
+    /// Moves all of host texture `copy` to `wanted` (a host state) in this
+    /// list and records the barrier: also for textures that are not a title
+    /// resource's host copy (colour twins).
+    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+        self.record(&self.moved(copy, &Subs::All, None, wanted));
     }
 
     /// A use of title texture `resource` about to be recorded, if it is a
@@ -4741,7 +4752,6 @@ impl HostList {
     fn prelude(&self) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
-        let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -4775,30 +4785,23 @@ impl HostList {
             };
             for (texture, state) in [(from, COPY_SOURCE), (to, COPY_DEST)] {
                 let key = std::sync::Arc::as_ptr(texture) as usize;
-                let real = texture.state.load(Ordering::Relaxed);
+                let real = texture.states.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let there = crate::states::between(&real, &States::All(state));
                 copying.insert(key, state);
-                if real != state {
-                    to_copy.push(transition(
-                        &texture.texture,
-                        host_state(real),
-                        host_state(state),
-                    ));
-                    if !states.contains_key(&key) {
-                        barriers.push(transition(
-                            &texture.texture,
-                            host_state(state),
-                            host_state(real),
-                        ));
-                    }
+                to_copy.extend(crate::states::barriers(&texture.texture, &there));
+                if !states.contains_key(&key) {
+                    let back = crate::states::between(&States::All(state), &real);
+                    barriers.extend(crate::states::barriers(&texture.texture, &back));
                 }
             }
         }
-        barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
-            let real = copy.state.swap(*last, Ordering::Relaxed);
-            let real = copying.get(key).copied().unwrap_or(real);
-            (real != *first)
-                .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
-        }));
+        for (key, (uses, copy)) in states.iter() {
+            let mut real = copy.states.lock().unwrap_or_else(|e| e.into_inner());
+            let found = copying.get(key).map_or_else(|| real.clone(), |&state| States::All(state));
+            let (changes, left) = uses.enter(&found);
+            *real = left;
+            barriers.extend(crate::states::barriers(&copy.texture, &changes));
+        }
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }

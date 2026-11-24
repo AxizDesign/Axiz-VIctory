@@ -14,6 +14,7 @@ use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+use crate::states::Subs;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -157,7 +158,7 @@ pub(crate) struct State {
     vertex: [VertexView; 32],
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
-    targets: Vec<usize>,
+    targets: Vec<(usize, Subs)>,
     depth: usize,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
@@ -538,7 +539,7 @@ impl State {
                 rtvs.push(host.rtv(None, Some(&null)));
                 continue;
             };
-            self.targets.push(record.resource as usize);
+            self.targets.push((record.resource as usize, record.target_subs(texture)));
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
@@ -910,8 +911,8 @@ impl State {
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+        for (t, subs) in &self.targets {
+            list.ensure(*t as This, subs, RENDER_TARGET);
         }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
@@ -1819,7 +1820,7 @@ impl State {
                     format!("{t:#x} {}x{} f{}", d.Width, d.Height, d.Format.0)
                 })
             };
-            let targets: Vec<String> = self.targets.iter().filter_map(|&t| described(t)).collect();
+            let targets: Vec<String> = self.targets.iter().filter_map(|t| described(t.0)).collect();
             let _ = write!(text, " targets {targets:?} depth {:?} state [{}]", described(self.depth), p.state);
             // The title's scissor and viewport at this draw (the first of
             // each): the title draws what it sees through a
@@ -2151,7 +2152,7 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_made(t as This))
+            .filter_map(|t| crate::resource::host_made(t.0 as This))
             .map(|t| {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
@@ -2660,7 +2661,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
     }
     match (view, kind) {
-        (View::Shader(resource, _), ResourceType::Srv) => {
+        (View::Shader(resource, desc), ResourceType::Srv) => {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
@@ -2683,7 +2684,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            let subs = crate::descriptor::host::view_subs(*resource as This, desc.as_ref(), false);
+            // (A depth target only tested is read whole.)
+            let subs = if state == SHADER_RESOURCE { subs } else { Subs::All };
+            list.ensure(*resource as This, &subs, state);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -2697,12 +2701,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 }
             }
         }
-        (View::Unordered(resource, _, _), ResourceType::Uav) => {
+        (View::Unordered(resource, _, desc), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
-                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+                let subs = crate::descriptor::host::view_subs(*resource as This, desc.as_ref(), true);
+                list.ensure(*resource as This, &subs, UNORDERED_ACCESS);
             }
         }
         _ => {}

@@ -52,6 +52,8 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod states;
 pub mod signature;
 #[cfg(windows)]
 mod texture;

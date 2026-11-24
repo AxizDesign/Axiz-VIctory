@@ -2215,6 +2215,48 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Which subresources of a title texture's host copy a shader view or
+/// (`unordered`) unordered access view with description `desc` is of.
+pub(crate) fn view_subs(
+    resource: crate::object::This,
+    desc: Option<&[u32; 10]>,
+    unordered: bool,
+) -> crate::states::Subs {
+    use crate::states::{Subs, shape};
+    let Some(w) = desc else {
+        return Subs::All;
+    };
+    let Some(of) = crate::resource::host_resource(resource)
+        // SAFETY: a live resource.
+        .and_then(|t| shape(&unsafe { t.GetDesc() }))
+    else {
+        return Subs::All;
+    };
+    let (mips, slices) = if unordered {
+        // Format, dimension, then mip, first slice and slices.
+        match w[1] {
+            2 | 4 => ((w[2], 1), (0, 1)),
+            3 | 5 => ((w[2], 1), (w[3], w[4])),
+            8 => ((w[2], 1), (0, 1)),
+            _ => return Subs::All,
+        }
+    } else {
+        // Format, dimension, mapping, a pad, then first mip and mips, first
+        // slice and slices.
+        match w[1] {
+            2 | 4 => ((w[4], w[5]), (0, 1)),
+            3 | 5 => ((w[4], w[5]), (w[6], w[7])),
+            6 => ((0, 1), (0, 1)),
+            7 => ((0, 1), (w[4], w[5])),
+            8 => ((w[4], w[5]), (0, 1)),
+            9 => ((w[4], w[5]), (0, 6)),
+            10 => ((w[4], w[5]), (w[6], w[7].saturating_mul(6))),
+            _ => return Subs::All,
+        }
+    };
+    Subs::part(mips, slices, of)
+}
+
 /// Whether a view names a format.
 pub(crate) fn typed_view(view: &View) -> bool {
     match view {

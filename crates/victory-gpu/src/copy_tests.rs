@@ -279,3 +279,106 @@ fn unordered_clears_fill_the_view() {
         assert_eq!(word, wanted, "dword {i}");
     }
 }
+
+/// One mip of a texture copied into another in one list, with the title's
+/// barriers on each mip: both are in their own state (one state for the
+/// whole texture is the wrong one for one of them), and the contents are
+/// there. Run with the debug layer it says nothing.
+#[test]
+fn a_mip_is_copied_into_another() {
+    if crate::host::host().is_none() {
+        return; // no host GPU here
+    }
+    let queue = title_queue();
+    let null = std::ptr::null();
+    // A 64x64 RGBA8 render target with two mips.
+    let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 0x2_0001, 28, 1, 0, 0, 1, 0];
+    // SAFETY: plain numbers in the descriptions' layouts.
+    let (desc, heap) = unsafe {
+        (
+            std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(words),
+            std::mem::transmute::<[u32; 5], crate::resource::HeapProperties>([1, 0, 0, 0, 0]),
+        )
+    };
+    let iid = guid(
+        0x696442be,
+        0xa72e,
+        0x4059,
+        [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+    );
+    const TARGET: u32 = 0x4;
+    const COPY_SOURCE: u32 = 0x800;
+    const COPY_DEST: u32 = 0x400;
+    let mut texture = null;
+    assert_eq!(
+        crate::resource::create_committed(null, &heap, 0, &desc, TARGET, null.cast(), &iid, &mut texture),
+        S_OK
+    );
+    let (back, back_at) = buffer();
+    // Two target views, one a mip: descriptor memory of our own.
+    let mut slots = vec![0u64; 64];
+    let handle = |n: usize| slots_at(&slots) + n as u64 * 128;
+    for mip in 0..2usize {
+        let view = [28u32, 4, mip as u32, 0, 0, 0];
+        crate::descriptor::create_rtv(null, texture, &view, handle(mip));
+    }
+    let list = title_list();
+    type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const u8);
+    let clear = |mip: usize, colour: [f32; 4]| {
+        slot::<Clear>(list, 0x1a0)(list, handle(mip), &colour, 0, null.cast());
+    };
+    #[repr(C)]
+    struct Barrier {
+        kind: u32,
+        flags: u32,
+        resource: This,
+        sub: u32,
+        before: u32,
+        after: u32,
+        pad: u32,
+    }
+    let barrier = |sub: u32, before: u32, after: u32| {
+        let b = Barrier { kind: 0, flags: 0, resource: texture, sub, before, after, pad: 0 };
+        slot::<extern "system" fn(This, u32, *const Barrier) -> u32>(list, 0xd0)(list, 1, &b);
+    };
+    #[repr(C)]
+    struct Location {
+        resource: This,
+        kind: u32,
+        /// Offset; format, width; height, depth; row pitch.
+        footprint: [u64; 4],
+    }
+    let at_sub = |sub: u64| Location {
+        resource: texture,
+        kind: 0,
+        // (the index lies where a footprint has its offset)
+        footprint: [sub, 0, 0, 0],
+    };
+    let rows = Location {
+        resource: back,
+        kind: 1,
+        footprint: [0, 28 | 64 << 32, 64 | 1 << 32, 256],
+    };
+    type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+    let copy = |to: &Location, from: &Location| slot::<Copy>(list, 0x80)(list, to, 0, 0, 0, from, null.cast());
+    clear(0, [1.0, 0.0, 0.0, 1.0]);
+    clear(1, [0.0, 1.0, 0.0, 1.0]);
+    barrier(1, TARGET, COPY_SOURCE);
+    barrier(0, TARGET, COPY_DEST);
+    copy(&at_sub(0), &at_sub(1));
+    barrier(0, COPY_DEST, COPY_SOURCE);
+    copy(&rows, &at_sub(0));
+    close(list);
+    submit(queue, &[list]);
+    slots.clear();
+    // SAFETY: 64 rows of 256 bytes in a buffer of `LEN`.
+    let texel = |x: usize, y: usize| unsafe { back_at.add(y * 256 + x * 4).cast::<u32>().read_unaligned() };
+    assert_eq!(texel(0, 0), 0xff00_ff00, "the small mip's green");
+    assert_eq!(texel(31, 31), 0xff00_ff00);
+    assert_eq!(texel(32, 31), 0xff00_00ff, "the large mip's red around it");
+    assert_eq!(texel(63, 63), 0xff00_00ff);
+}
+
+fn slots_at(slots: &[u64]) -> u64 {
+    slots.as_ptr() as u64
+}
