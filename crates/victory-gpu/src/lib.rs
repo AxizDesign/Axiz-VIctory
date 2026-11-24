@@ -34,6 +34,8 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+#[cfg(all(test, windows))]
+mod list_copy_tests;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
