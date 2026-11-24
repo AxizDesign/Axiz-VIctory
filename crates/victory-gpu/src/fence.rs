@@ -3,10 +3,11 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
-use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
+use crate::object::{self, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 pub(crate) const FENCE_IIDS: [Iid; 4] = [
@@ -30,6 +31,8 @@ struct Fence {
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
     waiters: Mutex<Vec<(u64, usize)>>,
+    /// Threads blocked on it, with `waiters`.
+    moved: Condvar,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -50,6 +53,7 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        moved: Condvar::new(),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
@@ -88,32 +92,58 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
-        // With submissions sent to the card and not waited for
-        // (`crate::host::late`) the signal may be behind them: they are
-        // settled, which sets it.
-        #[cfg(windows)]
-        if crate::host::late() {
-            drop(waiters);
-            crate::host::settle_for_fence();
-            if fence.value.load(Ordering::Acquire) >= value {
-                return S_OK;
-            }
-            tracing::warn!(value, "blocking fence wait not implemented");
-            return E_NOTIMPL;
-        }
-        // shortcut: a null event means "block until reached"; nothing can
-        // reach it while no GPU work runs, so fail instead of hanging.
-        tracing::warn!(value, "blocking fence wait not implemented");
-        return E_NOTIMPL;
+        drop(waiters);
+        block(fence, value);
+        return S_OK;
     }
     waiters.push((value, event as usize));
     S_OK
 }
+/// Returns once the fence has reached `value`, as a null event asks for. The
+/// signal may be another thread's, behind what a queue holds, or behind
+/// submissions sent to the card and not waited for (`crate::host::late`):
+/// those two are moved on here, with no lock held.
+fn block(fence: &Fence, value: u64) {
+    let started = Instant::now();
+    let mut said = false;
+    loop {
+        #[cfg(windows)]
+        {
+            if crate::host::late() {
+                crate::host::settle_for_fence();
+            }
+            crate::queue::release_held(false);
+        }
+        let waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        let reached = || fence.value.load(Ordering::Acquire) >= value;
+        // The time out is for a wait on memory a shader wrote, which tells
+        // no one.
+        let pause = Duration::from_millis(5);
+        let (waiters, _) = fence
+            .moved
+            .wait_timeout_while(waiters, pause, |_| !reached())
+            .unwrap_or_else(|e| e.into_inner());
+        drop(waiters);
+        if reached() {
+            return;
+        }
+        if !said && started.elapsed() > Duration::from_secs(5) {
+            said = true;
+            tracing::warn!(
+                value,
+                stands = fence.value.load(Ordering::Acquire),
+                "a thread has waited 5 seconds for a fence"
+            );
+        }
+    }
+}
+
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
+    fence.moved.notify_all();
     waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
         if reached {
@@ -181,11 +211,24 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        // Without an event the wait is the call's: until another thread's
+        // signal, and not before it.
+        let at_fence = f as usize;
+        let started = Instant::now();
+        let other = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(signal(at_fence as This, 7), S_OK);
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(signal(at_fence as This, 9), S_OK);
+        });
+        assert_eq!(wait(f, 9, std::ptr::null_mut()), S_OK);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        other.join().unwrap();
+        assert_eq!(wait(f, 8, std::ptr::null_mut()), S_OK, "already reached");
         // The title reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
-        assert_eq!(unsafe { *(at as *const u64) }, 5);
+        assert_eq!(unsafe { *(at as *const u64) }, 9);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);

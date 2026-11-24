@@ -129,10 +129,16 @@ pub(crate) fn hand_out<T>(
 
 /// Release for objects made by [`hand_out`]: the last reference frees it.
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
+    release_boxed_after::<T>(this, || {})
+}
+
+/// [`release_boxed`], with `last` called before the object is freed.
+pub(crate) fn release_boxed_after<T>(this: This, last: impl FnOnce()) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
+            last();
             private_data().retain(|&(object, _), _| object != this as usize);
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });

@@ -60,8 +60,23 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.make_with(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+    }
+
+    /// A panic on the way is a pipeline the host does not have: let out, it
+    /// would end the worker for good and leave `made` unset, so that every
+    /// later frame waited for it (and, on a title's thread, end the run).
+    fn make_with(&self, new: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(new)).unwrap_or_else(|_| {
+                tracing::error!(
+                    key = %self.key,
+                    shaders = ?self.shaders,
+                    "making a host pipeline panicked; its draws are dropped"
+                );
+                None
+            })
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -361,6 +376,21 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// It is answered, waited for by no one, and the worker goes on.
+    #[test]
+    fn a_panic_while_making_is_a_pipeline_the_host_does_not_have() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        p.make_with(|| panic!("a fault of the translator's"));
+        assert!(matches!(p.made.get(), Some(None)));
+        p.make_with(|| unreachable!("tried again"));
+        let started = Instant::now();
+        assert!(ready(&p).is_none());
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let next = Arc::new(Pending::new(Vec::new(), None));
+        next.make();
+        assert!(matches!(next.made.get(), Some(None)));
     }
 
     #[test]

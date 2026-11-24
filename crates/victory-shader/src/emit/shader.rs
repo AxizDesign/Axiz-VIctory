@@ -119,6 +119,10 @@ pub(crate) struct Geometry {
 /// out of bounds"), which AMD's driver forgives.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+pub(super) fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
@@ -397,7 +401,7 @@ impl Shader {
         props: (u32, u32),
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let limit = view_heap_limit();
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);

@@ -188,6 +188,50 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// The environment variables a translation depends on besides those with a
+/// function of their own here ([`loop_limit`], [`group_sync`],
+/// [`shader_opt`]): read where they matter.
+const SWITCHES: [&str; 7] = [
+    "VICTORY_WAVE_WIDE",
+    "VICTORY_WAVE_DEEP_SKIPS",
+    "VICTORY_WAVE_OWN_BITS",
+    "VICTORY_WAVE_LOCAL",
+    "VICTORY_F16_NEAREST",
+    "VICTORY_MESH_OUTPUT_STRICT",
+    "VICTORY_STRICT_JOINS",
+];
+
+/// Everything a translation depends on besides the container and this
+/// build, for a cache to key on: the host's widest wave and the end of its
+/// view heap (another adapter's are others) and every switch. As it stands
+/// now: the host's limits are set when the device is made.
+pub fn settings() -> Vec<u8> {
+    settings_of(
+        [
+            lower::host_max_wave(),
+            shader::view_heap_limit(),
+            loop_limit(),
+            u32::from(group_sync()),
+            shader_opt(),
+        ],
+        |name| std::env::var_os(name),
+    )
+}
+
+/// [`settings`] of given values. Pure, for testing.
+fn settings_of(numbers: [u32; 5], value: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<u8> {
+    let mut out: Vec<u8> = numbers.iter().flat_map(|n| n.to_le_bytes()).collect();
+    for name in SWITCHES {
+        // (unset is not empty, and no value runs into the next name)
+        let value = value(name);
+        let bytes = value.as_deref().map_or(&[][..], |v| v.as_encoded_bytes());
+        out.push(u8::from(value.is_some()));
+        out.extend((bytes.len() as u64).to_le_bytes());
+        out.extend(bytes);
+    }
+    out
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
@@ -1739,5 +1783,72 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn every_setting_a_translation_depends_on_tells_two_apart() {
+        let none = |_: &str| None;
+        let base = [32, 0, 8, 2, 63];
+        let mut seen = vec![settings_of(base, none)];
+        for n in 0..base.len() {
+            let mut other = base;
+            other[n] += 1;
+            seen.push(settings_of(other, none));
+        }
+        for name in SWITCHES {
+            for value in ["", "0", "1"] {
+                seen.push(settings_of(base, |n| (n == name).then(|| value.into())));
+            }
+        }
+        let all = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), all);
+        assert_eq!(settings_of(base, none), settings_of(base, none));
+    }
+
+    /// A switch the translator reads and the cache does not key on serves
+    /// one run another's translations.
+    #[test]
+    fn every_switch_the_translator_reads_is_keyed_on() {
+        // Keyed by value, for tests and dumps alone, or only said aloud.
+        const OTHERS: [&str; 13] = [
+            "VICTORY_GROUP_SYNC",
+            "VICTORY_SHADER_LOOP_LIMIT",
+            "VICTORY_SHADER_OPT",
+            "VICTORY_WAVE_WHY",
+            "VICTORY_EMIT_DUMP",
+            "VICTORY_SHADER_CENSUS",
+            "VICTORY_DIFF_ONLY",
+            "VICTORY_WARP",
+            "VICTORY_CONSOLE_DXC",
+            "VICTORY_PC_DXC",
+            "VICTORY_D3D12_DEBUG",
+            "VICTORY_DXIL",
+            "VICTORY_HOST_MAX_WAVE",
+        ];
+        let mut files = vec![std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))];
+        while let Some(at) = files.pop() {
+            if at.is_dir() {
+                files.extend(std::fs::read_dir(at).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
+            let text = std::fs::read_to_string(&at).unwrap();
+            for call in ["env::var(\"", "env::var_os(\""] {
+                for after in text.split(call).skip(1) {
+                    let name = after.split('"').next().unwrap();
+                    assert!(
+                        !name.starts_with("VICTORY_") || SWITCHES.contains(&name) || OTHERS.contains(&name),
+                        "{}: {name}",
+                        at.display()
+                    );
+                }
+            }
+        }
     }
 }
