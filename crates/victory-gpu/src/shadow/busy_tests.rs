@@ -336,3 +336,115 @@ fn many_submissions_declare_one_heap() {
     println!("submissions {total:7.2} ms a frame, {sent:7.2} ms on the submitting thread");
     unregister(p, p as u64);
 }
+
+/// A byte the title writes costs the kernel's page it lies in, not 64 KiB.
+#[test]
+fn a_written_byte_copies_its_kernel_page() {
+    if crate::host::host().is_none() {
+        return;
+    }
+    let len = 4 * PAGE;
+    let p = pool(len);
+    register(p, p as u64, len as u64);
+    let copy = find(p as u64, len as u64).unwrap();
+    // (A page nothing touched yet is told as written once it is read.)
+    for at in (p..p + len).step_by(4096) {
+        store(at, 9);
+    }
+    copy.update(p, len);
+    assert_eq!(copy.update(p, len), 0, "nothing was written");
+    store(p + PAGE + 5000, 1);
+    assert_eq!(copy.update(p, len), 4096);
+    assert_eq!(held(&copy, p + PAGE + 5000), 1);
+    // The two ends of a page, and the next page's start: two pieces.
+    store(p + PAGE, 2);
+    store(p + 2 * PAGE - 1, 3);
+    store(p + 2 * PAGE, 4);
+    assert_eq!(copy.update(p, len), 3 * 4096);
+    // A copy that missed a write of a page takes all of it: another copy
+    // asked (and so cleared the kernel's bits) in between.
+    store(p + 3 * PAGE + 100, 5);
+    let _ = crate::watch::writes(p, p + len, true);
+    store(p + 3 * PAGE + 50_000, 6);
+    let _ = crate::watch::writes(p, p + len, true);
+    assert_eq!(copy.update(p, len), PAGE);
+    assert_eq!((held(&copy, p + 3 * PAGE + 100), held(&copy, p + 3 * PAGE + 50_000)), (5, 6));
+    unregister(p, p as u64);
+}
+
+/// Title writes anywhere, refreshes of parts of two copies that overlap,
+/// with ranges shaders are declared to write and without: what was
+/// refreshed is what title memory holds.
+#[test]
+fn refreshed_ranges_hold_title_memory_whatever_was_written() {
+    if crate::host::host().is_none() {
+        return;
+    }
+    let len = 8 * PAGE;
+    let p = pool(len);
+    // The second is inside the first and starts off a page.
+    let (inner, inner_len) = (p + 2 * PAGE + 4096 + 256, 3 * PAGE);
+    register(p, p as u64, len as u64);
+    register(inner, inner as u64, inner_len as u64);
+    let outer = find(p as u64, len as u64).unwrap();
+    let nested = find(inner as u64, inner_len as u64).unwrap();
+    assert_ne!(outer.id(), nested.id());
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut next = move |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 20) as usize % n
+    };
+    let mut declared: Vec<(usize, usize)> = Vec::new();
+    for round in 0..4000 {
+        for _ in 0..next(6) {
+            let most = if next(8) == 0 { 2 * PAGE } else { 64 };
+            let (at, n) = (next(len), 1 + next(most));
+            for k in at..(at + n).min(len) {
+                store(p + k, next(256) as u8);
+            }
+        }
+        if next(5) == 0 {
+            // As a submission asks, once for all of it.
+            crate::watch::ask_once(&[(p, p + len), (inner, inner + inner_len)]);
+            let (at, n) = (next(len - 64), 1 + next(64));
+            for k in at..at + n {
+                store(p + k, next(256) as u8);
+            }
+            crate::watch::wrote(p + at, n);
+        }
+        // Shaders are declared to write some of the outer copy for a while
+        // (and write nothing): the title's bytes must reach it all the same.
+        if next(20) == 0 {
+            let (at, n) = (next(len - 1), 1 + next(3 * PAGE));
+            let n = n.min(len - at);
+            outer.update(p + at, n);
+            outer.writing(p + at, n);
+            declared.push((p + at, p + at + n));
+        }
+        if next(40) == 0 {
+            take_snapshots();
+            for range in declared.drain(..) {
+                outer.copy_back(range.0, range.1 - range.0);
+                outer.copy_back_done(&[range]);
+            }
+        }
+        let (copy, base, size) = if next(2) == 0 {
+            (&outer, p, len)
+        } else {
+            (&nested, inner, inner_len)
+        };
+        let at = next(size);
+        let most = if next(3) == 0 { size } else { 5000 };
+        let n = (1 + next(most)).min(size - at);
+        copy.update(base + at, n);
+        for k in 0..n {
+            let a = base + at + k;
+            assert_eq!(held(copy, a), load(a), "round {round}, byte {:#x} of {at:#x}+{n:#x}", a - base);
+        }
+        crate::watch::ask_once_end();
+    }
+    unregister(inner, inner as u64);
+    unregister(p, p as u64);
+}
