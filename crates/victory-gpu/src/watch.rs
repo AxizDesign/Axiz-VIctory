@@ -91,15 +91,6 @@ impl Write {
             u16::MAX
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn whole(last: u64) -> Write {
-        Write {
-            last,
-            since: last,
-            parts: u16::MAX,
-        }
-    }
 }
 
 /// The parts of `page` in the bytes `[from, to)`.
