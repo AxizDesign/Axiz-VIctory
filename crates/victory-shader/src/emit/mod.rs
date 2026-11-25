@@ -201,7 +201,7 @@ pub fn shader_opt() -> u32 {
 /// The environment variables a translation depends on besides those with a
 /// function of their own here ([`loop_limit`], [`group_sync`],
 /// [`shader_opt`]): read where they matter.
-const SWITCHES: [&str; 9] = [
+const SWITCHES: [&str; 10] = [
     "VICTORY_WAVE_WIDE",
     "VICTORY_WAVE_DEEP_SKIPS",
     "VICTORY_WAVE_OWN_BITS",
@@ -211,6 +211,7 @@ const SWITCHES: [&str; 9] = [
     "VICTORY_STRICT_JOINS",
     "VICTORY_FIRSTLANE_OWN",
     "VICTORY_FIRST_HALF",
+    "VICTORY_PIXEL_HELPERS",
 ];
 
 /// Everything a translation depends on besides the container and this
@@ -693,17 +694,37 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs,
-        outputs,
-        prims,
-        mesh_stride,
-    })?;
+    let lowered = |st: &structure::Structured, res: &resource::Resources| {
+        lower::lower(&lower::Parts {
+            native,
+            p,
+            st,
+            io,
+            res,
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
+            prims: prims.clone(),
+            mesh_stride,
+        })
+    };
+    let kills = || {
+        let st = structure::killing(p)?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        lowered(&st, &res)
+    };
+    let l = if st.discards.is_empty() {
+        lowered(st, res)?
+    } else if std::env::var_os("VICTORY_PIXEL_HELPERS").is_some_and(|v| v == "0") {
+        kills()?
+    } else {
+        // Discarded lanes kept on as helpers can read what no surviving
+        // lane does (a register only killed lanes skipped writing); such a
+        // program kills them as the console does (`structure::killing`).
+        match lowered(st, res) {
+            Err(_) => kills()?,
+            l => l?,
+        }
+    };
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

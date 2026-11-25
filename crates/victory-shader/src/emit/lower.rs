@@ -2757,6 +2757,16 @@ impl<'a> Lower<'a> {
             let mut i = 0;
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
+                if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
+                    // A pixel's discard: the lanes stay on as helpers.
+                    let at = self.cur;
+                    let offset = p.blocks[b].insts[i].machine.offset;
+                    let kill = self
+                        .boolean(lanes, at)
+                        .map_err(|w| unsupported(offset, w))?;
+                    self.s
+                        .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+                }
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
@@ -5260,6 +5270,13 @@ impl<'a> Lower<'a> {
         self.half_result(f)
     }
 
+    /// Whether a quad-local read must reach discarded lanes: after a pixel's
+    /// discard they are the host's helpers, which only quad reads see (wave
+    /// reads give 0 from them on AMD).
+    fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel && !self.x.st.discards.is_empty()
+    }
+
     fn read_lane(&mut self, x: V, lane: V) -> V {
         self.s.op(
             self.cur,
@@ -5359,7 +5376,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -8011,7 +8028,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
