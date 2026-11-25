@@ -343,6 +343,13 @@ fn same_float(a: u32, b: u32) -> bool {
     a == b || (f32::from_bits(a).is_nan() && f32::from_bits(b).is_nan())
 }
 
+fn floor_i32(x: f32, more: f64) -> u32 {
+    if x.is_nan() {
+        return if x.is_sign_negative() { 0x8000_0000 } else { 0x7FFF_FFFF };
+    }
+    (f64::from(x) + more).floor() as i32 as u32
+}
+
 #[test]
 fn conversions_and_rounding_match_the_rdna2_definitions() {
     // (name, VOP3 opcode, reference of one float operand: bits out).
@@ -351,10 +358,10 @@ fn conversions_and_rounding_match_the_rdna2_definitions() {
         // Saturating, NaN to 0.
         ("v_cvt_u32_f32", 0x187, |x| x as u32),
         ("v_cvt_i32_f32", 0x188, |x| x as i32 as u32),
-        ("v_cvt_flr_i32_f32", 0x18d, |x| x.floor() as i32 as u32),
-        ("v_cvt_rpi_i32_f32", 0x18c, |x| {
-            (x + 0.5).floor() as i32 as u32
-        }),
+        // These two saturate a NaN by its sign, and the half is added exactly
+        // (measured on RDNA2, `semantics_tests`).
+        ("v_cvt_flr_i32_f32", 0x18d, |x| floor_i32(x, 0.0)),
+        ("v_cvt_rpi_i32_f32", 0x18c, |x| floor_i32(x, 0.5)),
         ("v_trunc_f32", 0x1a1, |x| x.trunc().to_bits()),
         ("v_ceil_f32", 0x1a2, |x| x.ceil().to_bits()),
         ("v_rndne_f32", 0x1a3, |x| x.round_ties_even().to_bits()),
