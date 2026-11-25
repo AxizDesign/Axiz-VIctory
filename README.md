@@ -126,7 +126,7 @@ What each part does today and what it still needs:
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
+| Input | XInput pads, keyboard, keyboard and mouse stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
@@ -176,17 +176,26 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads. With none connected the keyboard and the mouse are a pad
+while the title's window has focus:
 
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
+| Pad | Keyboard and mouse |
+|-----|--------------------|
+| left trigger (aim), right trigger (fire) | right click, left click (or U, O) |
+| right stick | mouse (or I J K L) |
+| left stick | W A S D |
+| A | left Shift, Enter |
+| B | R, Backspace |
+| X | Space, X |
+| Y | F, Y |
+| left / right shoulder | Tab / Q (or the mouse's back / forward buttons) |
+| left / right stick click | left Ctrl, Z / C, H, middle click |
+| D-pad up, down, left, right | arrows (or 1, 2, 3, 4); E is right too |
+| Menu, View | Esc, P / V |
+
+Click in the title's window to give it the mouse (that click presses nothing);
+left Alt or switching windows gives it back.
+`VICTORY_MOUSE_SENSITIVITY=1.5` turns faster (1 by default).
 
 ## Commands
 
@@ -294,7 +303,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not (keys as in the pad table above) |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
