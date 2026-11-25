@@ -630,27 +630,49 @@ pub(super) fn store_waiting() {
     }
 }
 
+/// How long after a save that took `took` the next one waits: a save writes
+/// the whole library, so with a fixed pause the time spent saving grew with
+/// the library (a pre-build of the whole pack: tens of thousands of
+/// pipelines), until every worker stood behind one. At most a twentieth of
+/// the time goes into saves; at most ten minutes of pipelines are not saved,
+/// or four times as long as a save that takes longer than that allows.
+fn save_pause(took: std::time::Duration) -> std::time::Duration {
+    use std::time::Duration;
+    const LEAST: Duration = Duration::from_secs(20);
+    const MOST: Duration = Duration::from_secs(600);
+    (took * 20).clamp(LEAST, MOST).max(took * 4)
+}
+
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and [`save_pause`] has passed (or `now`). One thread saves; the
+/// others do not wait for it.
 pub(crate) fn save(now: bool) {
-    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    static SAVE_LOCK: Mutex<()> = Mutex::new(());
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    use std::sync::TryLockError;
+    // When the last save ended, and how long it took. Held for all of a
+    // save: worker saves and shutdown's `save(true)` never race on the
+    // `.tmp` or target files.
+    static LAST: Mutex<Option<(std::time::Instant, std::time::Duration)>> = Mutex::new(None);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
-    }
-    if now {
+    let mut last = if now {
         store_waiting();
+        LAST.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match LAST.try_lock() {
+            Ok(last) => last,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        }
+    };
+    if !now && last.is_some_and(|(ended, took)| ended.elapsed() < save_pause(took)) {
+        return;
     }
-    // Serialize the entire file-write and rename sequence across worker saves
-    // and shutdown's `save(true)` so two threads never race on the `.tmp` or
-    // target files after `library.saving.write()` is released.
-    let _save_guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let began = std::time::Instant::now();
+    write_out(dir, library);
+    *last = Some((std::time::Instant::now(), began.elapsed()));
+}
+
+/// A save of `library` and the early list in `dir`.
+fn write_out(dir: &std::path::Path, library: &Library) {
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
@@ -825,6 +847,21 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saves_take_a_small_part_of_the_time_whatever_the_library_weighs() {
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        assert_eq!(save_pause(Duration::ZERO), s(20));
+        assert_eq!(save_pause(s(1)), s(20));
+        assert_eq!(save_pause(s(6)), s(120));
+        assert_eq!(save_pause(s(60)), s(600));
+        assert_eq!(save_pause(s(300)), s(1200));
+        for took in 1..1000 {
+            let pause = save_pause(s(took));
+            assert!(pause >= s(took) * 4 && pause >= s(20), "{took}");
+        }
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
