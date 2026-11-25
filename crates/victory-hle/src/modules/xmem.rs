@@ -289,6 +289,9 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
+    if layout.size() >= WATCHED_FROM {
+        return alloc_watched(layout);
+    }
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
@@ -309,6 +312,46 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     }
 }
 
+/// Blocks of [`XMemAllocDefault`] from this size on are write-watched
+/// reservations of their own: resources the title makes through the device
+/// get their memory here, and the host copies of buffers in memory of the
+/// process heap, which cannot be watched, were copied whole by every
+/// submission that reads them (after fxceless/victory-fork #651). From
+/// half a megabyte, where the process heap makes a reservation too: smaller
+/// blocks stay as cheap as they were.
+const WATCHED_FROM: usize = 512 << 10;
+
+/// In the second word of a block's header: a [`WATCHED_FROM`] block, and
+/// the other bits are the user address' offset in the reservation.
+const WATCHED: usize = 1 << (usize::BITS - 1);
+
+/// A [`WATCHED_FROM`] block, zeroed by the system.
+fn alloc_watched(layout: Layout) -> *mut c_void {
+    // (A reservation is 64 KiB aligned: room to move up to more.)
+    let Some(bytes) = layout.size().checked_add(layout.align().saturating_sub(PAGE)) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: a fresh reservation; `layout` holds its alignment (at least
+    // the header) and then the user's bytes.
+    unsafe {
+        let base = VirtualAlloc(
+            std::ptr::null(),
+            bytes,
+            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+            PAGE_READWRITE,
+        )
+        .cast::<u8>();
+        if base.is_null() {
+            return base.cast();
+        }
+        victory_gpu::title_memory_new(base as usize, bytes);
+        let offset = (base as usize + layout.align()).next_multiple_of(layout.align()) - base as usize;
+        let user = base.add(offset);
+        user.sub(HEADER).cast::<[usize; 2]>().write([layout.size(), offset | WATCHED]);
+        user.cast()
+    }
+}
+
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
@@ -323,6 +366,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if align & WATCHED != 0 {
+            VirtualFree(user.sub(align & !WATCHED).cast(), 0, MEM_RELEASE);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -1129,6 +1176,39 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+    }
+
+    #[test]
+    fn big_blocks_are_watched_zeroed_aligned_and_given_back() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_FREE, VirtualQuery};
+        for (field, align) in [(0, 16), (0xc, 4096), (0x10, 64 * 1024), (0x15, 2 * MIB)] {
+            let attributes = field << ALIGNMENT_SHIFT | 1 << 29;
+            for size in [WATCHED_FROM - 1, WATCHED_FROM, 3 * MIB + 7] {
+                let p = XMemAllocDefault(size, attributes);
+                assert!(!p.is_null());
+                assert_eq!(p as usize % align, 0, "field {field:#x}");
+                // SAFETY: `size` bytes were allocated.
+                let bytes = unsafe { std::slice::from_raw_parts_mut(p.cast::<u8>(), size) };
+                let watched = size + align >= WATCHED_FROM;
+                if watched {
+                    assert!(bytes.iter().all(|&b| b == 0));
+                    let (mut pages, mut count, mut granularity) = ([std::ptr::null_mut(); 8], 8, 0);
+                    // SAFETY: room for `count` answers.
+                    let failed = unsafe { GetWriteWatch(0, p, size.min(4096), pages.as_mut_ptr(), &mut count, &mut granularity) };
+                    assert_eq!(failed, 0, "a block of {size} bytes is write-watched");
+                }
+                bytes[0] = 1;
+                bytes[size - 1] = 2;
+                XMemFreeDefault(p, attributes);
+                if watched {
+                    // SAFETY: plain data filled in by the query.
+                    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                    // SAFETY: a valid out pointer of the right size.
+                    unsafe { VirtualQuery(p, &mut info, size_of_val(&info)) };
+                    assert_eq!(info.State, MEM_FREE);
+                }
+            }
+        }
     }
 
     #[test]

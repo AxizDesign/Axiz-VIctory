@@ -925,6 +925,9 @@ pub(crate) struct Memory {
     /// Set when the memory came from the title's allocator, with these
     /// allocation attributes (it goes back there).
     attributes: Option<u64>,
+    /// Set when it is a write-watched reservation of its own
+    /// ([`Memory::new`]): where that starts.
+    reserved: Option<NonNull<u8>>,
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
@@ -988,6 +991,7 @@ impl Memory {
             ptr,
             layout,
             attributes: Some(attributes),
+            reserved: None,
         })
     }
 
@@ -1007,8 +1011,26 @@ impl Memory {
             .filter(|&(size, _)| size > 0)
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
-        // SAFETY: the size is non-zero.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        // A write-watched reservation from 64 KiB on: host copies of buffers
+        // in it take the pages the title wrote. Memory of the process heap
+        // cannot be watched and was copied whole by every submission that
+        // reads it (after fxceless/victory-fork #651).
+        let reserved = if layout.size() as u64 >= KIB_64 {
+            Some(Memory::reserve(layout)?)
+        } else {
+            None
+        };
+        let ptr = match reserved {
+            // (A reservation is 64 KiB aligned; `reserve` left room to move
+            // up to more.)
+            Some(base) => {
+                let to = (base.as_ptr() as usize).next_multiple_of(layout.align()) - base.as_ptr() as usize;
+                // SAFETY: inside the reservation.
+                unsafe { base.add(to) }
+            }
+            // SAFETY: the size is non-zero.
+            None => NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?,
+        };
         // The big ones are named in the log: the memory line counts our own
         // allocations by size, and these are the title's memory given out
         // of ours (a heap it made through the device, a descriptor heap).
@@ -1019,12 +1041,42 @@ impl Memory {
             ptr,
             layout,
             attributes: None,
+            reserved,
         })
+    }
+
+    /// Zeroed, write-watched memory with room for `layout` wherever in it
+    /// the first address of its alignment lies.
+    fn reserve(layout: Layout) -> Result<NonNull<u8>, HRESULT> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let bytes = layout
+            .size()
+            .checked_add(layout.align().saturating_sub(KIB_64 as usize))
+            .ok_or(E_OUTOFMEMORY)?;
+        // SAFETY: a fresh reservation.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                bytes,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        let base = NonNull::new(base.cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
+        crate::watch::title_memory_new(base.as_ptr() as usize, bytes);
+        Ok(base)
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        if let Some(base) = self.reserved {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            // SAFETY: the reservation [`Memory::reserve`] made.
+            unsafe { VirtualFree(base.as_ptr().cast(), 0, MEM_RELEASE) };
+            return;
+        }
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.
