@@ -404,8 +404,8 @@ pub(crate) fn writes_into(
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     written.clear();
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
+    let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *journal;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         written.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
@@ -445,7 +445,7 @@ pub(crate) fn writes_into(
         failed as u64,
     );
     #[cfg(feature = "diagnostics")]
-    if failed && !known_view && guarded {
+    if failed && !view && guarded {
         failed_asking(first * PAGE, last * PAGE);
     }
     let guarded = if failed {
@@ -458,6 +458,12 @@ pub(crate) fn writes_into(
         let pages = guard(first * PAGE, last * PAGE, view);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+        if view && pages.is_none() {
+            // A hole it was, and private memory now ([`guard`] has forgotten
+            // it): asked about as any other memory.
+            drop(journal);
+            return writes_into(start, end, guarded, written);
+        }
         pages?
     } else {
         Vec::new()
@@ -499,7 +505,7 @@ fn failed_asking(start: usize, end: usize) {
     let (protected, clean, absent, viewed, aliased) = {
         let g = guards();
         let b = start / BLOCK;
-        (g.protected.contains(&b), g.clean.contains(&b), g.absent.contains(&b), g.viewed.contains(&b), g.aliased.contains(&b))
+        (g.protected.contains(&b), g.clean.contains(b), g.absent.contains(b), g.viewed.contains(&b), g.aliased.contains(&b))
     };
     tracing::info!(
         "a failed write-watch asking (one in 2048): {start:#x}+{:#x}; Windows says (answered {n}): base {:#x} region {:#x} state {:#x} type {:#x} protect {:#x} allocation protect {:#x}; \
@@ -556,8 +562,10 @@ const BLOCK: usize = PAGE;
 
 /// Whether the block holding `start` is view memory the guards already
 /// hold (read-only by our hand, or noted absent): asking the kernel's write
-/// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
-/// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
+/// watch about it can only fail. (A block noted absent where the title made
+/// private memory since is found out by [`guard`], which forgets it then.)
+/// `VICTORY_VIEW_ASK=1` (or `VICTORY_GUARD_ASK=1`) asks the kernel anyway,
+/// as before.
 fn known_view(start: usize) -> bool {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ask = *ASK.get_or_init(|| {
@@ -806,7 +814,19 @@ fn guard(start: usize, end: usize, known: bool) -> Option<Vec<usize>> {
             }
             open = block >= uncommitted_until;
             if open {
-                g.absent.remove(block);
+                // Private memory now is never guarded. (From PR 907's fix in
+                // myokex/victory-amd; asked only where a hole ended.)
+                if is_view(block * BLOCK, (block + 1) * BLOCK) {
+                    g.absent.remove(block);
+                } else if block == first {
+                    g.absent.remove(block);
+                    return None;
+                } else {
+                    // It stays noted, so that the next asking finds it out
+                    // again, and counts as written, since nothing watches it.
+                    written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                    open = false;
+                }
                 if holes_level() == 2 {
                     untold(block);
                 }
@@ -1514,6 +1534,61 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
+// A copy whose stores may fault: rcx to, rdx from, r8 bytes; eax 1 when all
+// of them are there, 0 where a page could not be written (the bytes before
+// it may be). No stack and no registers to keep, so that the handler of
+// [`install`] can send a thread that faults inside to the failing end
+// ([`store_checked`]).
+core::arch::global_asm!(
+    ".globl victory_store_checked",
+    ".globl victory_store_checked_failed",
+    "victory_store_checked:",
+    "cmp r8, 8",
+    "jb 3f",
+    "2:",
+    "mov rax, qword ptr [rdx]",
+    "mov qword ptr [rcx], rax",
+    "add rdx, 8",
+    "add rcx, 8",
+    "sub r8, 8",
+    "cmp r8, 8",
+    "jae 2b",
+    "3:",
+    "test r8, r8",
+    "jz 5f",
+    "4:",
+    "mov al, byte ptr [rdx]",
+    "mov byte ptr [rcx], al",
+    "inc rdx",
+    "inc rcx",
+    "dec r8",
+    "jnz 4b",
+    "5:",
+    "mov eax, 1",
+    "ret",
+    "victory_store_checked_failed:",
+    "xor eax, eax",
+    "ret",
+);
+
+unsafe extern "system" {
+    fn victory_store_checked(to: *mut u8, from: *const u8, len: usize) -> u32;
+    fn victory_store_checked_failed();
+}
+
+/// Stores `len` bytes from `from` (memory of ours) at title address `to`
+/// in user mode, as the title itself would: a block guarded again meanwhile
+/// is opened by our handler. False where a page is not there or not
+/// writable, as the kernel's write says; the bytes before it may be stored
+/// by then. No lock of this file may be held.
+pub(crate) fn store_checked(to: *mut u8, from: *const u8, len: usize) -> bool {
+    install();
+    // SAFETY: the source is ours and holds `len` bytes; a fault on the
+    // destination ends in `victory_store_checked_failed` by the handler
+    // just installed.
+    unsafe { victory_store_checked(to, from, len) != 0 }
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -1544,10 +1619,20 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // Our own store into title memory that is not there (any more).
+        // SAFETY: the system passes the faulting thread's registers.
+        let context = unsafe { &mut *(*info).ContextRecord };
+        let (first, failed) = (
+            victory_store_checked as *const () as u64,
+            victory_store_checked_failed as *const () as u64,
+        );
+        if (first..failed).contains(&context.Rip) {
+            context.Rip = failed;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        EXCEPTION_CONTINUE_SEARCH
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
@@ -1616,6 +1701,82 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Our own stores: they land, and one that reaches memory not there
+    /// says so instead of ending the process.
+    #[test]
+    fn checked_stores_land_and_fail_where_the_kernels_do() {
+        // SAFETY: three pages reserved, two committed, freed at the end.
+        let p = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 3 * KERNEL_PAGE, MEM_RESERVE, PAGE_READWRITE);
+            VirtualAlloc(p, 2 * KERNEL_PAGE, MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let from: Vec<u8> = (0..=255).collect();
+        for len in 0..40 {
+            for off in 0..9 {
+                let at = p + 100 + off;
+                // SAFETY: committed pages of ours.
+                unsafe { (p as *mut u8).write_bytes(7, 300) };
+                assert!(store_checked(at as *mut u8, from.as_ptr(), len));
+                // SAFETY: as above.
+                let now = unsafe { std::slice::from_raw_parts(p as *const u8, 300) };
+                assert_eq!(&now[100 + off..100 + off + len], &from[..len]);
+                assert!(now[..100 + off].iter().chain(&now[100 + off + len..]).all(|&b| b == 7));
+            }
+        }
+        // At the end of the committed pages, over it, and past it.
+        let end = p + 2 * KERNEL_PAGE;
+        assert!(store_checked((end - 16) as *mut u8, from.as_ptr(), 16));
+        assert!(!store_checked((end - 16) as *mut u8, from.as_ptr(), 17));
+        assert!(!store_checked(end as *mut u8, from.as_ptr(), 1));
+        assert!(!store_checked((end + 5) as *mut u8, from.as_ptr(), 64));
+        // Read-only memory that is not a guard of ours.
+        let mut old = 0;
+        // SAFETY: a committed page of ours.
+        unsafe {
+            use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+            VirtualProtect(p as *const _, KERNEL_PAGE, PAGE_READONLY, &mut old);
+        }
+        assert!(!store_checked((p + 8) as *mut u8, from.as_ptr(), 8));
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A checked store into a guarded view block opens it, and the block
+    /// counts as written.
+    #[test]
+    fn checked_stores_open_guards() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        assert!(store_checked((view + 100) as *mut u8, b"shaders".as_ptr(), 7));
+        // SAFETY: the bytes just stored.
+        let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 7) };
+        assert_eq!(landed, b"shaders");
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some((view / PAGE..view / PAGE + 1).collect())
+        );
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        title_memory_remapped(view, 2 * BLOCK);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
@@ -2085,6 +2246,122 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// An uncommitted address noted in `g.absent` that is later allocated as
+    /// `MEM_WRITE_WATCH` or ordinary `MEM_PRIVATE` memory must not be hijacked
+    /// into `PAGE_READONLY` guarded memory.
+    #[test]
+    fn absent_block_reallocated_as_private_memory_is_not_guarded() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        // 1. Reserve an uncommitted 64 KiB block and observe it via `writes`,
+        //    which records the block in `g.absent`.
+        let reserved = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!reserved.is_null());
+        let addr = reserved as usize;
+        assert!(writes(addr, addr + PAGE, true).is_some());
+        assert!(guards().absent.contains(addr / BLOCK));
+        assert_ne!(unsafe { VirtualFree(reserved, 0, MEM_RELEASE) }, 0);
+
+        // 2. Reallocate the exact same virtual address as MEM_WRITE_WATCH private memory.
+        let watched = unsafe {
+            VirtualAlloc(
+                reserved,
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert_eq!(watched, reserved);
+        assert!(writes(addr, addr + PAGE, true).is_some());
+        assert!(
+            writable(addr),
+            "MEM_WRITE_WATCH private memory at a formerly absent address must remain writable"
+        );
+        assert!(!guards().protected.contains(&(addr / BLOCK)));
+        assert_ne!(unsafe { VirtualFree(watched, 0, MEM_RELEASE) }, 0);
+
+        // 3. Re-mark `addr` absent while free, then commit ordinary MEM_PRIVATE memory there.
+        let reserved2 = unsafe { VirtualAlloc(reserved, PAGE, MEM_RESERVE, PAGE_NOACCESS) };
+        assert_eq!(reserved2, reserved);
+        assert!(writes(addr, addr + PAGE, true).is_some());
+        assert!(guards().absent.contains(addr / BLOCK));
+        assert_ne!(unsafe { VirtualFree(reserved2, 0, MEM_RELEASE) }, 0);
+
+        let plain = unsafe { VirtualAlloc(reserved, PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(plain, reserved);
+        assert!(
+            writes(addr, addr + PAGE, true).is_none(),
+            "ordinary MEM_PRIVATE memory at a formerly absent address must not be treated as a view"
+        );
+        assert!(writable(addr));
+        assert!(!guards().protected.contains(&(addr / BLOCK)));
+        // (Left allocated: what was noted as written there would be told to
+        // the next test that gets the address.)
+        // Clean up the test's absent entry.
+        guards().absent.remove(addr / BLOCK);
+    }
+
+    /// The same behind a view: a block of a range that starts with a view
+    /// turns into private memory. It stays writable however often the range
+    /// is asked about, and counts as written each time (nothing watches it).
+    #[test]
+    fn private_memory_behind_a_view_is_never_guarded() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+            MapViewOfFileEx, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: memory of this test alone: a view of one block and a
+        // reservation right behind it, where a larger one was just released.
+        unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            // Another test's thread may take the released addresses first.
+            let mut found = None;
+            for _ in 0..64 {
+                let both = VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE, PAGE_NOACCESS);
+                assert!(!both.is_null());
+                assert_ne!(VirtualFree(both, 0, MEM_RELEASE), 0);
+                let view = MapViewOfFileEx(section, FILE_MAP_WRITE, 0, 0, BLOCK, both).Value;
+                let behind = both as usize + BLOCK;
+                let reserved = VirtualAlloc(behind as *const _, BLOCK, MEM_RESERVE, PAGE_NOACCESS);
+                if view == both && reserved as usize == behind {
+                    found = Some((both as usize, behind, reserved));
+                    break;
+                }
+            }
+            let (start, behind, reserved) = found.expect("a view with a reservation behind it");
+            assert!(writes(start, start + 2 * BLOCK, true).is_some());
+            assert!(guards().absent.contains(behind / BLOCK));
+            let plain = VirtualAlloc(reserved, BLOCK, MEM_COMMIT, PAGE_READWRITE);
+            assert_eq!(plain, reserved);
+            for round in 0..3 {
+                let (_, written) = writes(start, start + 2 * BLOCK, true).unwrap();
+                assert!(writable(behind), "round {round}: private memory was made read-only");
+                assert!(!guards().protected.contains(&(behind / BLOCK)), "round {round}");
+                assert!(
+                    written.iter().any(|&(page, _)| page * PAGE == behind),
+                    "round {round}: what nothing watches counts as written"
+                );
+            }
+            // The two blocks stay taken: what was noted as written there
+            // would be told to the next test that gets these addresses.
+            guards().absent.remove(behind / BLOCK);
+            CloseHandle(section);
+        }
     }
 }
 

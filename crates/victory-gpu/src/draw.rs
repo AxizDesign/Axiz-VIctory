@@ -134,6 +134,8 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// Where in `scratch` the window's first record lies.
+    scratch_at: u64,
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -2175,7 +2177,9 @@ impl State {
             let mut partly = None;
             if let Some((View::Placed(false, resource, desc), _)) = &record {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let len = crate::resource::placed_bytes(resource).unwrap_or(1);
+                // Of the mips the view shows: what lies behind them is
+                // another texture's.
+                let len = crate::resource::placed_bytes_from(resource, crate::resource::first_mip(desc)).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
@@ -2271,6 +2275,9 @@ impl State {
             // through a table: they upload it, and check it at every
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
+            if tabled {
+                crate::texture::upload_again(resource);
+            }
             if let Some(view) = &view {
                 match &mut into {
                     Into::List(list) => readable(list, sampled.kind, view),
@@ -2911,6 +2918,8 @@ impl State {
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
+            } else {
+                host.buffer_slot_tabled(index);
             }
         }
     }
@@ -3092,6 +3101,9 @@ impl State {
                             list.defer_fill(to, address as *const u8, size as usize);
                             host.constant_at(index, gpu, size);
                         }
+                        if let Some(title) = title_first {
+                            host.buffer_slot_tabled(title + k);
+                        }
                     }
                     Some(view) => {
                         host.make_at(index, &view);
@@ -3106,12 +3118,14 @@ impl State {
                         // (its texture is up to date now), and made in
                         // place as the texture pass would have made it,
                         // for a shader that picks it by index all the same.
-                        if let Some(title) = title_first
-                            && crate::descriptor::host::is_texture_view(&view)
-                        {
-                            host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() {
-                                host.mirror(title + k, table + u64::from(k) * 32, true);
+                        if let Some(title) = title_first {
+                            if crate::descriptor::host::is_texture_view(&view) {
+                                host.texture_slot_tabled(title + k, kind.is_some());
+                                if kind.is_some() {
+                                    host.mirror(title + k, table + u64::from(k) * 32, true);
+                                }
+                            } else {
+                                host.buffer_slot_tabled(title + k);
                             }
                         }
                     }
@@ -3511,7 +3525,7 @@ impl State {
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+            .map(|w| (w.scratch.clone(), w.scratch_at + (offset - w.base), w.step));
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
         let gathered = if hit.is_none() && windowed && gathers() {
@@ -3533,6 +3547,7 @@ impl State {
                         (kind, step),
                         &scratch,
                         at,
+                        crate::indirect::ring(),
                     )
                 {
                     self.host_pipeline = 0;
@@ -3554,7 +3569,7 @@ impl State {
                 args.refresh(list, arguments, len);
                 // Diagnostics of windows, for gathered records too: the
                 // record clamped again here and compared.
-                if crate::indirect::window_check() && crate::indirect::check_hit(list, (&args.buffer, offset), (kind, stride), &scratch, at) {
+                if crate::indirect::window_check() && crate::indirect::check_hit(list, (&args.buffer, offset), (kind, stride), &scratch, at, false) {
                     self.host_pipeline = 0;
                     self.host_roots[1] = 0;
                 }
@@ -3606,24 +3621,51 @@ impl State {
                     None => (step, records),
                 };
                 self.window_read = false;
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                let span = len.max(u64::from(step) * u64::from(records));
+                args.refresh(list, arguments, span);
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
+                // Whether a shader recorded before in the list may write the
+                // records: if none may, the card holds them as they are when
+                // the list begins, and they are clamped in its prelude
+                // (`crate::indirect::early`): nothing of ours goes into the
+                // list. Taken as written where shaders write undeclared:
+                // title memory in place (`VICTORY_INPLACE`).
+                let ring = crate::indirect::ring();
+                let written = ring
+                    && (args.in_place()
+                        || list.writes_declared((arguments as usize, (arguments + span) as usize)));
+                let early = crate::indirect::early() && counter.is_none() && !written && parts.is_none();
+                #[cfg(feature = "diagnostics")]
+                if ring {
+                    crate::copystat::add(
+                        match (kind == DISPATCH, written) {
+                            (false, false) => crate::copystat::C::ClampFromBefore,
+                            (false, true) => crate::copystat::C::ClampWrittenInList,
+                            (true, false) => crate::copystat::C::ClampDispatchFromBefore,
+                            (true, true) => crate::copystat::C::ClampDispatchWrittenInList,
+                        },
+                        1,
+                    );
+                }
                 // Bounded first: the clamp binds a compute pipeline of its
-                // own and copies clamped active records into a scratch
-                // buffer at offset 0.
+                // own and copies clamped active records into room of the
+                // list's ring, or its scratch buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
+                let ahead = windowed && records > 1;
                 let bounded = if parts.is_some() {
-                    crate::indirect::bound_split(list, (&args.buffer, offset))
-                } else if windowed && records > 1 {
+                    crate::indirect::bound_split(list, (&args.buffer, offset)).map(|scratch| (scratch, 0))
+                } else if early {
+                    crate::indirect::bound_early(list, (&args.buffer, offset), (kind, step, records), ahead)
+                } else if ahead {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
-                let Some(bounded) = bounded else {
+                let Some((bounded, bounded_at)) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
@@ -3653,8 +3695,12 @@ impl State {
                         }
                     }
                 }
-                self.host_pipeline = 0;
-                self.host_roots[1] = 0;
+                // A clamp in the list bound its own pipeline and compute
+                // root signature.
+                if !early {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,
@@ -3663,8 +3709,9 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    scratch_at: bounded_at,
                 });
-                (bounded, 0)
+                (bounded, bounded_at)
             }
         };
         #[cfg(feature = "diagnostics")]
@@ -3844,7 +3891,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                // Of a texture the title placed, the mips the view shows.
+                let first = match (&placed, view) {
+                    (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
+                    _ => 0,
+                };
+                crate::texture::upload_from(list, *resource as This, t, first);
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);

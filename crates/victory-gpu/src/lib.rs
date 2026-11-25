@@ -56,9 +56,13 @@ pub mod pipeline;
 mod plaincopy;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod ranges;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;
+#[cfg(windows)]
+mod present_trace;
 pub mod queue;
 #[cfg(windows)]
 mod queue2;

@@ -38,6 +38,54 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// When a worker began it ([`slow`]).
     begun: OnceLock<Instant>,
+    /// Why it is not made, if it is not ([`left_out`]).
+    left_out: Option<&'static str>,
+}
+
+/// Why a pipeline with these shaders is not made, if it is not: what
+/// `VICTORY_RT_RESOLVE=0` and `VICTORY_ACTIVATE_RAYS=0` leave out (both made
+/// by default).
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if without_structures(shaders) {
+        Some("shades ray-tracing hits, left out (VICTORY_RT_RESOLVE=0)")
+    } else if too_dear(shaders) {
+        Some("too dear to compile, left out (VICTORY_ACTIVATE_RAYS=0)")
+    } else {
+        None
+    }
+}
+
+/// Whether some compute shader of `shaders` holds `name`.
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+/// Whether a shader is left out for what it costs the host's driver:
+/// `CS_ScreenProbes_ActivateRays` (39f0e9aeb156a61c, 66,501 instructions,
+/// 9,948 branches). As translated before the clean-up passes
+/// (`emit::shader_opt`), AMD's took a core and 0.8 GB more every 10 s for it
+/// and did not finish (RX 7800 XT: 47 GB after 8 minutes); cleaned up, it
+/// takes 85 s and 1.3 GB, once. `VICTORY_ACTIVATE_RAYS=0` leaves it out.
+fn too_dear(shaders: &[Arc<Shader>]) -> bool {
+    static OUT: OnceLock<bool> = OnceLock::new();
+    let out = *OUT.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
+    out && named(shaders, b"CS_ScreenProbes_ActivateRays")
+}
+
+/// Whether a shader only shades what the console's ray-tracing structures
+/// were hit by: about 1,000 compute programs, all bound at the world's first
+/// frame, each 5 to 9 s of AMD's compiler. They stand in the queue before the
+/// passes that make the picture, and with the structure builder off there is
+/// no hit to shade. `VICTORY_RT_RESOLVE=0` leaves them out, unless the
+/// builder is on (off here by default; the fork this is from,
+/// myokex/victory-amd, leaves them out unless told otherwise).
+fn without_structures(shaders: &[Arc<Shader>]) -> bool {
+    static OUT: OnceLock<bool> = OnceLock::new();
+    let is = |name, value| std::env::var_os(name).is_some_and(|v| v == value);
+    let out = *OUT.get_or_init(|| is("VICTORY_RT_RESOLVE", "0") && !is("VICTORY_BVH_BUILDER", "1"));
+    out && named(shaders, b"CS_RaytracingResolve")
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -54,9 +102,11 @@ impl Pending {
 
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let key = key(&shaders, graphics.as_deref());
+        let left_out = left_out(&shaders);
         Pending {
             shaders,
             graphics,
+            left_out,
             queue_state: AtomicU8::new(NOT_QUEUED),
             asked: AtomicU64::new(0),
             made: OnceLock::new(),
@@ -107,7 +157,10 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(p.left_out.map_or_else(
+            || format!("being made {:?}", p.shaders),
+            str::to_owned,
+        )),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -184,6 +237,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -199,7 +255,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 
 /// Starts `p` on the workers, before anything asks for it.
 pub(crate) fn begin(p: &Arc<Pending>) {
-    start(p, REQUESTED);
+    if p.left_out.is_none() {
+        start(p, REQUESTED);
+    }
 }
 
 /// Why each of `pipelines` that is made and is none the host has is not
@@ -227,6 +285,9 @@ pub(crate) fn failures(pipelines: &[Arc<Pending>]) -> Vec<String> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -234,7 +295,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }

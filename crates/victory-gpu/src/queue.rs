@@ -1364,6 +1364,7 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
+        crate::capture::light_present(frame);
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
         }
@@ -1394,6 +1395,15 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
             let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
             (r, t, was)
         });
+        if crate::present_trace::on() {
+            // SAFETY: the plane lists `count` resources.
+            let all = unsafe { std::slice::from_raw_parts(plane.resources, plane.count as usize) };
+            crate::present_trace::title(format!(
+                "planes {planes} token {} resources {all:?} state {state:#x} tables refused {}",
+                plane.token,
+                crate::descriptor::host::REFUSED.load(Ordering::Relaxed)
+            ));
+        }
         let shown = host.present(texture, state, frame, over.map(|(_, t, was)| (t, was)));
         if let Some((r, _, was)) = over {
             crate::resource::host_transition(r, was);
