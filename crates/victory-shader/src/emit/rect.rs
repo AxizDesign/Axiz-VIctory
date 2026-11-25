@@ -430,6 +430,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn rectangles_are_drawn_whole() {
+        let _one = crate::emit::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use super::super::host::{Draw, Host};
         let Ok(host) = Host::new(false) else {
             eprintln!("no SM 6.6 device; skipped");

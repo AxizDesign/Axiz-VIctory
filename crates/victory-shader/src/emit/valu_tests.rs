@@ -1806,6 +1806,7 @@ const fn mtbuf(op: u8, format: u8, vdata: u8, vaddr: u8, srsrc: u8, offset: u16)
 
 #[test]
 fn tbuffer_load_format_d16_packs_float_and_int_channels() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // MTBUF opcodes: tbuffer_load_format_d16_xyz = 0x0a, tbuffer_load_format_d16_xyzw = 0x0b.
     // Input raw SRV at table offset 0 dwords (heap index 0); output raw UAV at 8 dwords (index 1).
     let cases: &[(u8, u8, &[u32], [u32; 2], &str)] = &[
@@ -2008,6 +2009,7 @@ const fn mubuf_load_offen(op: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
 
 #[test]
 fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // CBV contents (64 bytes = 16 dwords, 16-byte rows):
     //   dword 0 (bytes 0..4):   [0x05, 0xFE, 0x7F, 0x81]
     //   dword 1 (bytes 4..8):   [0x01, 0x80, 0xAB, 0xCD]
