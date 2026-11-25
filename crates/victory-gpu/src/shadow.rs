@@ -139,20 +139,82 @@ pub(crate) fn cards() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+/// What goes to the card's memory by itself, for a card whose budget (the
+/// part of its memory the system gives us) is `budget` bytes: the smallest
+/// title buffer whose copy does, the most bytes of such copies, and the most
+/// bytes of windows outside buffers.
+///
+/// Shaders read the card's memory at some 590 GiB/s and the PC's over the
+/// bus at 12.5 (RTX 5070, PCIe 4.0 x8): on a frame of our own
+/// (`frame_bench`) whose shaders read 800 MB of windows, 99 ms with the
+/// windows in the PC's memory and 7 with them on the card. The limits were
+/// 16 MiB, 512 MiB and no windows for every card.
+///
+/// The textures keep their room: whatever the limits, a copy goes to the
+/// card only while a fifth of the budget is free (`card_for`).
+fn card_shares(budget: Option<u64>) -> (u64, u64, u64) {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    match budget {
+        Some(b) if b >= 10 * GIB => (MIB, b / 8, b / 4),
+        Some(b) if b >= 7 * GIB => (MIB, b / 8, b / 8),
+        Some(b) if b >= 5 * GIB => (4 * MIB, 512 * MIB, 256 * MIB),
+        _ => (16 * MIB, 512 * MIB, 0),
+    }
+}
+
+/// [`card_shares`] of the host's card, with what the switches say instead:
+/// `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` and
+/// `VICTORY_CARD_WINDOWS_MB`.
+fn card_shares_set() -> (u64, u64, u64) {
+    static SHARES: std::sync::OnceLock<(u64, u64, u64)> = std::sync::OnceLock::new();
+    *SHARES.get_or_init(|| {
+        let mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|v| v << 20);
+        let budget = host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let (least, buffers, windows) = card_shares(budget);
+        let shares = (
+            mb("VICTORY_CARD_BUFFERS_MIN_MB").unwrap_or(least).max(1 << 20),
+            mb("VICTORY_CARD_BUFFERS_MB").unwrap_or(buffers),
+            mb("VICTORY_CARD_WINDOWS_MB").unwrap_or(windows),
+        );
+        tracing::info!(
+            budget_mb = budget.map(|b| b >> 20),
+            buffers_from_mb = shares.0 >> 20,
+            buffers_mb = shares.1 >> 20,
+            windows_mb = shares.2 >> 20,
+            "copies of title memory in the card's memory"
+        );
+        shares
+    })
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
-/// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// shaders write takes its size twice), both in bytes ([`card_shares_set`]).
 fn card_limits() -> (u64, u64) {
-    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-    *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
-        };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
-    })
+    let (least, most, _) = card_shares_set();
+    (least, most)
+}
+
+#[cfg(test)]
+mod shares_tests {
+    use super::card_shares;
+
+    #[test]
+    fn a_card_with_room_takes_what_shaders_read() {
+        const MIB: u64 = 1 << 20;
+        // An RTX 5070 (12 GB): its budget with a desktop running.
+        let (least, buffers, windows) = card_shares(Some(11_175 * MIB));
+        assert_eq!(least, MIB);
+        assert!((1300..1500).contains(&(buffers / MIB)) && (2700..2900).contains(&(windows / MIB)));
+        // The whole of it is never asked for, on any card.
+        for gib in 1..=32u64 {
+            let (_, buffers, windows) = card_shares(Some(gib << 30));
+            assert!(2 * buffers + windows <= (gib << 30) / 2 + (1 << 30), "{gib} GiB");
+        }
+        // No card to ask (WARP): as it was.
+        assert_eq!(card_shares(None), (16 * MIB, 512 * MIB, 0));
+    }
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -225,7 +287,8 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
-/// memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none).
+/// memory (`VICTORY_CARD_WINDOWS_MB`, 0 for none; by the card's size
+/// otherwise, [`card_shares`]).
 ///
 /// Windows are two thirds of the PC memory the card shares (run 104: 861
 /// windows, 3,552 MB of 5,400), and every draw that takes vertices, indices
@@ -243,10 +306,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
 fn window_card_most() -> u64 {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
-    })
+    card_shares_set().2
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).

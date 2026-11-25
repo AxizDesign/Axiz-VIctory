@@ -68,6 +68,13 @@ Independent host-copy refreshes are the exception: they use parallel workers
 automatically on systems with at least four logical CPUs. Each switch is
 described in a comment where it is read.
 
+How much of the title's memory is copied to the card follows the card's free
+memory (logged as "copies of title memory in the card's memory");
+`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` and
+`VICTORY_CARD_WINDOWS_MB` (0 for none) set it by hand, for a card whose
+textures run out of room. `cargo test -p victory-gpu --release --lib
+frame_bench -- --ignored --nocapture` times a frame of our own.
+
 ### Known problems
 
 - Everything in shadow is black (see above).
