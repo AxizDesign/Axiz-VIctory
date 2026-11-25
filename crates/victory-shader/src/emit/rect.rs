@@ -87,6 +87,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         };
         e.usage = (1 << e.cols) - 1;
     }
+    super::container::one_mode_per_register(&mut outputs, false);
     let mut s = Shader::new(false);
     s.geometry = Some(Geometry {
         max_vertices: VERTICES,
@@ -430,7 +431,6 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn rectangles_are_drawn_whole() {
-        let _one = crate::emit::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use super::super::host::{Draw, Host};
         let Ok(host) = Host::new(false) else {
             eprintln!("no SM 6.6 device; skipped");

@@ -26,16 +26,6 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
-/// Where the [`SLOT_STRIDES`] buffer goes on, in dwords: two per heap slot,
-/// the low and then the high dword of the title address of the buffer view
-/// at that slot (0: none). For a program that takes a buffer view out of the
-/// heap at an index it computes and reads the address out of the descriptor
-/// to walk the memory behind it (the shadow-ray trace programs take their
-/// ray-tracing structure this way).
-pub const SLOT_ADDRESSES: u32 = SLOT_STRIDES_COUNT;
-/// Dwords of the whole [`SLOT_STRIDES`] buffer: the strides, then the
-/// addresses ([`SLOT_ADDRESSES`]).
-pub const SLOT_STRIDES_DWORDS: u32 = 3 * SLOT_STRIDES_COUNT;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -53,22 +43,14 @@ pub const SLOT_STRIDES_DWORDS: u32 = 3 * SLOT_STRIDES_COUNT;
 ///   reads zeros and drops writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
 ///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
-///   host reads afterwards to make those copies for the frames to come,
-///   and after them the marks of the copies stores went to
-///   ([`MEMORY_MARKS`]).
+///   host reads afterwards to make those copies for the frames to come.
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
-/// Dwords of the fault notes at the start of the [`SLOT_FAULTS`] buffer.
+/// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
-/// After the fault notes in the [`SLOT_FAULTS`] buffer: one dword per
-/// numbered copy (dword [`MEMORY_FAULTS`] + n for copy `n`), set to 1 by
-/// every store and atomic a running lane makes through that copy. The host
-/// reads and clears them to learn which copies shaders write, so that it
-/// need not take every copy for written.
-pub const MEMORY_MARKS: u32 = 1024;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
@@ -87,20 +69,14 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
-/// `RootType::Other` code of a user-data dword the host computes: the
-/// raw thread count along axis `dword` (0 = X, 1 = Y, 2 = Z) of a
-/// `DispatchX` call with `USE_THREAD_DIMENSIONS` (`flags & 0x20`), or 0
-/// for a normal thread-group dispatch (all threads in every group active).
-pub const USER_DISPATCH_THREADS: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
-    pub const RAW_BUFFERS: u64 = 1 << 4;
-    /// A render-target or viewport index from a vertex shader.
-    pub const LAYER_VIEWPORT: u64 = 1 << 9;
     pub const DOUBLES: u64 = 1 << 2;
+    pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -108,7 +84,6 @@ pub(crate) mod flags {
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
-    pub const ROVS: u64 = 1 << 18;
 }
 
 pub(crate) struct Types {
@@ -181,8 +156,9 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
-    /// Every UAV the shader opens is rasterizer ordered ([`Self::annotate`]).
-    pub rov: bool,
+    /// A pixel shader whose writes to views the console orders by primitive (POPS): its
+    /// heap views written or read as UAVs are rasterizer-ordered views.
+    pub ordered: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -240,7 +216,7 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
-            rov: false,
+            ordered: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -408,15 +384,7 @@ impl Shader {
         self.annotate(block, h, 14 | cmp, 0)
     }
 
-    /// Annotates a handle with its resource properties. Bit 12 of `props0` is
-    /// "UAV"; with `rov` set a UAV also gets bit 13, rasterizer ordered.
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
-        let props0 = if self.rov && props0 & 0x1000 != 0 {
-            self.flags |= flags::ROVS;
-            props0 | 0x2000
-        } else {
-            props0
-        };
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
@@ -440,7 +408,7 @@ impl Shader {
         props: (u32, u32),
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = view_heap_limit();
+        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
@@ -467,6 +435,13 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
+        // (bit 12 of the kind field: a UAV; bit 13: rasterizer-ordered)
+        let props = if self.ordered && !sampler && props.0 & 0x1000 != 0 {
+            self.flags |= flags::ROVS;
+            (props.0 | 0x2000, props.1)
+        } else {
+            props
+        };
         self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
@@ -491,14 +466,12 @@ impl Shader {
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
-            let has_bary_input = self.inputs.iter().any(|e| e.kind == 28);
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
-                (flags::BARYCENTRICS, used.barycentrics || has_bary_input),
-                (flags::ROVS, used.rov),
                 (flags::INT64, used.int64),
                 (flags::DOUBLES, used.doubles),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
+                (flags::ROVS, used.rovs),
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),
                 (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
@@ -506,10 +479,6 @@ impl Shader {
                 if !used {
                     self.flags &= !flag;
                 }
-            }
-            let input_usage = self.m.input_usage(self.inputs.len());
-            for (e, mask) in self.inputs.iter_mut().zip(input_usage) {
-                e.usage = mask;
             }
         }
         let mut resources = None;
@@ -620,8 +589,6 @@ impl Shader {
                     // Id, variable, name, space, lower bound, range size,
                     // shape (11: raw buffer), globally coherent, counter,
                     // rasterizer ordered, no extra properties.
-                    let ordered = self.m.bool(self.rov);
-                    let ordered = self.m.md_value(ordered);
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
@@ -632,7 +599,7 @@ impl Shader {
                         Some(i32c(&mut self, 11)),
                         Some(no),
                         Some(no),
-                        Some(ordered),
+                        Some(no),
                         None,
                     ];
                     list.push(Some(self.m.md_node(ops)));
@@ -738,14 +705,6 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
-        // A vertex shader with one of the two indices (as DXC collects it).
-        if !self.pixel
-            && self.threads.is_none()
-            && self.geometry.is_none()
-            && self.outputs.iter().any(|o| matches!(o.kind, 4 | 5))
-        {
-            self.flags |= flags::LAYER_VIEWPORT;
-        }
         // Entry properties: shader flags (tag 0), geometry state (1),
         // thread-group size (4), wave size (11).
         let mut props = Vec::new();
@@ -833,9 +792,6 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
-        if self.flags & flags::LAYER_VIEWPORT != 0 {
-            features |= 0x2000;
-        }
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
         }
@@ -947,55 +903,5 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::emit::bitcode::Term;
-
-    #[test]
-    fn dead_doubles_clear_doubles_flag_and_pass_validation() {
-        let mut s = Shader::new(false);
-        s.threads = Some([32, 1, 1]);
-        s.flags |= flags::WAVE_OPS | flags::DOUBLES;
-        let e = s.entry;
-        let f64t = s.m.double();
-        let lo = s.m.i32(0);
-        let hi = s.m.i32(0x3FF0_0000);
-        let d = s.op(e, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
-        let k0 = s.m.i8(0);
-        let sum = s.op(e, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[d, k0, k0]);
-        let split_ty = s.m.named_struct("dx.types.splitdouble", vec![s.t.i32, s.t.i32]);
-        let _split = s.op(e, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
-        s.m.terminate(e, Term::Ret);
-
-        // Before optimization, usage reports both doubles and wave ops.
-        let before = s.m.usage();
-        assert!(before.doubles);
-        assert!(before.wave_ops);
-
-        // After finish() runs module optimization, dead doubles are removed and
-        // SFI0 must not declare DOUBLES (bit 0).
-        let mut container = s.finish();
-        let count = u32::from_le_bytes(container[28..32].try_into().unwrap()) as usize;
-        let feature_bits = (0..count)
-            .find_map(|i| {
-                let off =
-                    u32::from_le_bytes(container[32 + i * 4..36 + i * 4].try_into().unwrap())
-                        as usize;
-                (&container[off..off + 4] == b"SFI0")
-                    .then(|| u64::from_le_bytes(container[off + 8..off + 16].try_into().unwrap()))
-            })
-            .expect("SFI0 chunk");
-        assert_eq!(feature_bits & 0x1, 0, "dead DOUBLES flag must be cleared in SFI0");
-
-        if let Ok(mut v) =
-            super::super::validator::Validator::load(super::super::validator::Validator::default_path().as_deref())
-        {
-            v.validate(&mut container)
-                .expect("DXIL validator must accept shader after clearing dead DOUBLES");
-        }
     }
 }

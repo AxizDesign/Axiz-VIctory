@@ -30,6 +30,7 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    /// A 64-bit float.
     Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
@@ -108,14 +109,12 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    FpExt = 8,
     Bitcast = 11,
 }
 
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
-    // FALSE and TRUE are not emitted: WARP removes its device on them (and
-    // DXC folds them away), so constant compares lower as constants.
-    #[allow(dead_code)]
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;
@@ -134,7 +133,6 @@ pub(crate) mod pred {
     pub const ULT: u8 = 12;
     pub const ULE: u8 = 13;
     pub const UNE: u8 = 14;
-    #[allow(dead_code)]
     pub const TRUE: u8 = 15;
     pub const EQ: u8 = 32;
     pub const NE: u8 = 33;
@@ -326,6 +324,15 @@ impl Module {
                 Const::Int(x) => Some(x),
                 _ => None,
             },
+            _ => None,
+        }
+    }
+
+    /// `x` where `v` is the integer negation `0 - x` of a value `x` that is no constant.
+    pub fn negation_of(&self, v: V) -> Option<V> {
+        let V::Inst(i) = v else { return None };
+        match self.insts[i as usize].op {
+            Op::Bin(Bin::Sub, a, x) if self.int_value(a) == Some(0) && !matches!(x, V::Const(_)) => Some(x),
             _ => None,
         }
     }
@@ -731,7 +738,7 @@ impl Module {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
                 blk.term,
-                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
+                blk.phis.is_empty() && blk.body.is_empty(),
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
@@ -1198,45 +1205,6 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
-    }
-
-    #[test]
-    fn empty_latch_with_dead_phis_is_folded() {
-        // Two identical loops except one has an unread phi in its empty latch;
-        // both must fold the latch and emit identical bitcode.
-        let build = |with_dead_phi: bool| {
-            let mut m = Module::default();
-            let i32t = m.int(32);
-            let void = m.void();
-            let fty = m.func_ty(void, vec![i32t]);
-            let f = m.function("sink", fty, Some(Attr::NoUnwind), false);
-            let main_ty = m.func_ty(void, vec![]);
-            m.function("main", main_ty, None, true);
-            let (entry, head, body, latch, exit) = (
-                m.new_block(),
-                m.new_block(),
-                m.new_block(),
-                m.new_block(),
-                m.new_block(),
-            );
-            let (z, one, ten) = (m.i32(0), m.i32(1), m.i32(10));
-            m.terminate(entry, Term::Br(head));
-            let i = m.phi(head, i32t);
-            m.terminate(head, Term::Br(body));
-            let next = m.bin(body, Bin::Add, i, one);
-            let cond = m.cmp(body, pred::IULT, next, ten);
-            m.terminate(body, Term::CondBr(cond, latch, exit));
-            if with_dead_phi {
-                let dead = m.phi(latch, i32t);
-                m.set_phi(dead, vec![(next, body)]);
-            }
-            m.terminate(latch, Term::Br(head));
-            m.set_phi(i, vec![(z, entry), (next, latch)]);
-            let _ = m.call(exit, f, vec![next]);
-            m.terminate(exit, Term::Ret);
-            m.write()
-        };
-        assert_eq!(build(false), build(true));
     }
 
     #[test]

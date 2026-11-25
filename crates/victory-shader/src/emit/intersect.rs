@@ -244,13 +244,14 @@ impl<'a> Lower<'a> {
             let at = self.s.m.select(c, inside, at, outside);
             return (handle, at);
         }
-        self.memory(low, high, guard, false)
+        self.memory(low, high, guard)
     }
 
     /// `count` dwords of the node from its byte `base` + `offset` (`base`
     /// computed, `offset` fixed; none of the node's bytes past 127), read
     /// four at a time.
     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
+        let c = self.cur;
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         // The second half of a 128-byte node may lie in the next 64 KiB
         // page, which may be in another copy: its own look, made once.
@@ -267,10 +268,9 @@ impl<'a> Lower<'a> {
                     // Every lane in this block runs the instruction.
                     let (handle, byte) = self.bvh_memory(low, high, None);
                     let k64 = self.s.m.i32(64);
-                    (handle, self.s.m.bin(self.cur, Bin::Sub, byte, k64))
+                    (handle, self.s.m.bin(c, Bin::Sub, byte, k64))
                 }),
             };
-            let c = self.cur;
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
             }
@@ -330,23 +330,21 @@ impl<'a> Lower<'a> {
         let k16 = self.s.m.i32(16);
         let words = self.bvh_node_words(at, None, 16, 24);
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        let wide_end = self.cur;
-        self.s.m.terminate(wide_end, Term::Br(join));
+        self.s.m.terminate(wide_block, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
         let words = self.bvh_node_words(at, None, 16, 12);
-        let half_end = self.cur;
         let f32t = self.s.t.f32;
         let mut halves = Vec::with_capacity(24);
         for n in 0..24 {
             let mut h = words[n / 2];
             if n % 2 == 1 {
-                h = self.s.m.bin(half_end, Bin::LShr, h, k16);
+                h = self.s.m.bin(half_block, Bin::LShr, h, k16);
             }
             // The conversion reads the low 16 bits.
             halves.push(self.s.op(
-                half_end,
+                half_block,
                 "legacyF16ToF32",
                 Attr::ReadNone,
                 f32t,
@@ -354,14 +352,14 @@ impl<'a> Lower<'a> {
                 &[h],
             ));
         }
-        self.s.m.terminate(half_end, Term::Br(join));
+        self.s.m.terminate(half_block, Term::Br(join));
         self.cur = join;
         let mut coords = Vec::with_capacity(24);
         for n in 0..24 {
             let phi = self.s.m.phi(join, f32t);
             self.s
                 .m
-                .set_phi(phi, vec![(floats[n], wide_end), (halves[n], half_end)]);
+                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).
@@ -397,22 +395,14 @@ impl<'a> Lower<'a> {
             let leave = self.binary(36, far[0], far[1]);
             let leave = self.binary(36, leave, far[2]);
             let from = self.binary(35, enter, fzero);
-            // Every axis must be ordered (`min <= max`): ordered compares reject
-            // both inverted/empty boxes (`min > max`) and any NaN in any of the
-            // six coordinates (which FMin/FMax would otherwise drop).
+            // Ordered compares: a NaN anywhere is a miss.
             let through = self.s.m.cmp(c, pred::OGE, leave, from);
             let before = self.s.m.cmp(c, pred::OLT, enter, ray.extent);
-            let ok_x = self.s.m.cmp(c, pred::OLE, bx[0], bx[3]);
-            let ok_y = self.s.m.cmp(c, pred::OLE, bx[1], bx[4]);
-            let ok_z = self.s.m.cmp(c, pred::OLE, bx[2], bx[5]);
-            let valid = self.s.m.bin(c, Bin::And, ok_x, ok_y);
-            let valid = self.s.m.bin(c, Bin::And, valid, ok_z);
+            let off = self.is_nan_f32(bx[0]);
+            let on = self.s.m.bool(true);
+            let on = self.s.m.bin(c, Bin::Xor, off, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
-            let hit = self.s.m.bin(c, Bin::And, hit, valid);
-            // A child that is not there is a miss, whatever bytes its box
-            // holds: it must not sort before a child that is.
-            let there = self.s.m.cmp(c, pred::IULT, children[n], none);
-            let hit = self.s.m.bin(c, Bin::And, hit, there);
+            let hit = self.s.m.bin(c, Bin::And, hit, on);
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }

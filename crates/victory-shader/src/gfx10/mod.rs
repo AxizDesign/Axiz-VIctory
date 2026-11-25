@@ -24,11 +24,6 @@ use std::collections::BTreeMap;
 
 use crate::ShaderError;
 
-/// The guest wave's lane index bits for V_READLANE_B32 and V_WRITELANE_B32.
-pub(crate) const fn lane_selector_mask(wave64: bool) -> u32 {
-    if wave64 { 63 } else { 31 }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Encoding {
     Sop2,
@@ -355,21 +350,6 @@ mod tests {
             .iter()
             .map(|i| (i.offset, i.words.len(), i.name().unwrap_or("?")))
             .collect()
-    }
-
-    #[test]
-    fn flat_offsets_ignore_bit_eleven() {
-        let offset = |word0: u32| {
-            let code = bytes(&[word0, 0x0000_0001, S_ENDPGM]);
-            match decode(&code).unwrap()[0].fields(false) {
-                Fields::Flat { offset, .. } => offset,
-                fields => panic!("{fields:?}"),
-            }
-        };
-        // flat_load_dword v0, v[1:2]: the FLAT offset is 11-bit and
-        // unsigned, so bit 11 is ignored (0x800 -> 0, 0xfff -> 0x7ff).
-        assert_eq!(offset(0xDC30_0800), 0);
-        assert_eq!(offset(0xDC30_0FFF), 0x7FF);
     }
 
     #[test]

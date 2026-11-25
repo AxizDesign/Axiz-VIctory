@@ -78,7 +78,7 @@ pub fn take(dxil: &[u8]) -> Option<Census> {
 /// Counts `m`, whose written form is `bitcode`, and keeps the result for
 /// [`take`].
 pub(crate) fn note(m: &Module, bitcode: &[u8]) {
-    if !enabled() && !cfg!(test) {
+    if !enabled() {
         return;
     }
     let c = m.census();

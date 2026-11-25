@@ -11,14 +11,6 @@
 //! lane that reaches it; what it cannot prove stays as the instruction's
 //! guard, a per-lane `if` around it.
 //!
-//! A pixel's discard (`s_andn2 live, live, exec`, then "no lane is left":
-//! the exit) is the exception: on the console a discarded lane whose quad
-//! has a live lane stays in EXEC (`s_wqm` of the live mask), a helper of
-//! the quad's derivatives, and no lane takes the exit while its wave has a
-//! live lane. Here it runs on as a live lane and is discarded at that point
-//! ([`Structured::discards`]): the host's `discard` keeps it as a helper
-//! (derivatives read it) and drops its outputs and stores.
-//!
 //! The control-flow graph keeps its shape and must be reducible (DXIL's
 //! only requirement). Helper lanes of a pixel shader count as live: on PC
 //! their side effects are dropped too, and what they compute is only read
@@ -109,9 +101,6 @@ const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
 /// Case splits [`Bools::meet`] makes before it gives up.
 const MAX_MEET: usize = 1 << 16;
-/// Cap the `ite` memo table so complex shaders cannot trigger multi-tens-of-MB
-/// HashMap resizes (e.g. 35 MB at 2^21 buckets) under concurrent compilation.
-const MAX_MEMO: usize = 1 << 18;
 /// Conditions [`Meets`] keeps; past that, they are searched anew.
 const MAX_MEETS: usize = 1 << 18;
 
@@ -151,42 +140,6 @@ impl Bools {
         let mut vars = self.vars(b);
         vars.sort_unstable();
         vars.into_iter().map(|v| self.atoms[v as usize]).collect()
-    }
-
-    /// Does every satisfying assignment of b require atom to be true?
-    /// Walk only the false branch of that atom; all other variables are
-    /// unconstrained. A true terminal is a counterexample. Stop
-    /// conservatively on a large diagram rather than prove an unsafe split.
-    pub(crate) fn requires_atom(&self, b: Bool, atom: Atom) -> bool {
-        let Some(&target) = self.ids.get(&atom) else {
-            return false;
-        };
-        if b == Bool::FALSE {
-            return false;
-        }
-        let mut stack = vec![b];
-        let mut seen = HashSet::new();
-        while let Some(b) = stack.pop() {
-            if b == Bool::TRUE {
-                return false;
-            }
-            if b == Bool::FALSE || !seen.insert(b) {
-                continue;
-            }
-            if seen.len() > MAX_MEET {
-                return false;
-            }
-            let (v, lo, hi) = self.nodes[b.0 as usize];
-            if v > target {
-                // Ordered diagram: the atom cannot occur below this node.
-                return false;
-            }
-            stack.push(lo);
-            if v != target {
-                stack.push(hi);
-            }
-        }
-        true
     }
 
     fn vars(&self, b: Bool) -> Vec<u32> {
@@ -241,9 +194,6 @@ impl Bools {
     }
 
     fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
-        if self.overflow {
-            return Bool::FALSE;
-        }
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -262,12 +212,7 @@ impl Bools {
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
         let r = self.mk(v, lo, hi);
-        if !self.overflow {
-            if self.memo.len() >= MAX_MEMO {
-                self.memo.clear();
-            }
-            self.memo.insert((f, g, h), r);
-        }
+        self.memo.insert((f, g, h), r);
         r
     }
 
@@ -387,20 +332,6 @@ impl Bools {
         found
     }
 
-    /// The value `atom` has in every lane meeting `facts` (as [`Bools::meet`]
-    /// takes them), if they decide it.
-    pub fn decides(&self, facts: &[(Bool, bool)], atom: Atom) -> Option<bool> {
-        let x = *self
-            .unique
-            .get(&(*self.ids.get(&atom)?, Bool::FALSE, Bool::TRUE))?;
-        let can = |value| self.meet(&[facts, &[(x, value)]].concat());
-        match (can(false), can(true)) {
-            (false, true) => Some(true),
-            (true, false) => Some(false),
-            _ => None,
-        }
-    }
-
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
@@ -409,9 +340,6 @@ impl Bools {
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
-        if self.overflow {
-            return Bool::FALSE;
-        }
         let (v, lo, hi) = self.nodes[b.0 as usize];
         if v == TERMINAL {
             return b;
@@ -515,9 +443,6 @@ pub struct Structured {
     /// SCC values a mask operation sets when some lane's bit of its result is set, with that
     /// lane bit: as data such an SCC is "some lane of the wave has it".
     pub scc_some: HashMap<Value, Bool>,
-    /// A pixel's discards, by block and instruction: the lanes (EXEC there)
-    /// the instruction takes out of the live mask, which here stay in it.
-    pub discards: HashMap<(usize, usize), Bool>,
 }
 
 impl Structured {
@@ -544,23 +469,8 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// run as two host waves, which exchange that decision and can then meet (a group barrier)
 /// inside the branch.
 pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Structured, ShaderError> {
-    structure_as(program, wide, true)
-}
-
-/// The per-lane form with a pixel's discarded lanes taken out of the live
-/// mask, as the console does: wrong for derivatives after a discard, but
-/// what a program needs whose discarded lanes would read values no
-/// surviving lane does (see [`Structured::discards`]).
-pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, &HashSet::new(), false)
-}
-
-fn structure_as(program: &Program, wide: &HashSet<usize>, helpers: bool) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
     l.wide = wide.clone();
-    if !helpers {
-        l.kills.clear();
-    }
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -627,9 +537,6 @@ struct Lanes<'a> {
     scc_every: HashSet<Value>,
     /// See [`Structured::wave_any`].
     wave_any: Vec<Option<bool>>,
-    /// A pixel's discards (see [`Structured::discards`]) by block and
-    /// instruction.
-    kills: HashSet<(usize, usize)>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -687,7 +594,7 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
-        let mut l = Lanes {
+        Ok(Lanes {
             p,
             order,
             index,
@@ -710,19 +617,7 @@ impl<'a> Lanes<'a> {
             wide: HashSet::new(),
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
-            kills: HashSet::new(),
-        };
-        for block in blocks {
-            if let Exit::Branch { taken, not_taken } = block.exit
-                && let Some(last) = block.insts.last()
-                && l.discards(last)
-                && (l.kill_exit(taken) || l.kill_exit(not_taken))
-                && let Some(def) = last.read(Reg::Scc).and_then(|v| l.defs.get(&v))
-            {
-                l.kills.insert(*def);
-            }
-        }
-        Ok(l)
+        })
     }
 
     fn reset(&mut self) {
@@ -783,44 +678,14 @@ impl<'a> Lanes<'a> {
                     now = Some(e);
                 }
                 self.step(inst, now);
-                if self.kills.contains(&(b, i))
-                    && let Fields::Sop {
-                        dst: Some(Operand::Scalar { code, .. }),
-                        ..
-                    } = inst.fields
-                    && let (Some(old), Some(new)) = (
-                        self.key(|r| inst.read(r), code),
-                        self.key(|r| inst.write(r), code),
-                    )
-                {
-                    let m = self.mask(old).0;
-                    self.masks.insert(new, m);
-                    if let Some(scc) = inst.write(Reg::Scc) {
-                        self.scc_lane.insert(scc, m);
-                    }
-                }
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
             }
-            if let Exit::Branch { taken, not_taken } = p.blocks[b].exit
+            if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                let mut w = self.branch(last);
-                // A discard's "no lane is left" exit: no lane takes it (the
-                // live mask keeps every lane, see `kills`).
-                if last
-                    .read(Reg::Scc)
-                    .and_then(|v| self.defs.get(&v))
-                    .is_some_and(|d| self.kills.contains(d))
-                {
-                    if self.kill_exit(taken) {
-                        w = Bool::FALSE;
-                    } else if self.kill_exit(not_taken) {
-                        w = Bool::TRUE;
-                    }
-                }
-                self.when[b] = Some(w);
+                self.when[b] = Some(self.branch(last));
                 self.wave_any[b] = self.wave_kind(last);
             }
         }
@@ -927,9 +792,6 @@ impl<'a> Lanes<'a> {
             .iter()
             .enumerate()
             .map(|(n, block)| {
-                // Reachability is fixed within the block. Vector instructions
-                // with the same EXEC therefore need the same guard.
-                let mut last_guard = None;
                 block
                     .insts
                     .iter()
@@ -939,16 +801,8 @@ impl<'a> Lanes<'a> {
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
                         }
-                        (&Some(e), _) => {
-                            if let Some((prev, guard)) = last_guard
-                                && prev == e
-                            {
-                                return guard;
-                            }
-                            let guard = (!b.implies(cond[n], e)).then(|| b.given(e, cond[n]));
-                            last_guard = Some((e, guard));
-                            guard
-                        }
+                        (&Some(e), _) if b.implies(cond[n], e) => None,
+                        (&Some(e), _) => Some(b.given(e, cond[n])),
                     })
                     .collect()
             })
@@ -1003,11 +857,6 @@ impl<'a> Lanes<'a> {
                 .map(|(&scc, &m)| (scc, m))
                 .collect(),
             phi_masks,
-            discards: self
-                .kills
-                .iter()
-                .filter_map(|&(b, i)| execs[b][i].map(|e| ((b, i), e)))
-                .collect(),
             bools: self.b,
             exits,
             guards,
@@ -1474,54 +1323,6 @@ impl<'a> Lanes<'a> {
         }
     }
 
-    /// Whether `inst` branches on the SCC of `s_andn2 X, X, exec`: whether
-    /// any lane is left in a pixel's live mask after a discard.
-    fn discards(&self, inst: &Inst) -> bool {
-        if !inst.name().starts_with("s_cbranch_scc") {
-            return false;
-        }
-        let Some(&(db, di)) = inst.read(Reg::Scc).and_then(|v| self.defs.get(&v)) else {
-            return false;
-        };
-        let def = &self.p.blocks[db].insts[di];
-        let Fields::Sop {
-            dst: Some(d), src, ..
-        } = &def.fields
-        else {
-            return false;
-        };
-        matches!(def.name(), "s_andn2_b32" | "s_andn2_b64")
-            && src.first() == Some(d)
-            && matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. }))
-    }
-
-    /// Whether a lane entering block `b` leaves the program doing nothing but
-    /// scalar work and a `done` export to `null` (a discard's exit).
-    fn kill_exit(&self, mut b: usize) -> bool {
-        for _ in 0..8 {
-            let block = &self.p.blocks[b];
-            let mut null_done = false;
-            for inst in &block.insts {
-                match inst.fields {
-                    Fields::Exp {
-                        target: 9,
-                        done: true,
-                        ..
-                    } => null_done = true,
-                    Fields::Sop { .. } | Fields::Sopp { .. } => {}
-                    _ => return false,
-                }
-            }
-            match block.exit {
-                Exit::End => return null_done,
-                Exit::Jump(next) if !null_done => b = next,
-                _ => return false,
-            }
-        }
-        false
-    }
-
-    /// The per-lane condition under which a block's closing branch is taken.
     fn branch(&mut self, inst: &Inst) -> Bool {
         let exec = self.exec(inst);
         match inst.name() {
@@ -1620,28 +1421,6 @@ fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), 
 mod tests {
     use super::*;
     use crate::ir;
-
-    #[test]
-    fn first_lane_predicate_must_be_required_not_merely_present() {
-        let mut b = Bools::new();
-        let first = Atom::Lane(Value(1));
-        let other = Atom::Lane(Value(2));
-        let f = b.atom(first, 0);
-        let o = b.atom(other, 0);
-        let both = b.and(f, o);
-        let either = b.or(f, o);
-        let inverse = b.not(f);
-        let inverse_and = b.and(inverse, o);
-        assert!(b.requires_atom(f, first));
-        assert!(b.requires_atom(both, first));
-        assert!(b.requires_atom(both, other));
-        assert!(!b.requires_atom(either, first));
-        assert!(!b.requires_atom(inverse, first));
-        assert!(!b.requires_atom(inverse_and, first));
-        assert!(!b.requires_atom(o, first));
-        assert!(!b.requires_atom(Bool::TRUE, first));
-        assert!(!b.requires_atom(Bool::FALSE, first));
-    }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -1796,37 +1575,6 @@ mod tests {
         assert_eq!(s.guards[0][0], None, "the compare runs in every lane");
         let g = s.guards[0][1].expect("guard");
         assert!(matches!(s.bools.support(g)[..], [Atom::Lane(_)]));
-    }
-
-    #[test]
-    fn guards_follow_exec_and_block_reachability() {
-        let p = build(
-            &[
-                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
-                0x7E02_0280, // v_mov_b32 v1, 0
-                0x7E04_0280, // v_mov_b32 v2, 0
-                0xBF88_0005, // s_cbranch_execz -> end
-                0x7E06_0280, // v_mov_b32 v3, 0
-                0x7DA4_0880, // v_cmpx_eq_u32 exec, 0, v4
-                0x7E06_0280, // v_mov_b32 v3, 0
-                0xBE82_0480, // s_mov_b64 s[2:3], 0
-                0x7E0A_0280, // v_mov_b32 v5, 0
-                S_ENDPGM,
-            ],
-            true,
-        );
-        let s = structure(&p).unwrap();
-        let lane = |block: usize, i: usize| {
-            Atom::Lane(p.blocks[block].insts[i].write(Reg::S(EXEC)).unwrap())
-        };
-        let a = s.guards[0][1].unwrap();
-        let b = s.guards[1][2].unwrap();
-        assert_eq!(s.bools.node(a), Some((lane(0, 0), Bool::FALSE, Bool::TRUE)));
-        assert_eq!(s.guards[0], [None, Some(a), Some(a), None]);
-        // The fallthrough already implies the first compare. Only the second
-        // compare needs testing, and the scalar move never needs a guard.
-        assert_eq!(s.bools.node(b), Some((lane(1, 1), Bool::FALSE, Bool::TRUE)));
-        assert_eq!(s.guards[1], [None, None, Some(b), None, Some(b)]);
     }
 
     #[test]
