@@ -168,15 +168,23 @@ fn hook(hwnd: HWND) {
     }
 }
 
+/// Whether a window message asks for the window to be closed.
+fn closes(message: u32, wparam: WPARAM) -> bool {
+    message == wm::WM_CLOSE || message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize
+}
+
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // A user close (close button, Alt+F4, window or taskbar menu); a
-    // console title never sees one, nor a WM_CLOSE from it.
-    if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
+    // A user close (close button, Alt+F4, window or taskbar menu), or
+    // another program's (Task Manager's "end task", a script): a console
+    // title never sees either. A WM_CLOSE that reached the title's procedure
+    // destroyed its window, and the title waited for frames until it aborted
+    // itself or hung.
+    if closes(message, wparam) {
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
@@ -366,6 +374,16 @@ mod tests {
         UnregisterAppStateChangeNotification(a);
         let left: Vec<_> = routines().iter().map(|r| r.0).collect();
         assert_eq!(left, [b]);
+    }
+
+    #[test]
+    fn closes_by_the_user_and_by_other_programs_are_closes() {
+        assert!(closes(wm::WM_SYSCOMMAND, wm::SC_CLOSE as usize));
+        // The low four bits are the system's own.
+        assert!(closes(wm::WM_SYSCOMMAND, wm::SC_CLOSE as usize | 3));
+        assert!(closes(wm::WM_CLOSE, 0));
+        assert!(!closes(wm::WM_SYSCOMMAND, wm::SC_MINIMIZE as usize));
+        assert!(!closes(wm::WM_DESTROY, 0));
     }
 
     #[test]
