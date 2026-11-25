@@ -6,7 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
@@ -4448,11 +4448,18 @@ impl<'a> Lower<'a> {
         let Some(new) = inst.write(reg) else { return };
         let x = match (guard, reg) {
             (Some(g), Reg::V(_)) => {
-                let old = match inst.read(reg).map(|o| self.i32_of(o)) {
+                let o = inst.read(reg);
+                let read = o.is_some_and(|o| self.read_phis.contains(&o));
+                let old = match o.map(|o| self.i32_of(o)) {
                     Some(Ok(o)) => o,
                     // The validator refuses reads of undef.
                     _ => self.s.m.i32(0),
                 };
+                // What lanes keep is zero where it has no DXIL form (as
+                // above), so keeping a phi does not make it live.
+                if let Some(o) = o.filter(|_| !read) {
+                    self.read_phis.remove(&o);
+                }
                 let v = self.s.m.select(self.cur, g, x, old);
                 self.s.m.tag(v, Tag::Guard);
                 v
@@ -12161,6 +12168,329 @@ impl<'a> Lower<'a> {
         e
     }
 
+    /// Whether no lane entering IR block `b` from its `n`th predecessor
+    /// reads what `reg` holds there before something overwrites it. The
+    /// lane is followed along its per-lane branches, with the phis it
+    /// passes taking that path's values; a branch whose compares have
+    /// constant operands on the path is followed one way. Scalar arithmetic
+    /// on the value passes it on; any other read of it, or a branch or guard
+    /// that depends on it, makes it live. Paths meeting at a block with the
+    /// same registers holding it go on with what they agree on. This is the
+    /// console compiler's flag after a join (`if (c) { x = load; f = .. }
+    /// if (f) use(x)`, with `f` 0 on the other path), where the register
+    /// that holds `x` holds a stale value, often a lane mask, on that path.
+    fn dead_on_edge(&self, b: usize, n: usize, reg: Reg) -> bool {
+        let p = self.x.p;
+        let st = self.x.st;
+        // Values computed from the stale one on some path followed.
+        let mut tainted = HashSet::new();
+        let mut work = vec![(b, n, HashMap::new(), BTreeSet::from([reg]))];
+        // Per block reached and registers holding tainted values on entry:
+        // the phi values known there, over the paths so far.
+        let mut at: HashMap<(usize, BTreeSet<Reg>), HashMap<Value, u32>> = HashMap::new();
+        let mut visits = 0;
+        while let Some((b, n, mut env, mut regs)) = work.pop() {
+            let block = &p.blocks[b];
+            let known: Vec<_> = block
+                .phis
+                .iter()
+                .map(|phi| (phi.value, self.konst(&env, phi.args[n])))
+                .collect();
+            for (v, k) in known {
+                match k {
+                    Some(k) => env.insert(v, k),
+                    None => env.remove(&v),
+                };
+            }
+            for phi in &block.phis {
+                if regs.contains(&phi.reg) {
+                    tainted.insert(phi.value);
+                }
+            }
+            let key = (b, regs.clone());
+            if let Some(old) = at.get(&key) {
+                let agreed: HashMap<Value, u32> = old
+                    .iter()
+                    .filter(|&(v, k)| env.get(v) == Some(k))
+                    .map(|(&v, &k)| (v, k))
+                    .collect();
+                if agreed.len() == old.len() {
+                    continue;
+                }
+                env = agreed;
+            }
+            at.insert(key, env.clone());
+            visits += 1;
+            if visits > 4 * p.blocks.len() + 64 {
+                return false;
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                if regs.is_empty() {
+                    break;
+                }
+                let guard = st.guards[b][i];
+                if guard.is_some_and(|g| self.touches(g, &env, &tainted)) {
+                    return false;
+                }
+                // The closing branch is the lane's exit, tested below.
+                if inst.reads.iter().any(|r| regs.contains(&r.0))
+                    && !inst.name().starts_with("s_cbranch")
+                {
+                    // Scalar arithmetic only passes the value on.
+                    let pure = matches!(inst.fields, Fields::Sop { .. })
+                        && inst.write(Reg::S(EXEC)).is_none()
+                        && !inst.name().starts_with("s_setreg");
+                    if !pure {
+                        return false;
+                    }
+                    for &(r, w) in &inst.writes {
+                        regs.insert(r);
+                        tainted.insert(w);
+                    }
+                } else if guard.is_none() {
+                    for w in &inst.writes {
+                        regs.remove(&w.0);
+                    }
+                }
+            }
+            if regs.is_empty() {
+                continue;
+            }
+            let into = |t: usize| p.blocks[t].preds.iter().position(|&q| q == b);
+            let mut go = |t: usize, env, regs| match into(t) {
+                Some(n) => {
+                    work.push((t, n, env, regs));
+                    true
+                }
+                None => false,
+            };
+            let ok = match st.exits[b] {
+                LaneExit::End => true,
+                LaneExit::Indirect => false,
+                LaneExit::Jump(t) => go(t, env, regs),
+                LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } => {
+                    let (no, yes) = self.can_be(when, &env, &mut HashMap::new());
+                    !(no && yes && self.touches(when, &env, &tainted))
+                        && (!yes || go(taken, env.clone(), regs.clone()))
+                        && (!no || go(not_taken, env, regs))
+                }
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether deciding `b`, given the values in `env`, may test an atom
+    /// of a `tainted` value.
+    fn touches(&self, b: Bool, env: &HashMap<Value, u32>, tainted: &HashSet<Value>) -> bool {
+        let mut stack = vec![b];
+        let mut seen = HashSet::new();
+        while let Some(b) = stack.pop() {
+            let Some((atom, lo, hi)) = self.x.st.bools.node(b) else {
+                continue;
+            };
+            if !seen.insert(b) {
+                continue;
+            }
+            let v = match atom {
+                Atom::Lane(v)
+                | Atom::Uniform(v)
+                | Atom::Phi(v)
+                | Atom::Quad(v)
+                | Atom::Opaque(v) => Some(v),
+                Atom::Constant(_) => None,
+            };
+            if v.is_some_and(|v| tainted.contains(&v)) {
+                return true;
+            }
+            match v.and_then(|v| self.compared(env, v)) {
+                Some(true) => stack.push(hi),
+                Some(false) => stack.push(lo),
+                None => stack.extend([lo, hi]),
+            }
+        }
+        false
+    }
+
+    /// Whether `b` can be false, and true, given the values in `env`.
+    fn can_be(
+        &self,
+        b: Bool,
+        env: &HashMap<Value, u32>,
+        memo: &mut HashMap<Bool, (bool, bool)>,
+    ) -> (bool, bool) {
+        if b == Bool::TRUE || b == Bool::FALSE {
+            return (b == Bool::FALSE, b == Bool::TRUE);
+        }
+        if let Some(&r) = memo.get(&b) {
+            return r;
+        }
+        let (atom, lo, hi) = self.x.st.bools.node(b).expect("not a constant");
+        let v = match atom {
+            Atom::Lane(v) | Atom::Uniform(v) => Some(v),
+            _ => None,
+        };
+        let r = match v.and_then(|v| self.compared(env, v)) {
+            Some(true) => self.can_be(hi, env, memo),
+            Some(false) => self.can_be(lo, env, memo),
+            None => {
+                let (a, c) = self.can_be(lo, env, memo);
+                let (d, e) = self.can_be(hi, env, memo);
+                (a || d, c || e)
+            }
+        };
+        memo.insert(b, r);
+        r
+    }
+
+    /// The instruction writing `v`.
+    fn def_inst(&self, v: Value) -> Option<&'a Inst> {
+        let b = *self.def_block.get(&v)?;
+        let p = self.x.p;
+        p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))
+    }
+
+    /// The constant `v` holds, `env` giving phi values: moves of constants.
+    fn konst(&self, env: &HashMap<Value, u32>, v: Value) -> Option<u32> {
+        if let Some(&k) = env.get(&v) {
+            return Some(k);
+        }
+        let inst = self.def_inst(v)?;
+        let op = match &inst.fields {
+            Fields::Valu(w)
+                if inst.name() == "v_mov_b32" && w.sdwa.is_none() && w.dpp.is_none() =>
+            {
+                w.src.first()?
+            }
+            Fields::Sop { src, .. } if inst.name() == "s_mov_b32" => src.first()?,
+            Fields::Sop { imm, .. } if inst.name() == "s_movk_i32" => {
+                return Some(i32::from((*imm)? as i16) as u32);
+            }
+            _ => return None,
+        };
+        self.konst_operand(env, inst, op)
+    }
+
+    fn konst_operand(&self, env: &HashMap<Value, u32>, inst: &Inst, op: &Operand) -> Option<u32> {
+        match *op {
+            Operand::Const(c) => crate::resource::inline(c),
+            Operand::Literal(x) => Some(x),
+            Operand::Scalar { code, .. } if code != NULL => {
+                self.konst(env, inst.read(Reg::S(code))?)
+            }
+            Operand::Vector { reg, .. } => self.konst(env, inst.read(Reg::V(reg))?),
+            _ => None,
+        }
+    }
+
+    /// The lane's bit of the 32-bit integer compare writing `v` (a VALU
+    /// result before EXEC masking, or SCC), when its operands are constants.
+    fn compared(&self, env: &HashMap<Value, u32>, v: Value) -> Option<bool> {
+        let inst = self.def_inst(v)?;
+        let name = inst.name();
+        let rest = ["v_cmpx_", "v_cmp_", "s_cmp_"]
+            .iter()
+            .find_map(|p| name.strip_prefix(p))?;
+        let (op, ty) = rest.rsplit_once('_')?;
+        let (a, b) = match &inst.fields {
+            Fields::Valu(w) if w.sdwa.is_none() && w.dpp.is_none() => {
+                (w.src.first()?, w.src.get(1)?)
+            }
+            Fields::Sop { src, .. } => (src.first()?, src.get(1)?),
+            _ => return None,
+        };
+        let (a, b) = (
+            self.konst_operand(env, inst, a)?,
+            self.konst_operand(env, inst, b)?,
+        );
+        let (sa, sb) = (a as i32, b as i32);
+        Some(match (op, ty) {
+            ("f", _) => false,
+            ("t", _) => true,
+            ("eq", "u32" | "i32") => a == b,
+            ("ne" | "lg", "u32" | "i32") => a != b,
+            ("lt", "u32") => a < b,
+            ("le", "u32") => a <= b,
+            ("gt", "u32") => a > b,
+            ("ge", "u32") => a >= b,
+            ("lt", "i32") => sa < sb,
+            ("le", "i32") => sa <= sb,
+            ("gt", "i32") => sa > sb,
+            ("ge", "i32") => sa >= sb,
+            _ => return None,
+        })
+    }
+
+    /// The incoming edges (phi, predecessor index) over which a value can
+    /// reach a read. A phi that only another read phi consumes is live too
+    /// (else a value with no DXIL form reaching a read through two joins
+    /// would be replaced by zero), but only over edges a lane can take on
+    /// its way there: each step back adds the branch a lane took on that
+    /// edge, and a contradiction (the lane that skipped an arm is not one
+    /// that ran it) leaves the edge dead. A back edge forgets the branches
+    /// (the loop redefines their conditions). Fewer conditions are weaker,
+    /// so keeping only the last few stays sound.
+    fn live_edges(&self) -> HashSet<(Value, usize)> {
+        const MAX_KNOWN: usize = 4;
+        let (p, st) = (self.x.p, &self.x.st);
+        let mut work: Vec<(Value, Vec<(Bool, bool)>)> =
+            self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
+        let mut live = HashSet::new();
+        let mut seen = HashMap::<Value, Vec<Vec<(Bool, bool)>>>::new();
+        while let Some((v, known)) = work.pop() {
+            let Some(&(b, i)) = self.phi_at.get(&v) else {
+                continue;
+            };
+            let done = seen.entry(v).or_default();
+            // Known of fewer lanes than before: nothing new is live.
+            if done.iter().any(|d| d.iter().all(|c| known.contains(c))) {
+                continue;
+            }
+            done.push(known.clone());
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if self.tail[q].is_none() {
+                    continue;
+                }
+                let mut k = Vec::new();
+                // Forward edges out of a block that is no loop's latch (a
+                // loop's exit is also taken at its iteration limit).
+                if let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = st.exits[q]
+                    && taken != not_taken
+                    && self.rpo[taken] > self.rpo[q]
+                    && self.rpo[not_taken] > self.rpo[q]
+                {
+                    k.clone_from(&known);
+                    k.push((when, taken == b));
+                    k.drain(..k.len().saturating_sub(MAX_KNOWN));
+                    if !st.bools.meet(&k) {
+                        continue;
+                    }
+                } else if self.rpo[q] < self.rpo[b] {
+                    k.clone_from(&known);
+                }
+                live.insert((v, n));
+                let arg = p.blocks[b].phis[i].args[n];
+                if self.phi_at.contains_key(&arg) {
+                    work.push((arg, k));
+                }
+            }
+        }
+        live
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         // Lane-mask joins first (what an edge brings may ask for more joins,
@@ -12183,32 +12513,19 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
-        // A join that only another join reads is read wherever that one is. Left
-        // unmarked, a value without a DXIL form coming into it became zero without a
-        // word (the looked-up tint of the material resolve programs, whose size
+        // A join that only another join reads is read wherever that one is
+        // ([`Self::live_edges`], over the edges a lane can take to the read). What comes in
+        // over such an edge is given its value where it has one; left out, it became zero
+        // without a word (the looked-up tint of the material resolve programs, whose size
         // computation had no value, was zero in every lane that way).
-        // shortcut: only with `VICTORY_STRICT_JOINS` set (the offline pack
-        // listing sets it to count them): 40 programs that translate today
-        // stop by name with it (vehicle paint pixel shaders at "the first
-        // half of an interpolation", foliage mesh shaders); until those are
-        // lowered they keep drawing with that zero.
+        // shortcut: a value without a DXIL form that is read through another join alone stops
+        // the program only with `VICTORY_STRICT_JOINS` set; else it is that zero (programs
+        // that translate today stop by name with it).
         static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let strict = *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some());
-        let mut work: Vec<Value> = if strict {
-            self.read_phis.iter().copied().collect()
-        } else {
-            Vec::new()
-        };
-        while let Some(v) = work.pop() {
-            let Some(&(b, i)) = self.phi_at.get(&v) else {
-                continue;
-            };
-            for &a in &p.blocks[b].phis[i].args {
-                if self.phi_at.contains_key(&a) && self.read_phis.insert(a) {
-                    work.push(a);
-                }
-            }
-        }
+        let live = self.live_edges();
+        // (what the values below read in turn is read whichever way it comes)
+        let seeds = self.read_phis.clone();
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -12228,7 +12545,12 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
+                // Whether a lane coming this way reads it, and whether the program stops if it
+                // has no form.
+                let read = live.contains(&(phi.value, n))
+                    || self.read_phis.contains(&phi.value) && !seeds.contains(&phi.value);
+                let must = read && (strict || self.read_phis.contains(&phi.value));
+                if read && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);
                     // A root parameter nothing read before the join (user
                     // data is loaded on first use, in the entry block).
@@ -12246,17 +12568,29 @@ impl<'a> Lower<'a> {
                     {
                         self.s.m.i32(0)
                     }
+                    // No lane from this edge reads it: any value will do.
+                    (Some(Val::Missing(_) | Val::Bit(_)) | None, false) | (Some(Val::Missing(_) | Val::I32(_)) | None, true)
+                        if read && self.dead_on_edge(b, n, phi.reg) =>
+                    {
+                        if bit {
+                            self.s.m.bool(false)
+                        } else {
+                            self.s.m.i32(0)
+                        }
+                    }
                     // A lane mask joined with numbers (a traversal that keeps its lanes' masks on
                     // a stack with its node numbers): the mask comes as the number it is, the
                     // ballot of its lanes where it is written.
                     (Some(Val::Missing(_)) | None, false)
-                        if self.read_phis.contains(&phi.value)
+                        if read
                             && self.mask_data == MaskData::Console
                             && (st.masks.contains_key(&arg) || st.highs.contains_key(&arg)) =>
                     {
                         match self.mask_dword(arg) {
                             Ok(x) => x,
-                            Err(why) => return Err(Stop::Retry(phi.value, why)),
+                            Err(why) if must => return Err(Stop::Retry(phi.value, why)),
+                            Err(_) if bit => self.s.m.bool(false),
+                            Err(_) => self.s.m.i32(0),
                         }
                     }
                     // SCC of a mask operation ("some lane is left") joined with a scalar test:
@@ -12267,31 +12601,34 @@ impl<'a> Lower<'a> {
                     // console has the skipped code's SCC. So the branch must be one the wave
                     // takes together; else its region is named for `emit`'s retry to widen it.
                     (Some(Val::Missing(_)) | None, true)
-                        if self.read_phis.contains(&phi.value)
+                        if read
                             && self.mask_data == MaskData::Console
                             && st.scc_some.contains_key(&arg) =>
                     {
                         let per_lane = !st.wide.contains(&q)
                             && matches!(st.exits[q], LaneExit::Branch { when, .. }
                                 if !st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))));
-                        if per_lane {
+                        if per_lane && must {
                             for &other in p.blocks[b].preds.iter().filter(|&&o| o != q) {
                                 need(other);
                             }
                             return Err(Stop::Retry(phi.value, LANE_MASK));
                         }
-                        match self.scc_some(arg) {
+                        let some = if per_lane { Err(LANE_MASK) } else { self.scc_some(arg) };
+                        match some {
                             Ok(x) => x,
-                            Err(why) => return Err(Stop::Retry(phi.value, why)),
+                            Err(why) if must => return Err(Stop::Retry(phi.value, why)),
+                            Err(_) if bit => self.s.m.bool(false),
+                            Err(_) => self.s.m.i32(0),
                         }
                     }
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Bit(_)), false) if must => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Missing(why)), _) if must => {
                         return Err(Stop::Retry(phi.value, why));
                     }
-                    _ if self.read_phis.contains(&phi.value) => {
+                    _ if must => {
                         return Err(Stop::Retry(phi.value, "a join of mismatched values"));
                     }
                     _ if bit => self.s.m.bool(false),
@@ -12864,6 +13201,93 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[test]
+    fn a_value_no_lane_from_its_edge_reads_needs_no_form() {
+        // s6 is a timestamp (no DXIL form) where the load is skipped and 5
+        // where it runs; a flag in v1, set only with the load, guards the
+        // read after the join (the console compiler's form, where the
+        // skipped path leaves a stale lane mask in the register).
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0002, // s_cbranch_scc1 -> join
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7E02_02C1, // v_mov_b32 v1, -1
+            0x7D84_02C1, // join: v_cmp_eq_u32 vcc_lo, -1, v1
+            0xBF86_0003, // s_cbranch_vccz -> end
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let group_ids_xy = 3 << 7;
+        lowers(&words, group_ids_xy).expect("the timestamp is never read");
+        // With the flag set on both paths the timestamp is read: as refused
+        // (or accepted) as a direct read.
+        words[2] = 0x7E02_02C1; // v_mov_b32 v1, -1
+        let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let direct = [&words[..2], &words[9..]].concat();
+        assert_eq!(refusal(&words), refusal(&direct));
+    }
+
+    #[test]
+    fn a_missing_value_on_a_path_no_lane_takes_is_dead() {
+        let refusal = |code: &[u32]| match lowers(code, 1 << 7) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        // The timestamp stays in s6 only where s0 == 0, and those lanes
+        // overwrite it before the second join: it never reaches the read.
+        let mut joins = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0001, // s_cbranch_scc1: s0 == 0 keeps the timestamp
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBF84_0001, // s_cbranch_scc0: s0 != 0 keeps that 0
+            0xBE86_0381, // s_mov_b32 s6, 1
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001,
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&joins), None);
+        // Tested on the other side, the timestamp reaches the read.
+        joins[5] = 0xBF85_0001; // s_cbranch_scc1
+        // (read through two joins: only strict joins stop for it)
+        if std::env::var_os("VICTORY_STRICT_JOINS").is_some() {
+            assert!(refusal(&joins).is_some());
+        }
+        // The same through a VGPR whose old value a guarded write keeps
+        // (lanes outside it get 0 for a value with no DXIL form, as for any
+        // such write): keeping does not make the join live.
+        let kept = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1: s0 == 0 keeps the timestamp
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF84_0004, // s_cbranch_scc0: s0 != 0 keeps that 0
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0x7E02_0282, // v_mov_b32 v1, 2 (the other lanes keep v1)
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            0x7E02_0283, // v_mov_b32 v1, 3
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0xBF87_0001, // s_cbranch_vccnz
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&kept), None);
     }
 
     #[test]
