@@ -32,6 +32,19 @@ pub fn build(native: &NativeProgram) -> Result<Program, ShaderError> {
     Ok(p)
 }
 
+/// [`build`] and its structure, the registers of relative moves bounded where their index is
+/// ([`crate::range`]).
+pub fn build_bounded(
+    native: &NativeProgram,
+) -> Result<(Program, Result<crate::structure::Structured, ShaderError>), ShaderError> {
+    let code = native.patched_code();
+    crate::range::build_with(|bounds| {
+        let mut p = ir::build_bounded(&code, native.wave64, native.vgprs, bounds)?;
+        user_data(&mut p, native);
+        Ok(p)
+    })
+}
+
 /// Whether `native` is a compute program that keeps its root parameters in
 /// a spilled user-data table (see the module): the entries no register
 /// holds, as (first user-data index, dwords), if the table starts at index
