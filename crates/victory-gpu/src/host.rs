@@ -4506,6 +4506,14 @@ impl Host {
         working(was_working);
     }
 
+    /// No submission is prepared while this is held. For tests that bring
+    /// copies up to date themselves: the write journal's asking is the
+    /// submission's that is being prepared.
+    #[cfg(test)]
+    pub(crate) fn alone(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock

@@ -39,9 +39,10 @@ fn held(copy: &Shadow, at: usize) -> u8 {
 /// After Marvisak/VIctory ed0dbfd's test.
 #[test]
 fn title_writes_under_a_busy_range_reach_the_copy_and_stay() {
-    if crate::host::host().is_none() {
+    let Some(host) = crate::host::host() else {
         return;
-    }
+    };
+    let _alone = host.alone();
     let len = 2 * PAGE;
     let p = pool(len);
     register(p, p as u64, len as u64);
@@ -69,9 +70,10 @@ fn title_writes_under_a_busy_range_reach_the_copy_and_stay() {
 /// go to the card as well.
 #[test]
 fn title_writes_under_a_busy_range_go_to_the_card() {
-    if crate::host::host().is_none() {
+    let Some(host) = crate::host::host() else {
         return;
-    }
+    };
+    let _alone = host.alone();
     let len = 64 << 20;
     let p = pool(len);
     register(p, p as u64, len as u64);
@@ -340,9 +342,10 @@ fn many_submissions_declare_one_heap() {
 /// A byte the title writes costs the kernel's page it lies in, not 64 KiB.
 #[test]
 fn a_written_byte_copies_its_kernel_page() {
-    if crate::host::host().is_none() {
+    let Some(host) = crate::host::host() else {
         return;
-    }
+    };
+    let _alone = host.alone();
     let len = 4 * PAGE;
     let p = pool(len);
     register(p, p as u64, len as u64);
@@ -377,9 +380,10 @@ fn a_written_byte_copies_its_kernel_page() {
 /// refreshed is what title memory holds.
 #[test]
 fn refreshed_ranges_hold_title_memory_whatever_was_written() {
-    if crate::host::host().is_none() {
+    let Some(host) = crate::host::host() else {
         return;
-    }
+    };
+    let _alone = host.alone();
     let len = 8 * PAGE;
     let p = pool(len);
     // The second is inside the first and starts off a page.
