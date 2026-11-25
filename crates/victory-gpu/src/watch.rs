@@ -331,6 +331,16 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
+/// While a submission's one asking stands ([`ask_once`]) and holds all of
+/// `[start, end)`: the number of the latest asking or noted write
+/// ([`wrote`]). As long as it stays the same, [`writes`] of the range says
+/// the same.
+pub(crate) fn standing(start: usize, end: usize) -> Option<u64> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    (j.kept && j.ahead.iter().any(|&(a, b)| a <= first && last <= b)).then_some(j.asked)
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the

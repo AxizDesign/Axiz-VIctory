@@ -2312,6 +2312,13 @@ fn flying() -> bool {
     line.settling || line.line.iter().any(|l| matches!(l, Late::Run(_)))
 }
 
+/// Whether what the title wrote may be put into copies beside what shaders
+/// write: always while nothing is in the air (no shader of the submission
+/// being prepared has run), else with [`late_exact`].
+pub(crate) fn merges_under_flights() -> bool {
+    late_exact() || !flying()
+}
+
 /// With flights in the air ([`late`]): why `runs` cannot be prepared
 /// before they are settled, if so. Preparing reads title memory on the
 /// CPU (the title's buffer copies, fills of upload memory, textures) and

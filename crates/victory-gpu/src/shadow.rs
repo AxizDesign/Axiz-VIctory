@@ -37,6 +37,9 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
+    /// With the submission's one asking (`crate::watch::standing`): its
+    /// number, and the span that is up to date with it.
+    fresh: Mutex<(u64, usize, usize)>,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -1891,6 +1894,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
+            fresh: Mutex::default(),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -2433,7 +2437,6 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
-        let mut title = vec![0u8; PAGE];
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -2449,73 +2452,92 @@ impl Shadow {
                 stale_pages_in(base, &copied, a, e, &written)
             };
             for page in stale {
-                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
-                if lo >= hi {
-                    continue;
-                }
-                let n = hi - lo;
-                let title = &mut title[..n];
-                // The lock of the copy's reference (the snapshot, or the
-                // CPU's side of a copy in the card's memory), from before
-                // title memory is read until the title's bytes are in: with
-                // the copy-back on its own thread ([`relay`]) that thread
-                // puts what the card wrote into title memory and into the
-                // reference under the same lock, and a page read before
-                // such a merge and compared after it would take the card's
-                // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-                // A page that is not there is left as it is, and looked at
-                // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
-                    continue;
-                }
-                MERGED[0].fetch_add(1, Ordering::Relaxed);
-                let at = lo - start;
-                if self.card.is_some() {
-                    // SAFETY: inside the mapping of the copy's CPU side,
-                    // which only the submitting thread writes.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let Some(runs) = changed_runs_limited(title, held, *runs_left) else {
-                        return true;
-                    };
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
-                    }
-                } else {
-                    let Some(snapshot) = before.as_mut() else {
-                        return true;
-                    };
-                    // SAFETY: the snapshot's allocation holds the copy's
-                    // bytes at the copy's offsets (`writing`), and these
-                    // are in a declared range.
-                    let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
-                        // SAFETY: inside the copy's mapping. The card may be
-                        // writing the copy beside these bytes; they are
-                        // written here and nothing around them.
-                        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
-                    }
-                }
-                drop(before);
-                // Taken, if the range holds all of the page that is in the
-                // copy; else the rest of it is the refresh's, which notes
-                // only whole pages, and the page is looked at again.
-                if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
-                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
-                    }
+                if self.merge_page(page, (a, e), now, runs_left).is_none() {
+                    return true;
                 }
             }
         }
         false
+    }
+
+    /// Puts what the title changed in `page`, inside `[a, e)` (a range
+    /// shaders may be writing), into the copy and into the reference its
+    /// shaders' writes are told from. `now`: the asking that found the page
+    /// written. The bytes put in; `None` if that cannot be done here (no
+    /// reference, or more changed runs than `runs_left`).
+    fn merge_page(&self, page: usize, (a, e): (usize, usize), now: u64, runs_left: &mut usize) -> Option<usize> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+        if lo >= hi {
+            return Some(0);
+        }
+        let n = hi - lo;
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        TITLE.with_borrow_mut(|title| {
+            title.resize(PAGE, 0);
+            let title = &mut title[..n];
+            let mut bytes = 0;
+            // The lock of the copy's reference (the snapshot, or the CPU's
+            // side of a copy in the card's memory), from before title
+            // memory is read until the title's bytes are in: with the
+            // copy-back on its own thread ([`relay`]) that thread puts what
+            // the card wrote into title memory and into the reference under
+            // the same lock, and a page read before such a merge and
+            // compared after it would take the card's bytes for the
+            // title's.
+            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            // A page that is not there is left as it is, and looked at
+            // again next time.
+            if !crate::host::read_into(lo as *const u8, title) {
+                return Some(0);
+            }
+            MERGED[0].fetch_add(1, Ordering::Relaxed);
+            let at = lo - start;
+            if self.card.is_some() {
+                // SAFETY: inside the mapping of the copy's CPU side, which
+                // only the submitting thread writes.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                let runs = changed_runs_limited(title, held, *runs_left)?;
+                *runs_left -= runs.len();
+                for (r, m) in runs {
+                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                    self.card_changed(at + r, at + r + m);
+                    MERGED[1].fetch_add(1, Ordering::Relaxed);
+                    MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    bytes += m;
+                }
+            } else {
+                let snapshot = before.as_mut()?;
+                // SAFETY: the snapshot's allocation holds the copy's bytes
+                // at the copy's offsets (`writing`), and these are in a
+                // declared range.
+                let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+                for (r, m) in changed_runs(title, held) {
+                    // SAFETY: inside the copy's mapping. The card may be
+                    // writing the copy beside these bytes; they are written
+                    // here and nothing around them.
+                    unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
+                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                    MERGED[1].fetch_add(1, Ordering::Relaxed);
+                    MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    bytes += m;
+                }
+            }
+            drop(before);
+            // Taken, if the range holds all of the page that is in the
+            // copy; else the rest of it is the refresh's, which notes only
+            // whole pages, and the page is looked at again.
+            if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(at) = copied.get_mut(page - base) {
+                    *at = now;
+                }
+            }
+            Some(bytes)
+        })
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -2531,6 +2553,32 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // Already brought up to date with what the submission's one asking
+        // says: thousands of dispatches bind one big buffer, each from a
+        // place of its own to the buffer's end. Memory that is not watched
+        // has no asking to go by.
+        let asking = (self.watched.load(Ordering::Relaxed) == 1)
+            .then(|| crate::watch::standing(from, to))
+            .flatten();
+        if let Some(asking) = asking {
+            let fresh = self.fresh.lock().unwrap_or_else(|e| e.into_inner());
+            if fresh.0 == asking && fresh.1 <= from && to <= fresh.2 {
+                return 0;
+            }
+        }
+        let bytes = self.update_ranges(from, to);
+        if let Some(asking) = asking {
+            let mut fresh = self.fresh.lock().unwrap_or_else(|e| e.into_inner());
+            *fresh = match *fresh {
+                (a, f, t) if a == asking && from <= t && f <= to => (a, f.min(from), t.max(to)),
+                _ => (asking, from, to),
+            };
+        }
+        bytes
+    }
+
+    /// [`Shadow::update`] of `[from, to)`, inside the buffer.
+    fn update_ranges(&self, from: usize, to: usize) -> usize {
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -2546,8 +2594,12 @@ impl Shadow {
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
+                let (a, e) = (a.max(at), e.min(to));
                 if a > at {
                     bytes += self.update_free(at, a);
+                }
+                if e > a {
+                    bytes += self.update_busy(a, e);
                 }
                 at = at.max(e);
             }
@@ -2557,6 +2609,72 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// [`Shadow::update`] of `[from, to)` (inside the buffer) where shaders
+    /// of a list ahead may write: the bytes the title changed since the
+    /// range was taken go into the copy and into what its shaders' writes
+    /// are told from, and nothing beside them does. Left alone (as it was),
+    /// constants the title copied into a buffer an earlier list of the same
+    /// submission binds as a whole for writing were not there for the later
+    /// lists' shaders: a dispatch read its sizes as zeros (after
+    /// Marvisak/VIctory ed0dbfd).
+    ///
+    /// Flights in the air were looked at before the submission was prepared
+    /// (`host::stale_under_flights`); what the title wrote since goes in
+    /// the same way where they allow it.
+    fn update_busy(&self, from: usize, to: usize) -> usize {
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return 0;
+        }
+        let Some((now, written)) = crate::watch::writes(from, to, true) else {
+            return 0;
+        };
+        let stale = {
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            stale_pages_in(self.start as usize / PAGE, &copied, from, to, &written)
+        };
+        if stale.is_empty() || !crate::host::merges_under_flights() {
+            return 0;
+        }
+        // Snapshots that were only noted are what the merge compares with.
+        self.take_own_snapshots();
+        let (mut runs_left, mut bytes) = (usize::MAX, 0);
+        for page in stale {
+            let Some(n) = self.merge_page(page, (from, to), now, &mut runs_left) else {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!("title writes under ranges shaders write have no snapshot to be told from: not refreshed")
+                });
+                break;
+            };
+            bytes += n;
+        }
+        bytes
+    }
+
+    /// Takes this copy's snapshots noted with [`wide_back`], which
+    /// [`take_snapshots`] would take with the others. Not through the
+    /// threads of [`wide`]: this may run on one of them.
+    fn take_own_snapshots(&self) {
+        let (first, end) = (self.data as usize, self.data as usize + self.len as usize);
+        let own: Vec<(usize, usize, usize)> = {
+            let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut own = Vec::new();
+            snaps.retain(|s| {
+                let mine = (first..end).contains(&s.0);
+                if mine {
+                    own.push(*s);
+                }
+                !mine
+            });
+            own
+        };
+        for (from, to, n) in own {
+            // SAFETY: as noted by [`Shadow::writing`]: the copy's mapping
+            // and its snapshot, which stays until the range is done with.
+            unsafe { copy_wide(from as *const u8, to as *mut u8, n) };
+        }
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -3514,3 +3632,6 @@ mod buffers_tests {
         assert_eq!(b.holding(u64::MAX - 8, u64::MAX), None);
     }
 }
+
+#[cfg(test)]
+mod busy_tests;
