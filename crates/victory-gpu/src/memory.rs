@@ -276,6 +276,7 @@ pub(crate) fn ready(
     addresses: &[u64],
     constants: &[u32],
     writes: bool,
+    builder: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -324,7 +325,11 @@ pub(crate) fn ready(
     if writes {
         for shadow in &m.copies[write_from..] {
             let (start, len) = shadow.span();
-            shadow.gpu_writes(list, start, len);
+            // Bounded for the structure builder (`crate::pipeline::bvh_bound`).
+            // shortcut: a list's copies are declared once, by whichever
+            // program that can store comes first; a list mixing the builder
+            // with another such program follows the first.
+            crate::pipeline::builder_writes(list, shadow, start, len, builder);
         }
     }
     if list.first_use(KEEP) {
@@ -429,7 +434,7 @@ mod tests {
         let host_heap = heap(h).host().expect("host view heap");
         let key = std::ptr::from_ref(host_heap) as usize;
 
-        assert!(ready(&list, host_heap, &[], &[], false).is_some());
+        assert!(ready(&list, host_heap, &[], &[], false, false).is_some());
         {
             let guard = MEMORY.lock().unwrap();
             assert!(guard.as_ref().unwrap().heaps.contains_key(&key));
