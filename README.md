@@ -216,6 +216,7 @@ victory translate --list <game dir>\<the title's exe> <game dir>\shaders.rpf
 |---|---|
 | [Architecture](docs/architecture.md) | how it works |
 | [What this fork changed](docs/fork-changes.md) | the list, with numbers |
+| [Test runs](docs/test-runs.md) | measured runs, 2026-11-25 |
 | [Ray tracing](docs/fork-ray-tracing.md) | what is there and what is missing |
 | [`victory-pso`](docs/victory-pso.md) | pipelines without a title |
 | [Upstream status](docs/upstream-status.md) | subsystem by subsystem, 2026-11-23 |
