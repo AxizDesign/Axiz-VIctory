@@ -7,9 +7,9 @@ is a work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory).
 game. This project is not affiliated with or endorsed by the game's developer
 or publisher.
 
-> **Not playable yet.** The title boots, loads and reaches its world, at a few
-> frames per second and with missing graphics. Read [What works](#what-works)
-> before you try it.
+> **Not playable yet.** The title boots, loads and can be played in its world
+> for tens of minutes, at about 7 to 10 frames per second on one PC, and with
+> faults in the picture. Read [What works](#what-works) before you try it.
 
 ## Contents
 
@@ -71,33 +71,37 @@ a reason for a black picture or a run that does not start.
 
 ## What works
 
-State on 2026-11-25, Series X profile, on one PC (RTX 5070 12 GB, 32 GB RAM).
-Other PCs will differ.
+State on 2026-11-26, branch `main`, Series X profile, on one PC (RTX 5070
+12 GB, Ryzen 7 8700F, 32 GB RAM, Windows 11; NVIDIA driver 621.40 for the last
+run, 610.88 before). Other PCs will differ. The runs and how they were measured
+are in [docs/test-runs.md](docs/test-runs.md).
 
 | Stage | State |
 |---|---|
 | Boot, menus | works, 30 fps |
-| Loading into the world | works. It crashed at the end of loading (`0x80070057`) until `e5383ce` |
-| In the world | renders with faults, about 2 to 5 fps in busy scenes and 8 to 12 in light ones |
-| Cutscenes | start; can freeze, see below |
-| Skipping the opening cutscene | works, after a long black load |
+| Loading into the world | works |
+| In the world | 6.4 to 9.9 fps median by run and scene (2,500 draws and more), best about 12. Not measured with a fixed scene |
+| Cutscenes | start and can be skipped. Characters and models can come in coarse, and parts of a room can be missing for a while |
+| Longest session | 25 min 34 s without an error, ended by the player. Other sessions of 11 to 20 minutes were ended by the player too |
+| Faulted sessions (of 18 measured on 25 and 26 November) | one hung: run 18, with ray tracing and several new switches on together, cause not known. One lost the graphics device: run 24, while a graphics driver was being installed |
 | Sound | works at first; can break after a long freeze |
-| Ray-traced light | off: 3 of the structure builder's 53 programs do not translate for cards with 32-lane waves (NVIDIA) |
+| Mouths | a fix for the network that animates faces is in (from fxceless/victory-fork pull request 927). On this card the old path kept 1 of 65,536 values, all now; in the game it is not confirmed yet |
+| Ray-traced light | off by default. An ambient light stands in for it (`VICTORY_AMBIENT`). With it on, about 4 fps in a cutscene (run 17); the build merged since has not run with it apart from run 18 |
 | Series S profile | boots; not tried further |
 
 ## Known problems
 
 | What you see | What is known |
 |---|---|
-| Low frame rate | The CPU side. The pass that brings textures up to date took 80 to 500 ms a frame; it is now held to a share of the frame (`VICTORY_TEXTURE_SHARE`). Not measured in a run yet |
-| Textures missing, or uploaded over and over | A 12 GB card is full in the world. One 24-minute run uploaded 20.5 GB of textures with about 3.4 GB alive |
-| Freezes of 5 to 20 seconds | The title sends no work during them. Cause not known; memory pressure is likely part of it |
-| Title closes by itself after a freeze | Its own watchdog, after about 30 seconds without a frame |
-| Square blocks on characters, wrong light | 12 compute programs need 64-lane waves and are dropped on NVIDIA; 2 more do not translate. The blocks are believed to come from these |
-| Black skin, metal-looking clothes, bare ground | Textures or materials missing. Cause not known |
-| Characters frozen in a cutscene, sound broken | Seen after a long freeze. Two faults in the sound code that could do this are fixed; not confirmed in a run yet |
-| Shadowed areas black | Ray-traced light is off (above) |
-| Access violations in the title's own code | Reported by others on builds from before `350a7c3`. Cause not known |
+| Low frame rate | The submitting thread: about 100 of 108 ms of a usual frame in the last run, 78 of it preparing (copying memory for the card). The card's own work was 43 ms |
+| Water wholly black in some scenes, dark squares elsewhere | Open. Seen in three builds with different settings |
+| Eyes white in some shots | Open. The same shot, when a face is lit from the front, so it looks tied to light or view angle (not proven) |
+| Black clothes and objects for a moment, textures that come in late | Textures wait for room on a 12 GB card (thousands at times) |
+| Coarse, blocky characters and missing walls in cutscenes | Open. Likely the title's models come in late |
+| Clouds look smooth and blobby | Open |
+| A new graphics driver | makes the saved pipelines invalid: the first run afterwards builds hundreds and can stutter for seconds |
+| Memory | about 20 GB used; Windows can have less than 1 GB free. Close other programs |
+| Square blocks or wrong light on some effects | Not all programs of the title translate for 32-lane cards. The log names them |
 
 ## Make it run better
 
@@ -115,7 +119,8 @@ Other PCs will differ.
 | `VICTORY_TEXTURE_BUDGET_MB=<n>` | at most this much card memory for those textures: less pressure on memory, blurrier picture |
 | `VICTORY_CARD_BUFFERS_MB`, `VICTORY_CARD_WINDOWS_MB` | how much of the title's memory is copied to the card (`VICTORY_CARD_WINDOWS_MB=0`: no windows) |
 | `VICTORY_SHADER_OPT=0` | no clean-up of translated shaders: try it if you see black blocks. Everything is translated again |
-| `VICTORY_BVH_BUILDER=1` | asks for ray tracing. It stays off where programs are missing, and the log says which |
+| `VICTORY_BVH_BUILDER=1` | asks for ray tracing. Slow (about 4 fps), and not tested with the merged build apart from one run that hung |
+| `--work cpu`, `balanced`, `gpu` (`victory run`) | where work is done that both sides can do; `balanced` is the measured choice and the launcher's default |
 
 More switches are described in comments where the code reads them.
 
@@ -143,21 +148,26 @@ screenshots or shader dumps** ([asset policy](docs/asset-policy.md)).
 ## Controls
 
 XInput pads work. Without one, keyboard and mouse stand in while the window has
-focus:
+focus. There are two layouts, one on foot and one for driving; **G** switches
+between them. They are in `keys.txt` in the data folder, which the running title
+reads again within a second, and the launcher has a **Keys...** button for it.
 
-| Pad | Keyboard and mouse |
-|-----|--------------------|
-| left trigger (aim), right trigger (fire) | right click, left click (or U, O) |
-| right stick | mouse (or I J K L) |
-| left stick | W A S D |
-| A | left Shift, Enter |
-| B | R, Backspace |
-| X | Space, X |
-| Y | F, Y |
-| left / right shoulder | Tab / Q (or the mouse's back / forward buttons) |
-| left / right stick click | left Ctrl, Z / C, H, middle click |
-| D-pad up, down, left, right | arrows (or 1, 2, 3, 4); E is right too |
-| Menu, View | Esc, P / V |
+| On foot | Keys |
+|---|---|
+| Move, look | W A S D, the mouse (or I J K L) |
+| Aim, fire | right click, left click |
+| A, B | Shift or Enter, R or Backspace |
+| X, Y | Space or X, F or Y |
+| Shoulders | Tab, Q |
+| Stick clicks | Ctrl (crouch), C or middle click |
+| D-pad | arrows, or 1 2 3 4 |
+| Menu, View | Esc, V |
+
+| Driving | Keys |
+|---|---|
+| Accelerate, brake | W, S |
+| Steer | A, D |
+| Left shoulder, right shoulder | left or right click, Space |
 
 Click in the window to give it the mouse (that click presses nothing); left Alt
 or switching windows gives it back. `VICTORY_MOUSE_SENSITIVITY=1.5` turns
@@ -243,7 +253,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight; for a list that does not close, its commands |
-| `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
+| `VICTORY_PIPELINE_WAIT_MS=24` | the longest a frame waits for pipelines being made (500 ms by default, 24 with every `--work` choice). A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with `VICTORY_D3D12_DRED=1`, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
@@ -262,6 +272,12 @@ title's data folder.
   kept.
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** and its
   contributors: many changes here come from there, each credited in its commit.
+- **[soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)**:
+  the GPU and shader engine this branch is built on.
+- Parts ported or merged from WillyboPeep's, PastiiJay's (klbf), LeonardoS11's,
+  myokex's (victory-amd), reddxd-byte's (ShakiraRED, with Belobug's ambient
+  light), clankenjoyer's and tippythetaidum's forks or pull requests, each
+  credited in its commit.
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
