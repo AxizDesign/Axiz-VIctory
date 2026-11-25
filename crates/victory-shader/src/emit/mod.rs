@@ -2279,15 +2279,148 @@ mod barycentric_tests {
         validate(&shader);
     }
 
-    #[test]
+    /// Draws `ps` over an 8x8 target whose TEXCOORD0.x is 2 + (y + 0.5) / 4
+    /// + (x + 0.5) / 2 (with `size` 2; with 1, a triangle of half the target
+    /// and twice the steps); calls `check(backend, pixel, texel)` per pixel.
     #[cfg(windows)]
-    fn first_half_values_render_on_hardware_and_warp() {
-        use super::bitcode::{Attr, Term};
+    fn on_each_pixel(ps: &HostShader, size: f32, mut check: impl FnMut(&str, usize, [f32; 4])) {
         use super::host::{Draw, Host};
-        use super::shader::Shader;
+        use windows::Win32::Graphics::Direct3D12::*;
         let _one = super::valu_tests::ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let vs = passthrough();
+        validate(ps);
+        let vertices = [
+            [-1.0, 1.0, 0.5, 1.0, 2.0, 0.0, 0.0, 0.0],
+            [-1.0, 1.0 - 2.0 * size, 0.5, 1.0, 6.0, 0.0, 0.0, 0.0],
+            [2.0 * size - 1.0, 1.0, 0.5, 1.0, 10.0, 0.0, 0.0, 0.0],
+        ];
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: a correctly sized output for the feature query.
+            unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .unwrap();
+            }
+            if !options.BarycentricsSupported.as_bool() {
+                eprintln!("no barycentrics on {backend}; skipped");
+                continue;
+            }
+            let (root, pso) = host.pipeline(&vs, ps).expect("pipeline");
+            let draw = Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices: vertices.as_flattened(),
+                stride: 32,
+                size: (8, 8),
+                mesh_groups: 0,
+            };
+            let out = host.draw(&root, &pso, &draw).expect("draw");
+            for (n, &texel) in out.iter().enumerate() {
+                check(backend, n, texel);
+            }
+        }
+    }
+
+    /// Pixels below 4 are discarded, the console's way (`s_andn2` of the
+    /// live mask, then whole quads again); the others give the difference
+    /// of their row's two pixels, discarded or not: alpha-tested hair takes
+    /// its texture's level from such a difference.
+    #[test]
+    #[cfg(windows)]
+    fn derivatives_after_a_discard_read_the_discarded_neighbours() {
+        let ps = pixel(
+            &[
+                0xBE82037E, // s_mov_b32 s2, exec_lo
+                0xBEFE097E, // s_wqm_b32 exec_lo, exec_lo
+                0xC8080000, 0xC8090001, // v_interp_p1/p2_f32 v2, attr0.x
+                0x7E0802F6, // v_mov_b32 v4, 4.0
+                0x7C280504, // v_cmpx_gt_f32 v4, v2
+                0x8A027E02, // s_andn2_b32 s2, s2, exec_lo
+                0xBF84000A, // s_cbranch_scc0 no lane left
+                0xBEFE0902, // s_wqm_b32 exec_lo, s2
+                0x7E0602FA, 0xFF000002, // v_mov_b32 v3, v2 quad_perm:[0,0,0,0]
+                0x7E0A02FA, 0xFF005502, // v_mov_b32 v5, v2 quad_perm:[1,1,1,1]
+                0x08060705, // v_sub_f32 v3, v5, v3
+                0xBEFE0302, // s_mov_b32 exec_lo, s2
+                0xF800180F, 0x03030203, // exp mrt0 v3, v2, v3, v3 done vm
+                0xBF810000,
+                0xBEFE0380, // no lane left: s_mov_b32 exec_lo, 0
+                0xF8001890, 0x00000000, // exp null done vm
+                0xBF810000,
+            ],
+            PERSP_CENTER,
+        )
+        .unwrap();
+        on_each_pixel(&ps, 2.0, |backend, n, t| {
+            let v = 2.0 + ((n / 8) as f32 + 0.5) / 4.0 + ((n % 8) as f32 + 0.5) / 2.0;
+            if v < 4.0 {
+                assert_eq!(t, [0.0; 4], "{backend} pixel {n}: discarded");
+            } else {
+                assert!((t[1] - v).abs() < 1e-5, "{backend} pixel {n}: {t:?}, value {v}");
+                assert!((t[0] - 0.5).abs() < 1e-5, "{backend} pixel {n}: difference {}", t[0]);
+            }
+        });
+    }
+
+    /// A loop over the distinct values of the wave's lanes (as a loop over
+    /// materials or lights), whole quads: helper lanes, past the edge of the
+    /// triangle, must leave it too, with their own value.
+    #[test]
+    #[cfg(windows)]
+    fn a_loop_over_first_lanes_ends_for_helper_lanes() {
+        let ps = pixel(
+            &[
+                0xBE82037E, // s_mov_b32 s2, exec_lo
+                0xBEFE097E, // s_wqm_b32 exec_lo, exec_lo
+                0xC8080000, 0xC8090001, // v_interp_p1/p2_f32 v2, attr0.x
+                0x7E060F02, // v_cvt_u32_f32 v3, v2
+                0x7E080280, // v_mov_b32 v4, 0
+                0xBE84037E, // s_mov_b32 s4, exec_lo
+                0x7E0A0503, // loop: v_readfirstlane_b32 s5, v3
+                0xBE86037E, // s_mov_b32 s6, exec_lo
+                0x7DA40605, // v_cmpx_eq_u32 s5, v3
+                0x7E080D03, // v_cvt_f32_u32 v4, v3
+                0x8A7E7E06, // s_andn2_b32 exec_lo, s6, exec_lo
+                0xBF89FFFA, // s_cbranch_execnz loop
+                0xBEFE0304, // s_mov_b32 exec_lo, s4
+                0x7E0A02FA, 0xFF000004, // v_mov_b32 v5, v4 quad_perm:[0,0,0,0]
+                0x7E0C02FA, 0xFF00FF04, // v_mov_b32 v6, v4 quad_perm:[3,3,3,3]
+                0xBEFE0302, // s_mov_b32 exec_lo, s2
+                0xF800180F, 0x02060504, // exp mrt0 v4, v5, v6, v2 done vm
+                0xBF810000,
+            ],
+            PERSP_CENTER,
+        )
+        .unwrap();
+        on_each_pixel(&ps, 1.0, |backend, n, t| {
+            let v = |x: usize, y: usize| 2.0 + (y as f32 + 0.5) / 2.0 + (x as f32 + 0.5);
+            let (x, y) = (n % 8, n / 8);
+            if x + y >= 7 {
+                return; // on the edge of the triangle, or past it
+            }
+            let want = [
+                v(x, y).floor(),
+                v(x & !1, y & !1).floor(),
+                v(x | 1, y | 1).floor(),
+            ];
+            assert_eq!(t[..3], want, "{backend} pixel {n}");
+        });
+    }
+
+    /// Passes POSITION and TEXCOORD through.
+    #[cfg(windows)]
+    fn passthrough() -> HostShader {
+        use super::bitcode::{Attr, Term};
+        use super::shader::Shader;
         // Pass POSITION and TEXCOORD through, with TEXCOORD in the same
         // output row as the translated pixel shader's input signature.
         let mut s = Shader::new(false);
@@ -2316,7 +2449,7 @@ mod barycentric_tests {
             }
         }
         s.m.terminate(s.entry, Term::Ret);
-        let vs = HostShader {
+        HostShader {
             stage: HwStage::Vs,
             dxil: s.finish(),
             user_data: Vec::new(),
@@ -2326,7 +2459,17 @@ mod barycentric_tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn first_half_values_render_on_hardware_and_warp() {
+        use super::host::{Draw, Host};
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let vs = passthrough();
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
         let vertices = [
