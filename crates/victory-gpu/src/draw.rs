@@ -401,6 +401,38 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Of [`HEAP_BUFFER_MICROS`], what the textures took.
+pub(crate) static HEAP_TEXTURE_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// How long a pass over the textures picked by index may take, in
+/// milliseconds: `most`, but no more than `share` percent of what the rest
+/// of the frame takes (`took` since the last pass, of which that pass
+/// `passed`), and at least `LEAST` so that a backlog always drains. A
+/// `share` of 0 is no limit.
+fn texture_span(most: u64, took: u64, passed: u64, share: u64) -> u64 {
+    const LEAST: u64 = 16;
+    if share == 0 {
+        return most;
+    }
+    let rest = took.saturating_sub(passed);
+    most.min((rest * share / 100).max(LEAST))
+}
+
+#[cfg(test)]
+#[test]
+fn the_texture_pass_is_held_to_a_share_of_the_frame() {
+    // A backlog's 750 ms beside 120 ms of other work: 40 ms.
+    assert_eq!(texture_span(750, 270, 150, 33), 39);
+    // Quick frames: the least, which still drains a backlog.
+    assert_eq!(texture_span(250, 33, 2, 33), 16);
+    // A budget below the least stays as asked.
+    assert_eq!(texture_span(5, 33, 2, 33), 5);
+    // A long frame: the budget as before.
+    assert_eq!(texture_span(250, 5000, 250, 33), 250);
+    // Off, and a pass that took longer than the time since it began.
+    assert_eq!(texture_span(750, 33, 2, 0), 750);
+    assert_eq!(texture_span(750, 10, 40, 33), 16);
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1585,7 +1617,9 @@ impl State {
             due.push((shadow.clone(), *from as usize, shadow.left(*from).min(to - from) as usize));
         }
         let _ = pass.spans.set(due);
+        let textures = std::time::Instant::now();
         self.heap_textures(list, heap, host);
+        HEAP_TEXTURE_MICROS.fetch_add(textures.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1739,6 +1773,8 @@ impl State {
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
+        // What the last pass took, of that time.
+        static PASS_TOOK: AtomicU64 = AtomicU64::new(0);
         let most = (4000 / took).clamp(16, 256);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
@@ -1772,9 +1808,30 @@ impl State {
             Some((ms, bytes)) => {
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
             }
-            None => (span, per_frame),
+            None => {
+                // The pass runs on a thread that records the frame: with a
+                // backlog it took 80-500 ms of every frame of a scene
+                // (2026-11-25), for textures that were let go and uploaded
+                // again all along. A third of the rest of the frame;
+                // `VICTORY_TEXTURE_SHARE` sets another percentage (0: none).
+                static SHARE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let share = *SHARE.get_or_init(|| {
+                    std::env::var("VICTORY_TEXTURE_SHARE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(33)
+                });
+                let most = span.as_millis() as u64;
+                let held = texture_span(most, took, PASS_TOOK.load(Ordering::Relaxed), share);
+                (std::time::Duration::from_millis(held), per_frame)
+            }
         };
         let began = std::time::Instant::now();
+        // Noted however the pass ends.
+        struct Noted(std::time::Instant);
+        impl Drop for Noted {
+            fn drop(&mut self) {
+                PASS_TOOK.store(self.0.elapsed().as_millis() as u64, Ordering::Relaxed);
+            }
+        }
+        let _noted = PASS_BUDGET.get().is_none().then(|| Noted(began));
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
