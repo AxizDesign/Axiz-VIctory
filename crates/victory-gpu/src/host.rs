@@ -605,7 +605,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            device = Some(pick_device()?);
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -695,6 +695,127 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// What the translated shaders cannot do without, of what `device` lacks:
+/// shader model 6.6 (heaps indexed directly, 64-bit atomics), resource
+/// binding tier 3 (the title's whole view heap) and wave operations.
+fn lacks(device: &ID3D12Device) -> Vec<String> {
+    let mut lacks = Vec::new();
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: each query writes its own structure of the given size.
+    unsafe {
+        // (The query fails for a model the runtime does not know.)
+        if device
+            .CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut model).cast(), size_of_val(&model) as u32)
+            .is_err()
+            || model.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0
+        {
+            lacks.push("shader model 6.6".into());
+        }
+        if device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut options).cast(), size_of_val(&options) as u32)
+            .is_err()
+            || options.ResourceBindingTier.0 < D3D12_RESOURCE_BINDING_TIER_3.0
+        {
+            lacks.push("resource binding tier 3".into());
+        }
+        if device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut waves).cast(), size_of_val(&waves) as u32)
+            .is_err()
+            || !waves.WaveOps.as_bool()
+        {
+            lacks.push("wave operations".into());
+        }
+    }
+    lacks
+}
+
+/// The adapters' order of trying: the ones `VICTORY_ADAPTER` names (a part
+/// of the name, or the place in the system's list), then the rest as the
+/// system lists them, fastest first, software last.
+fn adapter_order(adapters: &[(String, bool)], wanted: Option<&str>) -> Vec<usize> {
+    let wanted = wanted.map(|w| w.trim().to_lowercase()).filter(|w| !w.is_empty());
+    let named = |i: usize| {
+        wanted.as_ref().is_some_and(|w| match w.parse::<usize>() {
+            Ok(n) => n == i,
+            Err(_) => adapters[i].0.to_lowercase().contains(w),
+        })
+    };
+    let mut order: Vec<usize> = (0..adapters.len()).collect();
+    order.sort_by_key(|&i| (!named(i), adapters[i].1));
+    order
+}
+
+/// The device of the first adapter that can run the translated shaders. The
+/// system's default adapter is the one its first screen is on, which on a
+/// laptop is the processor's, beside a card many times as fast. Where none
+/// can, the first one's, and what it lacks is said.
+fn pick_device() -> windows::core::Result<ID3D12Device> {
+    let make = |adapter: Option<&IDXGIAdapter1>| -> windows::core::Result<ID3D12Device> {
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation.
+        unsafe {
+            match adapter {
+                Some(a) => D3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
+        }
+        device.ok_or_else(windows::core::Error::empty)
+    };
+    let mut adapters: Vec<(IDXGIAdapter1, String, bool)> = Vec::new();
+    // SAFETY: plain DXGI enumeration.
+    unsafe {
+        if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) {
+            while let Ok(adapter) =
+                factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(adapters.len() as u32, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            {
+                let (name, software) = adapter.GetDesc1().map_or((String::new(), false), |d| {
+                    let len = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                    (
+                        String::from_utf16_lossy(&d.Description[..len]),
+                        d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+                    )
+                });
+                adapters.push((adapter, name, software));
+            }
+        }
+    }
+    let wanted = std::env::var("VICTORY_ADAPTER").ok();
+    let list: Vec<(String, bool)> = adapters.iter().map(|a| (a.1.clone(), a.2)).collect();
+    let mut first: Option<(ID3D12Device, String, Vec<String>)> = None;
+    for i in adapter_order(&list, wanted.as_deref()) {
+        let (adapter, name, software) = &adapters[i];
+        match make(Some(adapter)) {
+            Ok(device) => {
+                let lacks = lacks(&device);
+                if lacks.is_empty() {
+                    tracing::info!(adapter = %name, software, "host adapter");
+                    if *software {
+                        tracing::warn!("no graphics card can run this: the software adapter will be very slow");
+                    }
+                    return Ok(device);
+                }
+                tracing::warn!(adapter = %name, ?lacks, "an adapter that cannot run the translated shaders is passed over");
+                first.get_or_insert((device, name.clone(), lacks));
+            }
+            Err(e) => tracing::warn!(adapter = %name, error = %e, "no Direct3D 12 device on an adapter"),
+        }
+    }
+    if let Some((device, name, lacks)) = first {
+        tracing::error!(
+            adapter = %name,
+            ?lacks,
+            "no adapter of this PC can run the translated shaders; a newer graphics driver or Windows version may help"
+        );
+        return Ok(device);
+    }
+    // Where the system lists none (or not in this order): its own choice.
+    make(None)
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -755,6 +876,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn adapters_are_tried_by_name_then_speed_and_software_last() {
+        let a = [
+            ("Integrated Graphics".to_owned(), false),
+            ("Basic Render Driver".to_owned(), true),
+            ("Big Card 5070".to_owned(), false),
+        ];
+        let order = |wanted| super::adapter_order(&a, wanted);
+        assert_eq!(order(None), [0, 2, 1]);
+        assert_eq!(order(Some("big card")), [2, 0, 1]);
+        assert_eq!(order(Some(" 1 ")), [1, 0, 2]);
+        assert_eq!(order(Some("nothing like it")), [0, 2, 1]);
+        assert_eq!(order(Some("")), [0, 2, 1]);
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -1710,6 +1846,9 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// The refreshes of a descriptor heap's buffer views, for shaders that
+    /// pick them by index.
+    Heap(std::sync::Arc<HeapPass>),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
@@ -1721,6 +1860,64 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+}
+
+/// What a frame's shaders that pick buffers from one descriptor heap by an
+/// index may read: the spans of the host copies the heap's views show.
+/// Every list that runs such shaders has it ([`Step::Heap`]); the first
+/// submission with one of those lists brings the spans up to date, ahead of
+/// its lists. (The list that was recorded first had the refreshes, for the
+/// frame's lists of all heaps: the others read stale copies where that list
+/// was submitted behind them, or never, or the heap was another.)
+/// shortcut: what the title writes there between two submissions of one
+/// frame is seen a frame late.
+#[derive(Default)]
+pub(crate) struct HeapPass {
+    /// Set when the recording thread that makes the pass is done with it.
+    pub(crate) spans: OnceLock<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>>,
+    /// The number of the submission that brings them up to date (0: none
+    /// yet).
+    taken: std::sync::atomic::AtomicU64,
+}
+
+impl HeapPass {
+    /// The spans still to be brought up to date.
+    fn open(&self) -> &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)] {
+        if self.taken.load(Ordering::Acquire) == 0 {
+            self.spans.get().map_or(&[], Vec::as_slice)
+        } else {
+            &[]
+        }
+    }
+
+    /// The spans, if submission `number` is the one that brings them up to
+    /// date.
+    fn take(&self, number: u64) -> &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)] {
+        let Some(spans) = self.spans.get() else {
+            return &[];
+        };
+        match self.taken.compare_exchange(0, number, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => spans,
+            Err(taken) if taken == number => spans,
+            Err(_) => &[],
+        }
+    }
+}
+
+impl Step {
+    /// The ranges of host copies the step brings up to date in the next
+    /// submission it is part of.
+    fn each_refresh(&self, mut each: impl FnMut(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)) {
+        match self {
+            Step::Refresh(shadow, address, len) => each(shadow, *address, *len),
+            Step::Heap(pass) => {
+                for (shadow, address, len) in pass.open() {
+                    each(shadow, *address, *len);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2343,9 +2540,10 @@ fn blocked_in(line: &Line, runs: &[&HostList], count: bool) -> Option<usize> {
 /// Whether `runs` bring host copies up to date with any of `ranges`.
 fn refreshes(ranges: &[(usize, usize)], runs: &[&HostList]) -> bool {
     runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            Step::Refresh(_, at, len) => touches(ranges, *at, *at + *len),
-            _ => false,
+        list.deferred().copies.iter().any(|step| {
+            let mut found = false;
+            step.each_refresh(|_, at, len| found = found || touches(ranges, at, at + len));
+            found
         })
     })
 }
@@ -2388,7 +2586,7 @@ fn blocked_by_steps<'a>(
                 }
             }
             Step::Run(_) => return Some((WHY_RUN, None)),
-            Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+            Step::Refresh(..) | Step::Heap(_) | Step::GpuWrite(..) | Step::Host(_) => {}
         }
     }
     read_stat.map(|stat| (WHY_READ, stat))
@@ -2436,14 +2634,15 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
-            {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+            step.each_refresh(|shadow, address, len| {
+                if !shadow.writes_pending() {
+                    return;
                 }
-            }
+                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
+                    Some(s) => (s.1, s.2) = (s.1.min(address), s.2.max(address + len)),
+                    None => spans.push((shadow.clone(), address, address + len)),
+                }
+            });
         }
     }
     if late_exact() {
@@ -2991,8 +3190,11 @@ fn read_backs(list: &HostList) {
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
+                // (With submissions sent ahead the title may have let go of
+                // the memory, or a texture's guard may have been laid over
+                // it, since the copy was recorded.)
                 for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                    write_mapped((*at as *mut u8).wrapping_add(line * pitch), from.add(line * row.next_multiple_of(256)), *row);
                 }
                 buffer.Unmap(0, None);
             }
@@ -4366,7 +4568,10 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch {
+            number: this_submission,
+            ..Default::default()
+        };
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -4377,14 +4582,14 @@ impl Host {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
-                    }
+                    step.each_refresh(|shadow, address, len| {
+                        if !shadow.unwatched() {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((address, address + len));
+                            *span = (span.0.min(address), span.1.max(address + len));
+                        }
+                    });
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
@@ -5382,6 +5587,11 @@ impl HostList {
         }
     }
 
+    /// The list's shaders pick buffers from the heap `pass` is of.
+    pub(crate) fn defer_heap(&self, pass: std::sync::Arc<HeapPass>) {
+        self.deferred().copies.push(Step::Heap(pass));
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
@@ -5860,6 +6070,14 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
+                Step::Heap(pass) => {
+                    if batch.heaps.insert(std::sync::Arc::as_ptr(pass) as usize) {
+                        for (shadow, address, len) in pass.take(batch.number) {
+                            batch.add(shadow, *address, *len);
+                        }
+                    }
+                    continue;
+                }
                 Step::Run(work) | Step::Host(work) | Step::HostRead(_, _, work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
@@ -5971,6 +6189,10 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Heap passes (by address) added since the last title write.
+    heaps: std::collections::HashSet<usize>,
+    /// The submission's number.
+    number: u64,
 }
 
 type ShadowRefresh = (std::sync::Arc<crate::shadow::Shadow>, RefreshRanges);
@@ -6069,6 +6291,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.heaps.clear();
     }
 
     fn flush(&mut self) {

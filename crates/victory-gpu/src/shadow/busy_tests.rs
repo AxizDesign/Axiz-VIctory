@@ -448,3 +448,78 @@ fn refreshed_ranges_hold_title_memory_whatever_was_written() {
     unregister(inner, inner as u64);
     unregister(p, p as u64);
 }
+
+/// The buffers a heap's views show are brought up to date by the submission
+/// that needs them first, whichever of the frame's lists was recorded first.
+#[test]
+fn a_heaps_buffers_are_ready_for_the_list_submitted_first() {
+    if crate::host::host().is_none() {
+        return;
+    }
+    let (p, out) = (pool(4 * PAGE), pool(PAGE));
+    for (at, len) in [(p, 4 * PAGE), (out, PAGE)] {
+        register(at, at as u64, len as u64);
+    }
+    let copy = find(p as u64, 4 * PAGE as u64).unwrap();
+    let result = find(out as u64, 4).unwrap();
+    let work = reader();
+    let queue = title_queue();
+    let shown = p + PAGE + 64;
+    let record = |pass: &Arc<crate::host::HeapPass>| {
+        let list = title_list();
+        let h = crate::list::host_list(list).unwrap();
+        h.defer_heap(pass.clone());
+        result.refresh(h, out as u64, 4);
+        result.gpu_writes(h, out as u64, 4);
+        for o in [&copy.buffer, &result.buffer] {
+            h.keep(o);
+        }
+        h.keep(&work.0);
+        h.keep(&work.1);
+        // SAFETY: an open list and live objects.
+        unsafe {
+            h.list.SetComputeRootSignature(&work.0);
+            h.list.SetPipelineState(&work.1);
+            h.list.SetComputeRootShaderResourceView(0, copy.gpu(shown as u64));
+            h.list.SetComputeRootUnorderedAccessView(1, result.gpu(out as u64));
+            h.list.Dispatch(1, 1, 1);
+        }
+        close(list);
+        list
+    };
+    let write = |value: u32| {
+        // SAFETY: a dword of ours.
+        unsafe { (shown as *mut u32).write_volatile(value) }
+    };
+    let read = || {
+        crate::host::settle_for_fence();
+        // SAFETY: a dword of ours.
+        unsafe { (out as *const u32).read_volatile() }
+    };
+    let pass: Arc<crate::host::HeapPass> = Arc::default();
+    let (first, second, third) = (record(&pass), record(&pass), record(&pass));
+    // The recording thread that makes the pass is not done yet: nothing to
+    // go by, and nothing is taken for done.
+    write(1);
+    submit(queue, &[first]);
+    let _ = pass.spans.set(vec![(copy.clone(), p, 4 * PAGE)]);
+    write(2);
+    submit(queue, &[second]);
+    assert_eq!(read(), 2, "the list recorded second, submitted before the rest");
+    // Once a frame.
+    write(3);
+    submit(queue, &[third]);
+    assert_eq!(read(), 2);
+    // The next frame's pass.
+    let pass: Arc<crate::host::HeapPass> = Arc::default();
+    let _ = pass.spans.set(vec![(copy.clone(), p, 4 * PAGE)]);
+    let fourth = record(&pass);
+    submit(queue, &[fourth]);
+    assert_eq!(read(), 3);
+    for list in [first, second, third, fourth] {
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(list, 0x10)(list);
+    }
+    for at in [p, out] {
+        unregister(at, at as u64);
+    }
+}

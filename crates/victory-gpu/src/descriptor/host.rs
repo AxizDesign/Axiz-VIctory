@@ -123,6 +123,9 @@ pub(crate) struct HostHeap {
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
     pub(crate) buffers: BufferViews<std::sync::Arc<crate::shadow::Shadow>>,
+    /// The frame's pass over those views ([`crate::host::HeapPass`]), and
+    /// the frame.
+    pub(crate) pass: Mutex<(u64, std::sync::Arc<crate::host::HeapPass>)>,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -804,6 +807,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: BufferViews::new(),
+            pass: Mutex::new((u64::MAX, Default::default())),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
