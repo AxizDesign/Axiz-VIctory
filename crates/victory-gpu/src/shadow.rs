@@ -77,6 +77,8 @@ pub(crate) struct Shadow {
     /// Asks for the copy that gave no length (root views: they read from
     /// their address to the copy's end, whatever lies there).
     unsized_asks: AtomicU64,
+    /// With `crate::stamp` on: the pages checked in this submission.
+    stamp: crate::stamp::Stamp,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -2728,6 +2730,7 @@ impl Shadow {
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
+            stamp: crate::stamp::Stamp::default(),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -3447,6 +3450,29 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // Around ranges shaders are writing: the gaps, each as below (in
+        // the world most submissions have such ranges; copying the gaps
+        // whole cost ~1 s per frame).
+        // Checked already (`crate::stamp`): each gap on its own. The sequence
+        // is read before the check, so what is written during it is not
+        // marked as seen.
+        let seq = crate::stamp::on().then(crate::stamp::now);
+        let mut bytes = 0;
+        self.gaps(from, to, |a, e| {
+            if seq.is_some_and(|seq| self.stamp.current(seq, a, e, start, end)) {
+                return;
+            }
+            bytes += self.update_free(a, e);
+            if let Some(seq) = seq {
+                self.stamp.mark(seq, a, e, start, end);
+            }
+        });
+        bytes
+    }
+
+    /// Calls `f` with the parts of `[from, to)` (inside the buffer) no range
+    /// shaders may be writing holds, in order.
+    fn gaps(&self, from: usize, to: usize, mut f: impl FnMut(usize, usize)) {
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -3455,24 +3481,36 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
-        if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                if a > at {
-                    bytes += self.update_free(at, a);
-                }
-                at = at.max(e);
+        busy.sort_unstable();
+        let mut at = from;
+        for (a, e) in busy {
+            if a > at {
+                f(at, a);
             }
-            if at < to {
-                bytes += self.update_free(at, to);
-            }
-            return bytes;
+            at = at.max(e);
         }
-        self.update_free(from, to)
+        if at < to {
+            f(at, to);
+        }
+    }
+
+    /// With `crate::stamp` on: whether `[address, address + len)` was
+    /// checked whole in this submission already (a refresh of it has
+    /// nothing to do).
+    pub(crate) fn current(&self, address: usize, len: usize) -> bool {
+        if !crate::stamp::on() {
+            return false;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if self.place.is_some() || from >= to {
+            return true;
+        }
+        // Ranges shaders may be writing are not refreshed anyway.
+        let seq = crate::stamp::now();
+        let mut current = true;
+        self.gaps(from, to, |a, e| current = current && self.stamp.current(seq, a, e, start, end));
+        current
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no

@@ -347,6 +347,7 @@ fn ask_now(ranges: &[(usize, usize)], views: bool) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
+    crate::stamp::advance();
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     if j.kept {
         j.kept = false;
@@ -359,6 +360,8 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    // Copies checked over it check again (`crate::stamp`).
+    crate::stamp::advance();
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     if !j.kept || len == 0 {
         return;
@@ -385,6 +388,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// last found `page` written (0: never) and the new one, for the copy
 /// that wrote to note itself current.
 pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
+    crate::stamp::advance();
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     j.asked += 1;
@@ -1423,6 +1427,8 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    // Copies checked in this submission check again (`crate::stamp`).
+    crate::stamp::advance();
     // The length is the title's (`fread`'s size times count, saturated).
     let end = at.saturating_add(len);
     // Nothing there is guarded, as for most of our own writes: nothing to
@@ -1490,6 +1496,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    crate::stamp::advance();
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -1744,6 +1751,7 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::stamp::advance();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
