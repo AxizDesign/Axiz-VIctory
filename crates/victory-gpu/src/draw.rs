@@ -2399,7 +2399,7 @@ impl State {
         &mut self,
         list: &HostList,
         record: (u32, u32, u32),
-        arguments: u64,
+        arguments: &std::ops::Range<u64>,
         count: Option<u64>,
     ) -> bool {
         let builder = crate::pipeline::is_builder(self.pipeline as This);
