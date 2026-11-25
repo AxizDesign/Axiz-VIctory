@@ -710,7 +710,10 @@ fn write_out(dir: &std::path::Path, library: &Library) {
             size
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    // With what earlier runs listed: a run that asks for no title pipeline
+    // (`victory warm`) wrote an empty list over theirs, and the next world
+    // began with every pipeline still to be asked for.
+    let used: Vec<String> = used().iter().flatten().cloned().collect();
     let library_written = if bytes > 0 {
         replace_library(dir, &tmp).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
