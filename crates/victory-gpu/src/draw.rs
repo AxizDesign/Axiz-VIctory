@@ -544,9 +544,11 @@ pub(crate) enum Into<'a> {
 }
 
 /// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
-/// picked by index that runs inside it (`heap_textures`), and the buffer
-/// slots the pass over buffer views looked at; since the last frame line.
-pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// picked by index that runs inside it (`heap_textures`), the buffer slots
+/// the pass over buffer views looked at, the microseconds of those looks
+/// and of the refreshes of the copies they read, and those copies; since
+/// the last frame line.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1587,37 +1589,44 @@ impl State {
         }
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        // reads, kept from pass to pass. Only the slots marked since the
+        // last pass are looked at again (`crate::heap_pass`: written, their
+        // view's resource released, their record copied past the API, no
+        // host copy yet); 83,000 slots a pass otherwise, 0.1 s at best.
+        // `VICTORY_HEAP_PASS_FULL=1`: all of them every 16 passes, as before.
+        type Picked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, Picked>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
-            .get_or_insert_with(Default::default)
+        let heaps = kept.get_or_insert_with(Default::default);
+        // One list of freed table entries for all heaps: each heap's pass is told.
+        let forgotten = crate::descriptor::take_forgotten();
+        for picked in heaps.values_mut() {
+            picked.note_forgotten(forgotten.as_deref());
+        }
+        let ranges = heaps
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_insert_with(|| Picked::new(crate::heap_pass::full_pass()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
-        *passes += 1;
+        let slots = ranges.plan(
+            changed,
+            || host.buffer_slots(),
+            |index| heap.handle(index).map(crate::descriptor::record_at),
+            crate::descriptor::record_entry,
+        );
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
+            ranges.forget(index);
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
+            // Read before the slot is made: a write after it is seen next pass.
+            let record = crate::descriptor::record_at(handle);
+            let entry = crate::descriptor::record_entry(record);
             let Some(view) = host.mirror(index, handle, true) else {
                 continue;
             };
@@ -1639,26 +1648,29 @@ impl State {
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                // A buffer view whose memory has no host copy (yet): tried
+                // again every 16 passes. (Other views: left out until
+                // written, as before.)
+                if crate::descriptor::host::buffer_range(&view).is_some_and(|(_, len)| len > 0) {
+                    ranges.orphan(index, record, entry);
+                }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            let unordered =
+                matches!(view, crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(true, ..));
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            ranges.keep(index, key, &shadow, [address, address + len], record, entry, unordered);
         }
-        let views = ranges.len() as u32;
+        let views = ranges.views() as u32;
+        let looked = started.elapsed();
         // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
-        }
+        let spans = ranges.spans();
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1669,7 +1681,7 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, from, to) in &spans {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
@@ -1691,6 +1703,9 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        HEAP_PASS_PARTS[2].fetch_add(looked.as_micros() as u64, Ordering::Relaxed);
+        HEAP_PASS_PARTS[3].fetch_add((started.elapsed() - looked).as_micros() as u64, Ordering::Relaxed);
+        HEAP_PASS_PARTS[4].fetch_add(spans.len() as u64, Ordering::Relaxed);
         let textures_began = std::time::Instant::now();
         if !crate::heap_worker::kick(heap) {
             Self::heap_textures(Into::List(list), heap, host);

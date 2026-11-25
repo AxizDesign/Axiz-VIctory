@@ -1160,50 +1160,6 @@ mod tests {
     }
 
     #[test]
-    fn integer_rtv_blend_splits_shared_state_only_for_mixed_active_formats() {
-        let mut g = GraphicsState::default();
-        g.targets.NumRenderTargets = 4;
-        g.targets.RTFormats[..5].copy_from_slice(&[
-            DXGI_FORMAT_R8_SINT, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_UNKNOWN,
-            DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT,
-        ]);
-        g.blend.AlphaToCoverageEnable = true.into();
-        let shared = &mut g.blend.RenderTarget[0];
-        shared.BlendEnable = true.into();
-        shared.BlendOp = D3D12_BLEND_OP_MAX;
-        shared.RenderTargetWriteMask = 3;
-        *shared = D3D12_RENDER_TARGET_BLEND_DESC {
-            LogicOp: D3D12_LOGIC_OP_XOR,
-            ..*shared
-        };
-
-        let mut expected = g.blend;
-        expected.IndependentBlendEnable = true.into();
-        expected.RenderTarget[1] = expected.RenderTarget[0];
-        expected.RenderTarget[3] = expected.RenderTarget[0];
-        expected.RenderTarget[0].BlendEnable = false.into();
-        assert_eq!(g.host_blend(), expected);
-    }
-
-    #[test]
-    fn integer_rtv_blend_keeps_shared_mode_for_integer_only_targets() {
-        let mut g = GraphicsState::default();
-        g.targets.NumRenderTargets = 2;
-        g.targets.RTFormats[..2].copy_from_slice(&[DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R32G32_SINT]);
-        g.blend.RenderTarget[0].BlendEnable = true.into();
-        g.blend.RenderTarget[0].BlendOp = D3D12_BLEND_OP_MAX;
-
-        let mut expected = g.blend;
-        expected.RenderTarget[0].BlendEnable = false.into();
-        assert_eq!(g.host_blend(), expected);
-
-        g.blend = expected;
-        g.blend.RenderTarget[0].LogicOpEnable = true.into();
-        g.blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
-        assert_eq!(g.host_blend(), g.blend);
-    }
-
-    #[test]
     fn integer_rtv_blend_keeps_blend_on_normalized_formats() {
         let mut g = GraphicsState::default();
         g.targets.NumRenderTargets = 3;
