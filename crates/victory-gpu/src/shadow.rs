@@ -789,15 +789,28 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    let merge = |now: &[u8], held: &mut [u8], title: &mut [u8]| {
+        let mut differs = 0u8;
+        for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+            let wrote = if *n != *h { 0xffu8 } else { 0 };
+            let merged = (*t & !wrote) | (*n & wrote);
+            differs |= merged ^ *t;
+            *t = merged;
+            *h = (*h & !wrote) | (*n & wrote);
+        }
+        differs != 0
+    };
+    // What a shader wrote lies in a few places of a piece: equal stretches
+    // are passed over without a store to either side (after
+    // reddxd-byte/ShakiraRED-dt c2271e5).
+    const STEP: usize = 64;
+    let mut differs = false;
+    for ((n, h), t) in now.chunks(STEP).zip(held.chunks_mut(STEP)).zip(title.chunks_mut(STEP)) {
+        if n != h {
+            differs |= merge(n, h, t);
+        }
     }
-    differs != 0
+    differs
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1370,6 +1383,20 @@ struct Workers {
     more: std::sync::Condvar,
 }
 
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS`; a quarter
+/// of the processor's, 2 to 6, unless set). The fork whose switch this is
+/// (reddxd-byte/ShakiraRED-dt c2271e5) keeps half of them, 2 to 12; the
+/// title's own threads and the recording ones want the rest, so that is to
+/// be measured.
+fn wide_threads() -> usize {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::env::var("VICTORY_WIDE_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map_or((threads / 4).clamp(2, 6), |n| n.min(threads))
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1378,7 +1405,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = wide_threads();
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 WIDE_WORKER.set(true);
