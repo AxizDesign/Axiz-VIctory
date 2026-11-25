@@ -136,6 +136,27 @@ What each part does today and what it still needs:
 
 ## Getting started
 
+Double-click `Launcher.cmd`: choose your own copy's executable, check this PC,
+install what is missing, play. Or the same in PowerShell, from a clone (no
+submodules, and no files from AnyXboxX, Leonida or TomBox, are needed):
+
+```powershell
+.\start.ps1                                  # check the tools, build, check this PC
+.\start.ps1 -Install                         # the same, installing what is missing
+.\start.ps1 -GameExe <the title's exe>       # the same, then run your own copy
+```
+
+If PowerShell refuses scripts: `powershell -ExecutionPolicy Bypass -File start.ps1`.
+`victory doctor` names what a PC lacks: graphics (shader model 6.6, resource
+binding tier 3, mesh shaders), system DLLs, memory, folders. Every FAIL line is
+a reason for a black picture or a run that does not start. On the first start
+shaders are translated and compiled for your card, and parts of the picture
+come in late. `start.ps1` makes the `diag` build, because a plain release build
+ignores `VICTORY_SHADER_LOOP_LIMIT` and long shader loops can make Windows
+reset the graphics driver.
+
+By hand:
+
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
@@ -200,6 +221,7 @@ victory translate [paths...] --cache [--pipelines [--used-pipelines]] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
+victory doctor
 ```
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs

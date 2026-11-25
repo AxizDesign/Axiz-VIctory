@@ -1,0 +1,132 @@
+<#
+.SYNOPSIS
+  A small window over start.ps1: choose your title's executable, check this
+  PC, install what is missing, run. Open it with Launcher.cmd.
+.PARAMETER SelfTest
+  Build the window and check it without showing it.
+#>
+[CmdletBinding()]
+param([switch]$SelfTest)
+
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$start = Join-Path $PSScriptRoot 'start.ps1'
+# The choices are kept outside the source tree (docs/asset-policy.md).
+$folder = Join-Path $env:LOCALAPPDATA 'victory'
+$store = Join-Path $folder 'launcher.json'
+
+function Read-Choices {
+    $choices = @{ GameExe = ''; Tuned = $false; LoopLimit = 256 }
+    try {
+        $read = Get-Content -LiteralPath $store -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($read.GameExe) { $choices.GameExe = [string]$read.GameExe }
+        $choices.Tuned = [bool]$read.Tuned
+        if ([int]$read.LoopLimit -ge 1) { $choices.LoopLimit = [Math]::Min([int]$read.LoopLimit, 1048576) }
+    } catch { }   # no file yet, or not one of ours: the defaults
+    $choices
+}
+
+function Save-Choices($Choices) {
+    try {
+        New-Item -ItemType Directory -Force -Path $folder | Out-Null
+        $Choices | ConvertTo-Json | Set-Content -LiteralPath $store -Encoding UTF8
+    } catch {
+        Write-Warning "the choices could not be saved: $_"
+    }
+}
+
+# One argument as a Windows command line takes it.
+function Format-Argument([string]$Text) { '"' + ($Text -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' }
+
+function Get-StartArguments([string[]]$More) {
+    $line = @('-NoProfile', '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', (Format-Argument $start))
+    ($line + $More) -join ' '
+}
+
+function Open-Console([string[]]$More) {
+    Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') `
+        -WorkingDirectory $PSScriptRoot -ArgumentList (Get-StartArguments $More)
+}
+
+$choices = Read-Choices
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'VIctory'
+$form.ClientSize = New-Object System.Drawing.Size(560, 216)
+$form.FormBorderStyle = 'FixedSingle'
+$form.MaximizeBox = $false
+$form.StartPosition = 'CenterScreen'
+$form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+function Add-Control($Control, [int]$X, [int]$Y, [int]$W, [int]$H, [string]$Text) {
+    $Control.SetBounds($X, $Y, $W, $H)
+    if ($Text) { $Control.Text = $Text }
+    $form.Controls.Add($Control)
+    $Control
+}
+
+$null = Add-Control (New-Object System.Windows.Forms.Label) 16 14 528 20 `
+    'Executable of your own copy of the title (no game files come with VIctory):'
+$path = Add-Control (New-Object System.Windows.Forms.TextBox) 16 36 430 24 $choices.GameExe
+$browse = Add-Control (New-Object System.Windows.Forms.Button) 454 34 90 27 'Browse...'
+$tuned = Add-Control (New-Object System.Windows.Forms.CheckBox) 16 74 300 22 'Faster submissions (experimental)'
+$tuned.Checked = $choices.Tuned
+$null = Add-Control (New-Object System.Windows.Forms.Label) 330 76 112 20 'Shader loop limit:'
+$limit = New-Object System.Windows.Forms.NumericUpDown
+$limit.Minimum = 1
+$limit.Maximum = 1048576
+$limit = Add-Control $limit 454 73 90 24 ''
+$limit.Value = $choices.LoopLimit
+$check = Add-Control (New-Object System.Windows.Forms.Button) 16 112 170 34 'Check this PC'
+$install = Add-Control (New-Object System.Windows.Forms.Button) 195 112 170 34 'Install what is missing'
+$play = Add-Control (New-Object System.Windows.Forms.Button) 374 112 170 34 'Play'
+$status = Add-Control (New-Object System.Windows.Forms.Label) 16 160 528 44 `
+    'The first build takes minutes. The first start translates shaders: parts of the picture come in late.'
+$form.AcceptButton = $play
+
+function Save-Form {
+    Save-Choices @{ GameExe = $path.Text.Trim(); Tuned = $tuned.Checked; LoopLimit = [int]$limit.Value }
+}
+
+# A button's work; what goes wrong is shown, not thrown out of the window.
+function Invoke-Safely([scriptblock]$Work) {
+    try { & $Work } catch { $status.Text = "Failed: $($_.Exception.Message)" }
+}
+
+$browse.Add_Click({ Invoke-Safely {
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Filter = 'Executables (*.exe)|*.exe'
+    if ($dialog.ShowDialog($form) -eq 'OK') { $path.Text = $dialog.FileName; Save-Form }
+} })
+$check.Add_Click({ Invoke-Safely { Open-Console @(); $status.Text = 'Building and checking in the other window.' } })
+$install.Add_Click({ Invoke-Safely {
+    Open-Console @('-Install')
+    $status.Text = 'Installing, building and checking in the other window.'
+} })
+$play.Add_Click({ Invoke-Safely {
+    $exe = $path.Text.Trim()
+    if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        $status.Text = 'Choose the executable first (Browse...).'
+        return
+    }
+    Save-Form
+    $more = @('-GameExe', (Format-Argument $exe), '-LoopLimit', "$([int]$limit.Value)")
+    if ($tuned.Checked) { $more += '-Tuned' }
+    Open-Console $more
+    $status.Text = 'Building, checking and starting in the other window.'
+} })
+
+if ($SelfTest) {
+    if (-not (Test-Path -LiteralPath $start)) { throw "no $start" }
+    if ((Format-Argument 'D:\a b\t.exe') -ne '"D:\a b\t.exe"') { throw 'quoting' }
+    if ($form.Controls.Count -ne 10) { throw "controls: $($form.Controls.Count)" }
+    $form.Dispose()
+    'launcher: ok'
+    exit 0
+}
+[void]$form.ShowDialog()
+Save-Form
+$form.Dispose()
