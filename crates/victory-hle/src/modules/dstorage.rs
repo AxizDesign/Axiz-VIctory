@@ -39,6 +39,7 @@ const FACTORY: Guid = Guid::new(
     [0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae],
 );
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)`: the source ends early.
 const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
@@ -450,7 +451,7 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = guarded(|| execute(&job.request));
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -459,6 +460,17 @@ fn work(scheduler: &'static Scheduler) {
         }
         scheduler.finished.notify_all();
     }
+}
+
+/// `run`'s result; a panic in it is a failed request. Let out, it ended the
+/// worker with the request still counted as running: its status entry was
+/// never written, so the title (which polls for completion) waited for it for
+/// good, and the staging bytes it held were never free again.
+fn guarded(run: impl FnOnce() -> Result<(), HRESULT>) -> Result<(), HRESULT> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|_| {
+        tracing::error!("dstorage: a request panicked; it fails (its destination may be unwritten)");
+        Err(E_FAIL)
+    })
 }
 
 impl Lanes {
@@ -803,6 +815,10 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         );
         hr
     };
+    #[cfg(test)]
+    if request.tag == tests::PANICS {
+        panic!("a fault in a request (test)");
+    }
     if options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) != 0 {
         return Err(fail(E_NOTIMPL, "unsupported options"));
     }
@@ -1182,6 +1198,9 @@ mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
 
+    /// The tag of a request that panics in its worker.
+    pub(super) const PANICS: u64 = 0x7061_6e69_6373;
+
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
         method(unsafe { &*object.cast::<Object>() }, slot)
@@ -1404,6 +1423,34 @@ mod tests {
         assert_eq!(result(array, 1), S_OK);
         assert_eq!(buffers[2], contents[100..116]);
         assert_eq!(buffers[3], contents[..16]);
+    }
+
+    /// More of them than there are workers, each with a third of the staging
+    /// space: every one completes, and reads after them still run.
+    #[test]
+    fn a_panic_in_a_request_fails_it_and_nothing_waits_for_it() {
+        let plain = pattern(50_000);
+        let packed = compress_zlib(&plain);
+        let (_dir, file) = file_with(&packed);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let mut unused = [0u8; 16];
+        for _ in 0..workers + 4 {
+            let mut bad = request(ZLIB, unused.as_mut_ptr().cast(), 16, file, 0, STAGING as usize / 3);
+            bad.tag = PANICS;
+            enqueue(queue, &bad);
+        }
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), E_FAIL);
+
+        let mut out = vec![0u8; plain.len()];
+        enqueue(queue, &request(ZLIB, out.as_mut_ptr().cast(), out.len(), file, 0, packed.len()));
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, plain);
+        void(queue, 0x40);
     }
 
     #[test]
