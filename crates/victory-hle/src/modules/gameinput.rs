@@ -1,6 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
 //! (host slots 0-3); while none is connected, the keyboard and the mouse
-//! drive one stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device
+//! drive one stand-in gamepad ([`binds`]). The keyboard is a device
 //! of its own too. A poll thread turns host state into readings (a new one
 //! per change) and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
@@ -21,7 +21,9 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+pub mod binds;
 pub(crate) mod mouse;
+use binds::Part;
 use mouse::{Mouse, Pace};
 
 /// The documented errors.
@@ -65,42 +67,6 @@ const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 const TAB: u8 = 0x09;
-
-/// The stand-in gamepad (virtual key, button); README lists it. A button may
-/// have several keys. Sticks: W/A/S/D left, the mouse or I/J/K/L right.
-const FALLBACK_BUTTONS: [(u8, u32); 29] = [
-    (0x1B, MENU), // Esc
-    (b'P', MENU),
-    (b'V', VIEW),
-    (0x0D, A), // Enter
-    (0xA0, A), // left Shift
-    (0x08, B), // Backspace
-    (b'R', B),
-    (0x20, X), // Space
-    (b'X', X),
-    (b'F', Y),
-    (b'Y', Y),
-    (0x26, UP), // arrows
-    (0x28, DOWN),
-    (0x25, LEFT),
-    (0x27, RIGHT),
-    (b'1', UP),
-    (b'2', DOWN),
-    (b'3', LEFT),
-    (b'4', RIGHT),
-    (b'E', RIGHT),
-    (TAB, LEFT_SHOULDER),
-    (mouse::BACK, LEFT_SHOULDER),
-    (b'Q', RIGHT_SHOULDER),
-    (mouse::FORWARD, RIGHT_SHOULDER),
-    (0xA2, LEFT_STICK), // left Ctrl
-    (b'Z', LEFT_STICK),
-    (b'C', RIGHT_STICK),
-    (b'H', RIGHT_STICK),
-    (mouse::MIDDLE, RIGHT_STICK),
-];
-const LEFT_TRIGGER: [u8; 2] = [mouse::RIGHT, b'U'];
-const RIGHT_TRIGGER: [u8; 2] = [mouse::LEFT, b'O'];
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
@@ -184,25 +150,35 @@ impl Latch {
     }
 }
 
-fn fallback(keys: &[KeyState], mouse: &Mouse) -> PadState {
+fn fallback(keys: &[KeyState], mouse: &Mouse, layout: &[(u8, binds::Part)]) -> PadState {
+    let mut pad = PadState::default();
+    for &(_, part) in layout.iter().filter(|b| pressed(keys, mouse, b.0)) {
+        match part {
+            Part::Button(bit) => pad.buttons |= bit,
+            Part::LeftTrigger => pad.left_trigger = 1.0,
+            Part::RightTrigger => pad.right_trigger = 1.0,
+            Part::Move(x, y) => {
+                pad.left_x += x;
+                pad.left_y += y;
+            }
+            Part::Look(x, y) => {
+                pad.right_x += x;
+                pad.right_y += y;
+            }
+        }
+    }
+    pad.left_x = pad.left_x.clamp(-1.0, 1.0);
+    pad.left_y = pad.left_y.clamp(-1.0, 1.0);
+    pad.right_x = (pad.right_x + mouse.stick.0).clamp(-1.0, 1.0);
+    pad.right_y = (pad.right_y + mouse.stick.1).clamp(-1.0, 1.0);
+    pad
+}
+
+/// Whether a key, or a button of the mouse, is down.
+fn pressed(keys: &[KeyState], mouse: &Mouse, vk: u8) -> bool {
     let key = |vk: u8| keys.iter().any(|k| k.virtual_key == vk);
     // Alt+Tab is the system's.
-    let system = |vk: u8| vk == TAB && key(mouse::RELEASE);
-    let down = |vk: u8| mouse.buttons.contains(&vk) || (key(vk) && !system(vk));
-    let on = |vk: u8| if down(vk) { 1.0_f32 } else { 0.0 };
-    let trigger = |keys: [u8; 2]| on(keys[0]).max(on(keys[1]));
-    PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| down(*vk))
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: trigger(LEFT_TRIGGER),
-        right_trigger: trigger(RIGHT_TRIGGER),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: (on(b'L') - on(b'J') + mouse.stick.0).clamp(-1.0, 1.0),
-        right_y: (on(b'I') - on(b'K') + mouse.stick.1).clamp(-1.0, 1.0),
-    }
+    mouse.buttons.contains(&vk) || (key(vk) && !(vk == TAB && key(mouse::RELEASE)))
 }
 
 /// Presses on the stand-in pad the title has not looked at yet stay: at a
@@ -571,7 +547,10 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(self.unseen.add(fallback(&keys, mouse), now)));
+        let fallback = (!any_pad).then(|| {
+            let layout = binds::layout(|vk| pressed(&keys, mouse, vk));
+            Value::Pad(self.unseen.add(fallback(&keys, mouse, &layout), now))
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1287,8 +1266,10 @@ mod host {
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
+                    for (key, part) in super::binds::layout(|_| false) {
+                        if let (true, super::Part::Button(button)) = (key == vk, part) {
+                            pad.buttons |= button;
+                        }
                     }
                 }
             }
@@ -1688,13 +1669,14 @@ mod tests {
 
     #[test]
     fn every_pad_control_has_a_key_or_the_mouse() {
-        let press = |vk: u8| fallback(&[key(vk)], &Mouse::default());
+        let walk = binds::Binds::read(binds::DEFAULT).0.walk;
+        let press = |vk: u8| fallback(&[key(vk)], &Mouse::default(), &walk);
         let click = |vk: u8| {
             let mouse = Mouse {
                 buttons: vec![vk],
                 ..Default::default()
             };
-            fallback(&[], &mouse)
+            fallback(&[], &mouse, &walk)
         };
         // The buttons, each from the keyboard alone.
         let all: [(u32, &[u8]); 14] = [
@@ -1745,18 +1727,11 @@ mod tests {
             stick: (0.5, -0.75),
             ..Default::default()
         };
-        let state = fallback(&[], &turned);
+        let state = fallback(&[], &turned, &walk);
         assert_eq!((state.right_x, state.right_y), (0.5, -0.75));
-        // No key does two things.
-        let mut keys: Vec<u8> = FALLBACK_BUTTONS.iter().map(|b| b.0).collect();
-        keys.extend(LEFT_TRIGGER.iter().chain(&RIGHT_TRIGGER).chain(b"WASDIJKL"));
-        let count = keys.len();
-        keys.sort_unstable();
-        keys.dedup();
-        assert_eq!(keys.len(), count);
         // Alt+Tab leaves the title alone.
         let switching = [key(mouse::RELEASE), key(TAB)];
-        assert_eq!(fallback(&switching, &Mouse::default()), PadState::default());
+        assert_eq!(fallback(&switching, &Mouse::default(), &walk), PadState::default());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! The mouse as part of the stand-in pad: its buttons press pad controls
-//! (`super::FALLBACK_BUTTONS`, the triggers) and its motion pushes the right
+//! ([`super::binds`]) and its motion pushes the right
 //! stick. A left click inside the title's window takes the mouse (cursor
 //! hidden and kept inside); left Alt, another window or a connected pad
 //! gives it back.

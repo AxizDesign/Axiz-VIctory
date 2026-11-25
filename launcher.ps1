@@ -87,9 +87,10 @@ $works = 'cpu', 'balanced', 'gpu'
 $work.Items.AddRange(@('Processor (saves card memory)', 'Balanced', 'Graphics card (more memory)'))
 $work.SelectedIndex = [Array]::IndexOf($works, $choices.Work)
 $prebuild = Add-Control (New-Object System.Windows.Forms.Button) 330 70 214 30 'Pre-build shaders'
-$check = Add-Control (New-Object System.Windows.Forms.Button) 16 112 170 34 'Check this PC'
-$install = Add-Control (New-Object System.Windows.Forms.Button) 195 112 170 34 'Install what is missing'
-$play = Add-Control (New-Object System.Windows.Forms.Button) 374 112 170 34 'Play'
+$check = Add-Control (New-Object System.Windows.Forms.Button) 16 112 126 34 'Check this PC'
+$install = Add-Control (New-Object System.Windows.Forms.Button) 150 112 160 34 'Install what is missing'
+$keys = Add-Control (New-Object System.Windows.Forms.Button) 318 112 90 34 'Keys...'
+$play = Add-Control (New-Object System.Windows.Forms.Button) 416 112 128 34 'Play'
 $status = Add-Control (New-Object System.Windows.Forms.Label) 16 160 528 44 `
     'The first build takes minutes. The first start translates shaders and loads slowly: pre-build before it, and once more after it.'
 $form.AcceptButton = $play
@@ -114,6 +115,16 @@ $install.Add_Click({ Invoke-Safely {
     $status.Text = 'Installing, building and checking in the other window.'
 } })
 
+# The keys file is made by the first start of a title.
+$keys.Add_Click({ Invoke-Safely {
+    $data = if ($env:VICTORY_DATA_DIR) { $env:VICTORY_DATA_DIR } else { Join-Path $env:LOCALAPPDATA 'victory\data' }
+    $file = Join-Path $data 'keys.txt'
+    if (Test-Path -LiteralPath $file) {
+        Start-Process -FilePath notepad.exe -ArgumentList (Format-Argument $file)
+        $status.Text = 'Change the keys and save: a running title takes them within a second.'
+    } else { $status.Text = 'Start the title once: that makes the file with the keys.' }
+} })
+
 # Plays the chosen title, or pre-builds its shaders.
 function Start-Title([bool]$Ahead, [string]$Said) {
     $exe = $path.Text.Trim()
@@ -131,7 +142,7 @@ $prebuild.Add_Click({ Invoke-Safely { Start-Title $true 'Pre-building in the oth
 if ($SelfTest) {
     if (-not (Test-Path -LiteralPath $start)) { throw "no $start" }
     if ((Format-Argument 'D:\a b\t.exe') -ne '"D:\a b\t.exe"') { throw 'quoting' }
-    if ($form.Controls.Count -ne 10) { throw "controls: $($form.Controls.Count)" }
+    if ($form.Controls.Count -ne 11) { throw "controls: $($form.Controls.Count)" }
     $line = (Get-PlayArguments 'D:\a b\t.exe' 'gpu' $false) -join ' '
     if ($line -ne '-GameExe "D:\a b\t.exe" -Work gpu') { throw "play: $line" }
     $line = (Get-PlayArguments 'D:\a b\t.exe' 'balanced' $true) -join ' '
