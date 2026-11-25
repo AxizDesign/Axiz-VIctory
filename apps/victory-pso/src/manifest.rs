@@ -126,6 +126,9 @@ pub struct View {
 pub struct Expect {
     pub view: usize,
     pub dwords: Vec<u32>,
+    /// The dwords are floats, and may be off by this much (of the expected
+    /// value where that is above 1); without it, exactly these bits.
+    pub near: Option<f32>,
 }
 
 /// What `build` found: the translated stages, the host root signature their

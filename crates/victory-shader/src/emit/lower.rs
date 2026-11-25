@@ -22,7 +22,7 @@ use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
-use uniform::{lane_uniform};
+use uniform::{lane_uniform, whole_masks};
 
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
 /// it shares the emitter's state.
@@ -212,6 +212,8 @@ fn enters_pops(p: &Program) -> bool {
 }
 
 struct Lower<'a> {
+    /// Masks as numbers that hold every lane or none (see [`whole_masks`]).
+    whole: HashSet<Value>,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
@@ -2006,6 +2008,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             split_lds,
             round16: round16(p),
+            whole: whole_masks(p, x.st, x.native.wave64),
             mode16: Some(0),
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
@@ -4431,6 +4434,11 @@ impl<'a> Lower<'a> {
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
+            Atom::Opaque(v) if self.whole.contains(&v) => {
+                let lo = self.i32_of(v)?;
+                let z = self.s.m.i32(0);
+                Ok(self.s.m.cmp(at, pred::NE, lo, z))
+            }
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
@@ -8481,53 +8489,8 @@ impl<'a> Lower<'a> {
             }
             "v_div_fixup_f32" => {
                 let (q, den, num) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let (qi, di, ni) = (self.as_int(q), self.as_int(den), self.as_int(num));
-                let (ksign, kabs, kinf) = (
-                    self.s.m.i32(0x8000_0000),
-                    self.s.m.i32(0x7FFF_FFFF),
-                    self.s.m.i32(0x7F80_0000),
-                );
-                let (kqnan_bit, kneg_qnan, zero) = (
-                    self.s.m.i32(0x0040_0000),
-                    self.s.m.i32(0xFFC0_0000),
-                    self.s.m.i32(0),
-                );
-                let sign = {
-                    let x = self.s.m.bin(c, Bin::Xor, ni, di);
-                    self.s.m.bin(c, Bin::And, x, ksign)
-                };
-                let q_abs = self.s.m.bin(c, Bin::And, qi, kabs);
-                let d_abs = self.s.m.bin(c, Bin::And, di, kabs);
-                let n_abs = self.s.m.bin(c, Bin::And, ni, kabs);
-                let q_nan = self.s.m.cmp(c, pred::IUGT, q_abs, kinf);
-                let d_nan = self.s.m.cmp(c, pred::IUGT, d_abs, kinf);
-                let n_nan = self.s.m.cmp(c, pred::IUGT, n_abs, kinf);
-                let d_inf = self.s.m.cmp(c, pred::EQ, d_abs, kinf);
-                let n_inf = self.s.m.cmp(c, pred::EQ, n_abs, kinf);
-                let d_zero = self.s.m.cmp(c, pred::EQ, d_abs, zero);
-                let n_zero = self.s.m.cmp(c, pred::EQ, n_abs, zero);
-                let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
-                let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
-                let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
-                let make_inf = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-                let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
-                let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
-                let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
-                let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
-                let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-                // Priority (highest to lowest): n_nan, d_nan, invalid (0/0 or
-                // Inf/Inf), make_inf (n_inf or d_zero), make_zero (d_inf or
-                // n_zero), q_nan (overflowed quotient -> signed Inf), signed_q.
-                // `q_nan` must stay below `make_zero` because `v_div_scale_f32`
-                // and `v_fma_f32(-Inf, 0, 1)` produce qNaN on `0 / x` and `x / Inf`.
-                let r = self.s.m.select(c, q_nan, signed_inf, signed_q);
-                let r = self.s.m.select(c, make_zero, sign, r);
-                let r = self.s.m.select(c, make_inf, signed_inf, r);
-                let r = self.s.m.select(c, invalid, kneg_qnan, r);
-                let r = self.s.m.select(c, d_nan, d_qnan, r);
-                let r = self.s.m.select(c, n_nan, n_qnan, r);
-                let rf = self.as_float(r);
-                float(self, rf)
+                let r = self.div_fixup(q, den, num);
+                float(self, r)
             }
             "v_fmac_f32" | "v_mac_f32" | "v_mac_legacy_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
@@ -8896,6 +8859,12 @@ impl<'a> Lower<'a> {
                 const UNTRACKED: Why = "a select on an untracked mask";
                 let cond = match mask.and_then(|m| self.x.st.masks.get(&m).copied()) {
                     Some(m) => self.boolean(m, c)?,
+                    // A scalar condition as a mask: every lane's bit is alike.
+                    None if mask.is_some_and(|m| self.whole.contains(&m)) => {
+                        let lo = self.i32_of(mask.ok_or(UNTRACKED)?).map_err(|_| UNTRACKED)?;
+                        let z = self.s.m.i32(0);
+                        self.s.m.cmp(c, pred::NE, lo, z)
+                    }
                     // A mask the code holds as a number (a constant bit
                     // pattern: every other lane, every other pair...):
                     // this lane's bit of it. Exact where host lanes are
@@ -9527,6 +9496,7 @@ impl<'a> Lower<'a> {
             "v_mad_f16",
             "v_fmac_f16",
             "v_mac_f16",
+            "v_div_fixup_f16",
             "v_max3_f16",
             "v_min3_f16",
             "v_med3_f16",
@@ -9649,6 +9619,7 @@ impl<'a> Lower<'a> {
                 // shortcut: fused f16 multiply-adds as FMad in f32 (the
                 // product is exact; the sum rounds twice).
                 "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
+                "v_div_fixup_f16" => self.div_fixup(a, b, acc),
                 "v_max3_f16" => {
                     let t = self.max_min(true, a, b);
                     self.max_min(true, t, acc)

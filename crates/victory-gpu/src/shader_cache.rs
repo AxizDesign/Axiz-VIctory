@@ -105,7 +105,9 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
-    result
+    let shader = result?;
+    validate_runtime(&shader.dxil)?;
+    Ok(shader)
 }
 
 /// Optional validation of translated title shaders, including cache hits.

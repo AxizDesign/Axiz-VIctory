@@ -365,6 +365,73 @@ pub(super) fn reaches(
     false
 }
 
+/// Scalar values that hold every lane or none, the same in all of them: a
+/// scalar condition made a mask (`s_cselect` of -1 and 0), copies, joins and
+/// combinations of such. In wave64 a value is its pair's low dword, and the
+/// pair's two dwords are alike. Which lane's bit is read does not matter.
+pub(super) fn whole_masks(p: &Program, st: &Structured, wave64: bool) -> HashSet<Value> {
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    // what each value is made of: dwords of registers by (low, high)
+    type Pair = (Value, Option<Value>);
+    let mut made: HashMap<Value, (Option<Value>, Vec<Pair>)> = HashMap::new();
+    let width = if wave64 { "_b64" } else { "_b32" };
+    for block in &p.blocks {
+        for phi in &block.phis {
+            let Reg::S(c) = phi.reg else { continue };
+            if c >= EXEC {
+                continue;
+            }
+            if !wave64 {
+                made.insert(phi.value, (None, phi.args.iter().map(|&a| (a, None)).collect()));
+            } else if let Some(high) = block.phis.iter().find(|h| h.reg == Reg::S(c + 1)) {
+                let args = phi.args.iter().copied().zip(high.args.iter().map(|&h| Some(h)));
+                made.insert(phi.value, (Some(high.value), args.collect()));
+            }
+        }
+        for inst in &block.insts {
+            let Fields::Sop { dst: Some(Operand::Scalar { code, .. }), src, imm: None } = &inst.fields else {
+                continue;
+            };
+            let name = inst.name();
+            let known = ["s_cselect", "s_mov", "s_not", "s_and", "s_or", "s_xor", "s_andn2", "s_orn2", "s_nand", "s_nor", "s_xnor"];
+            if *code >= EXEC || !name.strip_suffix(width).is_some_and(|n| known.contains(&n)) {
+                continue;
+            }
+            let Some(lo) = inst.write(Reg::S(*code)) else { continue };
+            let hi = if wave64 { inst.write(Reg::S(*code + 1)) } else { None };
+            let of: Option<Vec<Pair>> = src
+                .iter()
+                .filter_map(|op| match *op {
+                    // 0 and -1
+                    Operand::Const(128 | 193) => None,
+                    Operand::Scalar { code, .. } if code < EXEC && code != NULL => {
+                        let hi = if wave64 { inst.read(Reg::S(code + 1)) } else { None };
+                        Some(inst.read(Reg::S(code)).map(|lo| (lo, hi)))
+                    }
+                    _ => Some(None),
+                })
+                .collect();
+            if let Some(of) = of {
+                made.insert(lo, (hi, of));
+            }
+        }
+    }
+    made.retain(|&v, _| !is_mask(v));
+    loop {
+        let bad: Vec<Value> = made
+            .iter()
+            .filter(|(_, (_, of))| !of.iter().all(|(lo, hi)| made.get(lo).is_some_and(|m| m.0 == *hi)))
+            .map(|x| *x.0)
+            .collect();
+        if bad.is_empty() {
+            return made.into_keys().collect();
+        }
+        for v in bad {
+            made.remove(&v);
+        }
+    }
+}
+
 #[cfg(test)]
 mod settled_tests {
     /// A wave64 program of `words` (`crate::ir::build`'s console form).

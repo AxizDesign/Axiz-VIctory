@@ -2281,8 +2281,8 @@ mod barycentric_tests {
         validate(&shader);
     }
 
-    /// Draws `ps` over an 8x8 target whose TEXCOORD0.x is 2 + (y + 0.5) / 4
-    /// + (x + 0.5) / 2 (with `size` 2; with 1, a triangle of half the target
+    /// Draws `ps` over an 8x8 target whose TEXCOORD0.x is the sum of 2,
+    /// (y + 0.5) / 4 and (x + 0.5) / 2 (with `size` 2; with 1, a triangle of half the target
     /// and twice the steps); calls `check(backend, pixel, texel)` per pixel.
     #[cfg(windows)]
     fn on_each_pixel(ps: &HostShader, size: f32, mut check: impl FnMut(&str, usize, [f32; 4])) {

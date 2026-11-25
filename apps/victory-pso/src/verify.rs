@@ -394,6 +394,12 @@ fn dispatch(
     }
 }
 
+/// Whether a dword is the expected one, or a float as near it as `near`.
+fn alike(got: u32, want: u32, near: Option<f32>) -> bool {
+    let (a, b) = (f32::from_bits(got), f32::from_bits(want));
+    got == want || near.is_some_and(|n| (a - b).abs() <= n * b.abs().max(1.0))
+}
+
 /// What the run left in the views against what the description expects.
 fn compare(run: &Run, got: &[Vec<u32>]) -> Result<()> {
     if run.expect.is_empty() {
@@ -412,16 +418,24 @@ fn compare(run: &Run, got: &[Vec<u32>]) -> Result<()> {
             );
         }
         let wrong: Vec<usize> = (0..view.len())
-            .filter(|&i| view[i] != e.dwords[i])
+            .filter(|&i| !alike(view[i], e.dwords[i], e.near))
             .collect();
         if let Some(&first) = wrong.first() {
             return Err(Failure::Mismatch(format!(
-                "view {}: {} of {} dwords differ; the first is dword {first}: {:#x}, expected {:#x}",
+                "view {}: {} of {} dwords differ; the first is dword {first}: {:#x}, expected {:#x}{}",
                 e.view,
                 wrong.len(),
                 view.len(),
                 view[first],
-                e.dwords[first]
+                e.dwords[first],
+                match e.near {
+                    Some(_) => format!(
+                        " ({} for {})",
+                        f32::from_bits(view[first]),
+                        f32::from_bits(e.dwords[first])
+                    ),
+                    None => String::new(),
+                }
             ))
             .into());
         }

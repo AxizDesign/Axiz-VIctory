@@ -1761,4 +1761,57 @@ impl<'a> Lower<'a> {
         }
         Ok(())
     }
+
+    /// `v_div_fixup`: the quotient `q` of `num` and `den`, or what the
+    /// division of the two gives where they are special. Halves as floats
+    /// too.
+    pub(super) fn div_fixup(&mut self, q: V, den: V, num: V) -> V {
+        let c = self.cur;
+        let (qi, di, ni) = (self.as_int(q), self.as_int(den), self.as_int(num));
+        let (ksign, kabs, kinf) = (
+            self.s.m.i32(0x8000_0000),
+            self.s.m.i32(0x7FFF_FFFF),
+            self.s.m.i32(0x7F80_0000),
+        );
+        let (kqnan_bit, kneg_qnan, zero) = (
+            self.s.m.i32(0x0040_0000),
+            self.s.m.i32(0xFFC0_0000),
+            self.s.m.i32(0),
+        );
+        let sign = {
+            let x = self.s.m.bin(c, Bin::Xor, ni, di);
+            self.s.m.bin(c, Bin::And, x, ksign)
+        };
+        let q_abs = self.s.m.bin(c, Bin::And, qi, kabs);
+        let d_abs = self.s.m.bin(c, Bin::And, di, kabs);
+        let n_abs = self.s.m.bin(c, Bin::And, ni, kabs);
+        let q_nan = self.s.m.cmp(c, pred::IUGT, q_abs, kinf);
+        let d_nan = self.s.m.cmp(c, pred::IUGT, d_abs, kinf);
+        let n_nan = self.s.m.cmp(c, pred::IUGT, n_abs, kinf);
+        let d_inf = self.s.m.cmp(c, pred::EQ, d_abs, kinf);
+        let n_inf = self.s.m.cmp(c, pred::EQ, n_abs, kinf);
+        let d_zero = self.s.m.cmp(c, pred::EQ, d_abs, zero);
+        let n_zero = self.s.m.cmp(c, pred::EQ, n_abs, zero);
+        let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
+        let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
+        let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
+        let make_inf = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
+        let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
+        let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
+        let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
+        let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
+        let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
+        // Priority (highest to lowest): n_nan, d_nan, invalid (0/0 or
+        // Inf/Inf), make_inf (n_inf or d_zero), make_zero (d_inf or
+        // n_zero), q_nan (overflowed quotient -> signed Inf), signed_q.
+        // `q_nan` must stay below `make_zero` because `v_div_scale_f32`
+        // and `v_fma_f32(-Inf, 0, 1)` produce qNaN on `0 / x` and `x / Inf`.
+        let r = self.s.m.select(c, q_nan, signed_inf, signed_q);
+        let r = self.s.m.select(c, make_zero, sign, r);
+        let r = self.s.m.select(c, make_inf, signed_inf, r);
+        let r = self.s.m.select(c, invalid, kneg_qnan, r);
+        let r = self.s.m.select(c, d_nan, d_qnan, r);
+        let r = self.s.m.select(c, n_nan, n_qnan, r);
+        self.as_float(r)
+    }
 }
