@@ -4,6 +4,8 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+#[cfg(windows)]
+mod doctor;
 mod inspect;
 #[cfg(windows)]
 mod prebuild;
@@ -118,6 +120,10 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Check what this PC has of what a run needs (graphics, system DLLs,
+    /// memory, folders). Loads no title.
+    #[cfg(windows)]
+    Doctor,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -194,6 +200,8 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
+        #[cfg(windows)]
+        Command::Doctor => doctor::run(),
     }
 }
 
