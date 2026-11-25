@@ -250,3 +250,55 @@ fn a_buffer_copy_reads_what_an_earlier_list_of_the_submission_wrote() {
     assert_eq!(texels(a), expected(), "the read back itself");
     assert_eq!(texels(b), expected(), "the copy in the second list");
 }
+
+/// A list with a title's unordered access barrier (`flags`) on a texture,
+/// made with unordered access or without, closes and runs.
+fn unordered_barrier(uav: bool, flags: u32) {
+    if crate::host::host().is_none() {
+        return;
+    }
+    #[repr(C)]
+    struct Raw {
+        kind: u32,
+        flags: u32,
+        first: This,
+        second: u64,
+        last: u64,
+    }
+    let desc = Desc {
+        dimension: 3,
+        alignment: 0,
+        width: 64,
+        height: 64,
+        depth: 1,
+        mips: 1,
+        format: RGBA8,
+        samples: [1, 0],
+        layout: 0,
+        flags: if uav { 4 } else { 0 },
+    };
+    let iid = guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+    let mut texture = std::ptr::null();
+    assert_eq!(
+        create_committed(std::ptr::null(), DEFAULT_HEAP.as_ptr().cast(), 0, (&raw const desc).cast(), 0, std::ptr::null(), &iid, &mut texture),
+        S_OK
+    );
+    let list = new_list();
+    let b = Raw { kind: 2, flags, first: texture, second: 0, last: 0 };
+    crate::list::barrier(list, 1, (&raw const b).cast());
+    submit(&[list]);
+    settled();
+}
+#[test]
+fn an_unordered_access_barrier_closes() {
+    unordered_barrier(true, 0);
+}
+#[test]
+fn an_unordered_access_barrier_on_a_texture_without_it_closes() {
+    unordered_barrier(false, 0);
+}
+#[test]
+fn a_split_unordered_access_barrier_closes() {
+    unordered_barrier(true, 1);
+    unordered_barrier(true, 2);
+}

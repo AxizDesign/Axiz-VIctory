@@ -674,6 +674,167 @@ pub(crate) struct Barrier {
     last: u64,
 }
 
+#[cfg(windows)]
+macro_rules! once {
+    ($($arg:tt)*) => {{
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!($($arg)*));
+    }};
+}
+
+/// What a texture copy reads: rows in a buffer, or a texture's subresource.
+#[cfg(windows)]
+enum Source {
+    Rows(crate::resource::PlacedFootprint),
+    Texture(windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC, u32),
+}
+
+/// The size of subresource `sub` of a texture (width, height, depth);
+/// `None` if it has no such subresource.
+#[cfg(windows)]
+fn level(d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC, sub: u32) -> Option<[u64; 3]> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    let (mips, slices) = crate::states::shape(d)?;
+    if sub >= mips * slices {
+        return None;
+    }
+    let mip = sub % mips;
+    let depth = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        u64::from(d.DepthOrArraySize) >> mip
+    } else {
+        1
+    };
+    Some([(d.Width >> mip).max(1), (u64::from(d.Height) >> mip).max(1), depth.max(1)])
+}
+
+/// Why the host would refuse a copy between `sub` of a texture and rows of
+/// `format`, if it would. Textures with two planes are not looked at.
+#[cfg(windows)]
+fn rows_problem(
+    d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    sub: u32,
+    format: u32,
+) -> Option<&'static str> {
+    crate::states::shape(d)?;
+    if level(d, sub).is_none() {
+        return Some("a subresource the texture does not have");
+    }
+    alike(d.Format.0 as u32, format)
+}
+
+/// Why the host would not copy between two formats, if it would not (as far
+/// as that is certain: uncompressed formats of one family, and shared
+/// exponents beside 32-bit ones, are copied).
+#[cfg(windows)]
+fn alike(a: u32, b: u32) -> Option<&'static str> {
+    if b == 0 || (118..=120).contains(&b) {
+        return Some("rows in a format the host does not have");
+    }
+    let (Some(x), Some(y)) = (crate::resource::element(a), crate::resource::element(b)) else {
+        return None;
+    };
+    if x.0 != y.0 {
+        return Some("formats of two texel sizes");
+    }
+    let of = |f: u32| if f == 67 { 39 } else { crate::resource::family(f) };
+    (x.1 == 1 && y.1 == 1 && of(a) != of(b)).then_some("formats of two families")
+}
+
+/// Why the host would refuse the copy of `of` into `sub` of a texture at
+/// `at`, if it would. Textures with two planes are not looked at.
+#[cfg(windows)]
+fn copy_problem(
+    d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    sub: u32,
+    at: [u32; 3],
+    of: &Source,
+    b: Option<[u32; 6]>,
+) -> Option<&'static str> {
+    crate::states::shape(d)?;
+    let Some(room) = level(d, sub) else {
+        return Some("a destination subresource the texture does not have");
+    };
+    let block = crate::resource::element(d.Format.0 as u32).map_or(1, |e| e.1).max(1);
+    let source = match of {
+        Source::Rows(rows) => {
+            let (format, width, height, depth, pitch) = rows.parts();
+            if let Some(why) = alike(d.Format.0 as u32, format) {
+                return Some(why);
+            }
+            if let Some((element, block)) = crate::resource::element(format)
+                && u64::from(pitch) < u64::from(width).div_ceil(block) * element
+            {
+                return Some("rows closer together than they are long");
+            }
+            [u64::from(width), u64::from(height), u64::from(depth.max(1))]
+        }
+        Source::Texture(from, index) => {
+            crate::states::shape(from)?;
+            let Some(size) = level(from, *index) else {
+                return Some("a source subresource the texture does not have");
+            };
+            if let (Some(x), Some(y)) = (crate::resource::element(d.Format.0 as u32), crate::resource::element(from.Format.0 as u32))
+                && x.0 != y.0
+            {
+                return Some("textures of two texel sizes");
+            }
+            // Between compressed and plain texels a block is a texel.
+            if crate::resource::element(from.Format.0 as u32).map(|e| e.1) != Some(block) {
+                return None;
+            }
+            size
+        }
+    };
+    let up = |n: u64| n.next_multiple_of(block);
+    let (low, high) = match b {
+        Some([l, t, f, r, bottom, k]) => ([l, t, f].map(u64::from), [r, bottom, k].map(u64::from)),
+        None => ([0; 3], source),
+    };
+    if (0..3).any(|i| low[i] >= high[i]) {
+        return None; // nothing is copied
+    }
+    for i in 0..3 {
+        // Whole blocks in width and height.
+        let round = |n: u64| if i < 2 { up(n) } else { n };
+        if high[i] > round(source[i]) {
+            return Some("a box past its source's edge");
+        }
+        if u64::from(at[i]) + (high[i] - low[i]) > round(room[i]) {
+            return Some("past the destination's edge");
+        }
+        if i < 2 && !u64::from(at[i]).is_multiple_of(block) {
+            return Some("a destination inside a block");
+        }
+    }
+    None
+}
+
+/// Says which of the title's texture copies was left out, and why.
+#[cfg(windows)]
+fn refused_copy(
+    why: &'static str,
+    d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    dst: &CopyLocation,
+    at: [u32; 3],
+    src: &CopyLocation,
+    b: Option<[u32; 6]>,
+) {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 32 || n.is_power_of_two() {
+        tracing::warn!(
+            n,
+            why,
+            texture = format_args!("{}x{}x{} f{} mips {}", d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels),
+            destination = format_args!("kind {} {:?}", dst.kind, dst.footprint),
+            ?at,
+            source = format_args!("kind {} {:?}", src.kind, src.footprint),
+            source_box = ?b,
+            "a texture copy the host refuses is left out"
+        );
+    }
+}
+
 /// The barriers on host resources; none if it names a resource the host GPU
 /// does not have (buffers so far).
 #[cfg(windows)]
@@ -713,7 +874,40 @@ fn host_barrier(
                     None => return Vec::new(),
                 }
             };
-            let barrier = Barrier { first, ..*b };
+            // A split barrier's first half says nothing on the host, which
+            // refuses the split flags here: its second half is the barrier.
+            const BEGIN_ONLY: u32 = 1;
+            if b.flags & BEGIN_ONLY != 0 {
+                once!(flags = b.flags, "a split unordered access barrier: its second half is the barrier");
+                return Vec::new();
+            }
+            // The host refuses the barrier (the whole list, when it closes)
+            // on a texture without unordered access; the console does not.
+            // Nothing wrote that texture as unordered access, so the barrier
+            // waits for whatever else was written so.
+            let refused = !first.is_null() && {
+                // SAFETY: a live host texture (found above), borrowed.
+                let d = unsafe {
+                    windows::Win32::Graphics::Direct3D12::ID3D12Resource::from_raw_borrowed(&first.cast_mut().cast())
+                        .map(|r| r.GetDesc())
+                };
+                d.is_some_and(|d| {
+                    let no = d.Flags.0 & 4 == 0;
+                    if no {
+                        once!(
+                            width = d.Width,
+                            height = d.Height,
+                            format = d.Format.0,
+                            flags = d.Flags.0,
+                            samples = d.SampleDesc.Count,
+                            "an unordered access barrier on a texture without unordered access: made one on everything"
+                        );
+                    }
+                    no
+                })
+            };
+            let first = if refused { std::ptr::null() } else { first };
+            let barrier = Barrier { first, flags: 0, second: 0, last: 0, ..*b };
             // SAFETY: the same layout; a borrowed resource pointer, never
             // released through the barrier.
             vec![unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(barrier) }]
@@ -724,7 +918,7 @@ fn host_barrier(
 }
 
 /// Returns the console's barrier "actions" (none).
-extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+pub(crate) extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -1029,6 +1223,25 @@ extern "system" fn copy_texture_region(
         }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+        // What the host refuses fails the whole list when it closes.
+        {
+            // SAFETY: live textures; the box is the title's or null.
+            let (d, of, b) = unsafe {
+                (
+                    to.GetDesc(),
+                    crate::resource::host_resource(src.resource).map(|t| t.GetDesc()),
+                    source_box.as_ref().copied(),
+                )
+            };
+            let of = match of {
+                Some(of) if src.kind != FOOTPRINT => Source::Texture(of, src.footprint.offset as u32),
+                _ => Source::Rows(src.footprint),
+            };
+            if let Some(why) = copy_problem(&d, dst.footprint.offset as u32, [x, y, z], &of, b) {
+                refused_copy(why, &d, &dst, [x, y, z], &src, b);
+                return;
+            }
+        }
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
@@ -1074,6 +1287,16 @@ fn read_back(
     }
     let host = crate::host::host().ok_or("no host")?;
     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
+    // What the host refuses fails the whole list when it closes.
+    if let Some(of) = crate::resource::host_resource(src.resource) {
+        // SAFETY: a live texture.
+        let d = unsafe { of.GetDesc() };
+        if let Some(why) = rows_problem(&d, src.footprint.offset as u32, dst.footprint.parts().0) {
+            // SAFETY: the box is the title's or null.
+            refused_copy(why, &d, &dst, [x, y, z], &src, unsafe { source_box.as_ref().copied() });
+            return Err(why);
+        }
+    }
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
@@ -1149,6 +1372,23 @@ extern "system" fn resolve(
         const RESOLVE_SOURCE: u32 = 0x2000;
         if unlike(dst, src) {
             return;
+        }
+        {
+            // SAFETY: live textures.
+            let (a, b) = unsafe { (to.GetDesc(), from.GetDesc()) };
+            let subs = |d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC| {
+                crate::states::shape(d).map_or(u32::MAX, |(mips, slices)| mips * slices)
+            };
+            let typed = if crate::resource::stands_in(dst) { a.Format.0 as u32 } else { format };
+            if b.SampleDesc.Count <= 1 || a.SampleDesc.Count > 1 || typed == 0 || dst_sub >= subs(&a) || src_sub >= subs(&b) {
+                once!(
+                    to = format_args!("{}x{} f{} samples {} sub {dst_sub}", a.Width, a.Height, a.Format.0, a.SampleDesc.Count),
+                    from = format_args!("{}x{} f{} samples {} sub {src_sub}", b.Width, b.Height, b.Format.0, b.SampleDesc.Count),
+                    format,
+                    "a resolve the host refuses is left out"
+                );
+                return;
+            }
         }
         // Depth textures shaders also write: what they wrote, first.
         list.twin_use(dst, false, true);

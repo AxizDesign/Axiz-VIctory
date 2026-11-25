@@ -5105,6 +5105,15 @@ impl HostList {
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
+            // With `VICTORY_D3D12_DRED=1` the list has its commands' texts.
+            #[cfg(feature = "diagnostics")]
+            {
+                let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+                tracing::error!(noted = notes.len(), "the list that did not close; its commands, all but the first ones:");
+                for (i, note) in notes.iter().enumerate().skip(notes.len().saturating_sub(400)) {
+                    tracing::error!("  {i}: {}", note.0.chars().take(400).collect::<String>());
+                }
+            }
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
@@ -7301,10 +7310,29 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         (0x2, false, 0x10 | 0x20),
         (0x8, true, 0x40 | 0x80),
     ];
-    FORBIDDEN
+    let state = FORBIDDEN
         .iter()
         .filter(|&&(flag, deny, _)| (flags & flag != 0) == deny)
-        .fold(state, |s, &(_, _, bits)| s & !bits)
+        .fold(state, |s, &(_, _, bits)| s & !bits);
+    // The host refuses (the whole list, when it closes) bits that are no
+    // state of a texture, and a written state beside any other.
+    const WRITTEN: u32 = 0x4 | 0x8 | 0x10 | 0x400 | 0x1000;
+    const READ: u32 = 0x20 | 0x40 | 0x80 | 0x800 | 0x2000;
+    let known = state & (WRITTEN | READ);
+    let written = known & WRITTEN;
+    let legal = if written != 0 { written & written.wrapping_neg() } else { known };
+    if legal != state {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                state = format_args!("{state:#x}"),
+                legal = format_args!("{legal:#x}"),
+                flags = format_args!("{flags:#x}"),
+                "a texture state the host refuses: the nearest one it has"
+            )
+        });
+    }
+    legal
 }
 
 impl Host {

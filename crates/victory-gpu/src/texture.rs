@@ -208,6 +208,9 @@ pub(crate) fn remapped(at: usize, len: usize) {
 /// texture's layout first.
 struct Through {
     buffer: ID3D12Resource,
+    /// The written texture it was laid out for: the view outlives it, and
+    /// the next one in that memory may be of another format.
+    of: (i32, u64, u32, u16, u16),
     parts: Vec<(
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
@@ -247,9 +250,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     };
     let Some(host) = host() else { return false };
     let through = {
+        // SAFETY: a live texture.
+        let d = unsafe { from.GetDesc() };
+        let of = (d.Format.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels);
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(HashMap::new);
-        match map.get(&(placed as usize)) {
+        if let Some(old) = map.get(&(placed as usize)).filter(|t| t.of != of) {
+            tracing::info!(view = ?placed, was = ?old.of, now = ?of, "the texture in a placed view's memory is another now: its copy is laid out anew");
+        }
+        match map.get(&(placed as usize)).filter(|t| t.of == of) {
             Some(through) => through.clone(),
             None => {
                 // SAFETY: live textures.
@@ -325,6 +334,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let [of_written, of_read] = rows;
                 let through = Arc::new(Through {
                     buffer,
+                    of,
                     parts: of_written.into_iter().zip(of_read).collect(),
                 });
                 map.insert(placed as usize, through.clone());

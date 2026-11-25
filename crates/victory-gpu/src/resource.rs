@@ -673,6 +673,11 @@ impl PlacedFootprint {
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
 
+    /// Format, width, height, depth and row pitch.
+    pub(crate) fn parts(&self) -> (u32, u32, u32, u32, u32) {
+        (self.format, self.width, self.height, self.depth, self.row_pitch)
+    }
+
     /// For a read back through a host buffer: this footprint at offset 0
     /// with its rows pitched as the host wants them (multiples of 256
     /// bytes), then the bytes that buffer needs, the bytes of a row, the
@@ -3792,5 +3797,48 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// A view placed in the memory of one target after another, of `formats`,
+    /// each released before the next: the lists that copy from them close.
+    #[cfg(windows)]
+    fn alias_of_targets(formats: [u32; 2]) {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let heap = heap(16 * KIB_64);
+        // SAFETY: a heap we made.
+        let base = unsafe { (*heap.cast::<Heap>()).memory.ptr.as_ptr() } as u64;
+        let view = texture(64, 64, 67, 1);
+        let mut words = [0u32; 14];
+        // SAFETY: 56 bytes of description.
+        unsafe { std::ptr::copy_nonoverlapping((&raw const view).cast::<u32>(), words.as_mut_ptr(), 14) };
+        let placed = texture_at(base, &words).unwrap();
+        for format in formats {
+            let mut desc = texture(64, 64, format, 1);
+            desc.flags = 4;
+            let mut target = null;
+            assert_eq!(create_placed(null, heap, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut target), S_OK);
+            let source = alias_of(placed).expect("the target in the view's memory");
+            assert_eq!(source, target);
+            let (mut allocator, mut list) = (null, null);
+            assert_eq!(crate::list::create_allocator(null, 0, &crate::object::guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]), &mut allocator), S_OK);
+            assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &crate::object::guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]), &mut list), S_OK);
+            let host_list = crate::list::host_list(list).unwrap();
+            assert!(crate::texture::alias(host_list, placed, source));
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+            slot::<Release>(target, 0x10)(target);
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn a_placed_view_reads_the_next_target_of_its_format() {
+        alias_of_targets([42, 42]);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn a_placed_view_reads_the_next_target_of_another_format() {
+        alias_of_targets([42, 28]);
     }
 }
