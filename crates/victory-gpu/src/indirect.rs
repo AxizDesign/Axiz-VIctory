@@ -320,6 +320,12 @@ pub(crate) fn count_at(stride: u32, records: u32) -> u64 {
     u64::from(stride) * u64::from(records)
 }
 
+/// The count offset an execution is recorded with: of a call without a count
+/// buffer it is 0, or the host refuses the whole list when it closes.
+pub(crate) fn count_offset(counted: bool, stride: u32, records: u32) -> u64 {
+    if counted { count_at(stride, records) } else { 0 }
+}
+
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch
@@ -1719,3 +1725,37 @@ void main() {
 /// The benchmark of the clamp and its barriers (ignored by default).
 #[cfg(test)]
 mod bench;
+
+#[cfg(all(test, windows))]
+mod count_tests {
+    use super::*;
+
+    /// Both kinds of call, with the arguments `State::run_indirect` records
+    /// them with: the list closes.
+    #[test]
+    fn a_call_without_a_count_buffer_closes() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let Some((args, _)) = host.shared_buffer(65536) else {
+            return;
+        };
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &argument, NodeMask: 0 };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: plain creation; the out pointer is ours.
+        unsafe { host.device.CreateCommandSignature(&desc, None, &mut signature).unwrap() };
+        let signature = signature.unwrap();
+        for counted in [false, true] {
+            // SAFETY: plain creation; an open list and live objects. The list
+            // is not executed.
+            unsafe {
+                let allocator: ID3D12CommandAllocator = host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList =
+                    host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+                list.ExecuteIndirect(&signature, 1, &args, 0, counted.then_some(&args), count_offset(counted, 12, 1));
+                assert!(list.Close().is_ok(), "counted: {counted}");
+            }
+        }
+    }
+}

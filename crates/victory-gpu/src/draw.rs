@@ -2844,7 +2844,7 @@ impl State {
                 &bounded,
                 at,
                 counter.is_some().then_some(&bounded),
-                crate::indirect::count_at(stride, max),
+                crate::indirect::count_offset(counter.is_some(), stride, max),
             )
         };
         if kind == MESH {
