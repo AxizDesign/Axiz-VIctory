@@ -188,6 +188,7 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+    let mut due: Vec<(u32, u64)> = Vec::new();
     let mut page_bytes: Vec<u8> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -219,9 +220,7 @@ pub(crate) fn sync_heaps() {
                     // (`HostHeap::mirror_copied_page`); one by one below
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
                     let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
-                        looked += seen;
-                        mirrored += made;
+                        looked += host.mirror_copied_page(slots, (start, step), from, &page_bytes, &mut due);
                         0..0
                     } else {
                         slots
@@ -247,6 +246,10 @@ pub(crate) fn sync_heaps() {
                 page += crate::watch::PAGE;
             }
         }
+        // The heap's changed slots, in slot order within a page.
+        mirrored += due.len() as u64;
+        host.mirror_all(&due);
+        due.clear();
     }
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {

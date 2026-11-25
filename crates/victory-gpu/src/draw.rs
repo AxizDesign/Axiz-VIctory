@@ -585,6 +585,69 @@ fn full_card_pass() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FULL_CARD_PASS").is_none_or(|v| v != "0"))
 }
 
+/// What a look at a buffer view's slot found ([`look_at_slots`]).
+enum Seen {
+    /// The view reads `[from, to)` of title memory through this host copy;
+    /// whether it is an unordered access view.
+    Copy(std::sync::Arc<crate::shadow::Shadow>, u64, u64, bool),
+    /// A buffer view whose memory has no host copy yet.
+    NoCopy,
+}
+
+/// The buffer views at `slots` of `heap`, their host slots made and their
+/// host copies found, on several threads
+/// (`crate::descriptor::host::slot_threads`): the slot, its record, the view
+/// table entry the record names, and what it found; slots that hold no
+/// buffer view are left out. 9,300 slots took 30 ms a frame on the recording
+/// thread one after the other (RTX 5070, run 12).
+#[allow(clippy::type_complexity)]
+fn look_at_slots(
+    heap: &crate::descriptor::Heap,
+    host: &crate::descriptor::host::HostHeap,
+    slots: &[u32],
+) -> Vec<(u32, crate::heap_pass::Record, Option<u32>, Seen)> {
+    let look = |heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, index: u32| {
+        let handle = heap.handle(index)?;
+        // Read before the slot is made: a write after it is seen next pass.
+        let record = crate::descriptor::record_at(handle);
+        let entry = crate::descriptor::record_entry(record);
+        let view = host.mirror(index, handle, true)?;
+        let seen = match crate::descriptor::host::buffer_copy(&view) {
+            Some((shadow, address, len)) => {
+                let unordered =
+                    matches!(view, crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(true, ..));
+                Seen::Copy(shadow, address, address + len, unordered)
+            }
+            None if crate::descriptor::host::buffer_range(&view).is_some_and(|(_, len)| len > 0) => Seen::NoCopy,
+            None => return None,
+        };
+        Some((index, record, entry, seen))
+    };
+    let threads = crate::descriptor::host::slot_threads();
+    let results: std::sync::Arc<std::sync::Mutex<Vec<(usize, Vec<_>)>>> = Default::default();
+    let at = (std::ptr::from_ref(heap) as usize, std::ptr::from_ref(host) as usize);
+    let jobs = slots
+        .chunks(slots.len().div_ceil(threads * 2).max(128))
+        .enumerate()
+        .map(|(n, part)| {
+            let (part, results) = (part.to_vec(), results.clone());
+            Box::new(move || {
+                // SAFETY: `wide_run_apart` returns when every job has run:
+                // the heaps outlive them.
+                let (heap, host) = unsafe {
+                    (&*(at.0 as *const crate::descriptor::Heap), &*(at.1 as *const crate::descriptor::host::HostHeap))
+                };
+                let found: Vec<_> = part.into_iter().filter_map(|index| look(heap, host, index)).collect();
+                results.lock().unwrap_or_else(|e| e.into_inner()).push((n, found));
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run_apart(jobs);
+    let mut parts = std::mem::take(&mut *results.lock().unwrap_or_else(|e| e.into_inner()));
+    parts.sort_unstable_by_key(|p| p.0);
+    parts.into_iter().flat_map(|p| p.1).collect()
+}
+
 /// Whether a texture that has its host copy is still brought up to date
 /// while the card has no room for new ones (`VICTORY_REUPLOAD_WHEN_FULL=0`:
 /// no).
@@ -1623,7 +1686,23 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        for (n, &index) in slots.iter().enumerate() {
+        // Looked at side by side ([`look_at_slots`]), then kept in order.
+        let wide = slots.len() >= 512 && crate::descriptor::host::slot_threads() > 1;
+        if wide {
+            for &index in &slots {
+                ranges.forget(index);
+            }
+            for (index, record, entry, seen) in look_at_slots(heap, host, &slots) {
+                match seen {
+                    Seen::Copy(shadow, from, to, unordered) => {
+                        let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                        ranges.keep(index, key, &shadow, [from, to], record, entry, unordered);
+                    }
+                    Seen::NoCopy => ranges.orphan(index, record, entry),
+                }
+            }
+        }
+        for (n, &index) in slots.iter().enumerate().take(if wide { 0 } else { usize::MAX }) {
             ranges.forget(index);
             let Some(handle) = heap.handle(index) else {
                 continue;

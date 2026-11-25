@@ -1446,6 +1446,18 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
+/// [`wide_apart`], for the host's own work by a caller that holds locks; on
+/// one of the threads themselves the jobs run one after the other.
+pub(crate) fn wide_run_apart(jobs: Vec<Box<dyn FnOnce() + Send>>) {
+    if WIDE_WORKER.get() {
+        for job in jobs {
+            job();
+        }
+        return;
+    }
+    wide_apart(jobs);
+}
+
 /// As [`wide`], for a caller that holds a lock of a copy
 /// ([`Shadow::copy_stale`]): it runs the last of `jobs` itself and waits
 /// for the others without taking work off the queue, since what other
