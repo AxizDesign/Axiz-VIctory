@@ -61,6 +61,85 @@ enum Held {
 #[cfg(windows)]
 static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+/// Told when a queue comes onto [`WAITING`].
+#[cfg(windows)]
+static NOW_WAITING: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Puts the queue, which holds something, on the list of those, and has
+/// [`look_at_held`] look at it.
+#[cfg(windows)]
+fn now_waiting(this: This) {
+    {
+        let mut waiting = lock(&WAITING);
+        if !waiting.contains(&(this as usize)) {
+            waiting.push(this as usize);
+        }
+    }
+    // `VICTORY_HELD_LOOK=0`: no thread looks, as before.
+    static LOOKER: std::sync::Once = std::sync::Once::new();
+    LOOKER.call_once(|| {
+        if std::env::var_os("VICTORY_HELD_LOOK").is_some_and(|v| v == "0") {
+            return;
+        }
+        let spawned = std::thread::Builder::new().name("victory-held".into()).spawn(look_at_held);
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "no thread to look at what queues hold: the title's calls do");
+        }
+    });
+    NOW_WAITING.notify_one();
+}
+
+/// Looks at what queues hold, every 20 ms while any holds something. A value
+/// in memory changes without a call of ours (the CPU stores it), and the
+/// title need not make one afterwards: a thread of it that then sleeps on an
+/// event, until a signal behind the wait for that value, slept for good. On
+/// the console the queue looks by itself. (The title's own calls look too,
+/// and sooner: this is for when none comes.)
+#[cfg(windows)]
+fn look_at_held() {
+    let mut since: Option<std::time::Instant> = None;
+    let mut said = false;
+    loop {
+        {
+            let mut waiting = lock(&WAITING);
+            while waiting.is_empty() {
+                (since, said) = (None, false);
+                waiting = NOW_WAITING.wait(waiting).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        let began = *since.get_or_insert_with(std::time::Instant::now);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        release_held(false);
+        if lock(&WAITING).is_empty() {
+            (since, said) = (None, false);
+        } else if !said && began.elapsed().as_secs() >= 5 {
+            said = true;
+            say_held();
+        }
+    }
+}
+
+/// Says what each waiting queue stands at.
+#[cfg(windows)]
+fn say_held() {
+    // No queue is freed meanwhile.
+    let _one = lock(&RELEASING);
+    let queues = lock(&WAITING).clone();
+    for q in queues {
+        // SAFETY: a live queue: one released is taken off the list.
+        let queue = unsafe { &*(q as *const Queue) };
+        let held = lock(&queue.held);
+        let at = match held.first() {
+            Some(&Held::Wait(fence, value)) => {
+                format!("a fence at {} to reach {value}", crate::fence::completed(fence as This))
+            }
+            Some(Held::Value(wait)) => format!("{wait:?}"),
+            _ => continue,
+        };
+        tracing::warn!(kind = queue.kind, held = held.len(), "queues have held work for 5 seconds; one waits for {at}");
+    }
+}
+
 /// One caller of [`release_held`] at a time, so a queue's submissions keep
 /// their order and no queue is freed under it.
 #[cfg(windows)]
@@ -200,10 +279,7 @@ fn submit_cut(this: This, lists: &[This]) {
                 held.push(Held::Run(taken, order));
             }
         }
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        now_waiting(this);
     }
     // What ran may be what another queue waits for, and what was just
     // given to the queue may be free to run already.
@@ -282,10 +358,7 @@ fn submit_split(this: This, lists: &[This]) {
             from = to;
         }
         lock(&queue(this).held).extend(pieces);
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        now_waiting(this);
     }
     // What ran may be what another queue waits for, and what was just held
     // may be free to run already.
@@ -582,10 +655,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                     tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
                 }
                 lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
+                now_waiting(this);
             }
         }
         let kept = hold(this, || {
@@ -715,12 +785,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             }
         }
         if behind && waits() {
-            {
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
-            }
+            now_waiting(this);
             // The fence may have got there meanwhile.
             release_held(false);
         }
@@ -1115,6 +1180,47 @@ mod tests {
             slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
             7
         );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// A title thread sleeps on an event until a queue's signal, which stands
+    /// behind a wait for a value the CPU then stores: no call of the title's
+    /// follows that would look at the queue.
+    #[cfg(windows)]
+    #[test]
+    fn a_value_the_cpu_stores_moves_a_queue_with_no_call_after_it() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut q, mut fence) = (null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut fence), S_OK);
+        // (leaked: a look at it may come after the test)
+        let value: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+        let at = std::ptr::from_ref(value) as u64;
+        lock(&queue(q).held).push(Held::Value(crate::list::ValueWait::equal(at, 7)));
+        now_waiting(q);
+        assert_eq!(signal(q, fence, 1), S_OK);
+        // SAFETY: plain auto-reset event.
+        let event = unsafe { CreateEventW(null.cast(), 0, 0, null.cast()) };
+        type OnCompletion = extern "system" fn(This, u64, *mut std::ffi::c_void) -> HRESULT;
+        assert_eq!(slot::<OnCompletion>(fence, 0x48)(fence, 1, event), S_OK);
+        // SAFETY: a valid event.
+        assert_ne!(unsafe { WaitForSingleObject(event, 100) }, WAIT_OBJECT_0, "not met yet");
+        value.store(7, Ordering::Release);
+        // SAFETY: as above.
+        assert_eq!(unsafe { WaitForSingleObject(event, 5000) }, WAIT_OBJECT_0, "met, and nothing looked");
+        assert_eq!(crate::fence::completed(fence), 1);
+        // SAFETY: our event, waited for by no one.
+        unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 

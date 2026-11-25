@@ -1835,6 +1835,17 @@ pub(crate) struct ValueWait {
 }
 
 impl ValueWait {
+    /// A wait for the 64-bit `reference` at `address`.
+    #[cfg(test)]
+    pub(crate) fn equal(address: u64, reference: u64) -> ValueWait {
+        ValueWait {
+            address,
+            comparison: 3,
+            reference,
+            wide: true,
+        }
+    }
+
     /// Whether the memory holds what is waited for now.
     /// shortcut: the comparison codes are taken to be the comparison
     /// functions' (1 never .. 8 always, value against reference); one not
