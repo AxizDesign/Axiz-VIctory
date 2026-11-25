@@ -206,6 +206,10 @@ fn mirror(handle: u64) {
 /// only write-watch pages to reveal which slots changed.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
+    // One scan at a time: what one has taken for changed is made when it is
+    // done, and the next finds it made.
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     let heaps: Vec<(u64, u64, Held)> = {
         let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         heaps
