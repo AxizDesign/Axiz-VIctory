@@ -142,6 +142,11 @@ struct Last {
     /// The frame it was read in ahead of its submission
     /// ([`Staging::refresh_ahead`]).
     ahead: Option<u64>,
+    /// The kernel's write watch has nothing to say of the memory (views of
+    /// physical pages, for one): it is not asked again, only the guards
+    /// (after reddxd-byte/ShakiraRED-dt c2271e5). The asking failed at every
+    /// check, with the write-watch journal locked over it.
+    unwatched: bool,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1093,7 +1098,9 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        let watched = if last.unwatched { None } else { waited(1, || crate::watch::writes(start, start + size, false)) };
+        last.unwatched = watched.is_none();
+        if let Some((now, written)) = watched {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -1142,12 +1149,12 @@ impl Staging {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_now(start, size) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading(start, size))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages

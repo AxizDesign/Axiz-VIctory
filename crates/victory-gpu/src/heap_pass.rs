@@ -56,6 +56,19 @@ struct Copy<C> {
     stale: bool,
 }
 
+/// Passes between two compares of every kept slot's record in title memory
+/// with the one seen (`VICTORY_HEAP_SCAN_EVERY`; 1, every pass, unless set).
+/// What it finds late is a record the title copied itself, past the API: its
+/// slot shows the old view, and the copy the new one reads is not brought up
+/// to date, for that many passes less one. After reddxd-byte/ShakiraRED-dt
+/// c2271e5.
+fn scan_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_SCAN_EVERY").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n >= 1).unwrap_or(1)
+    })
+}
+
 /// What a pass looks at (see the module).
 pub(crate) struct Picked<C> {
     passes: u64,
@@ -70,6 +83,8 @@ pub(crate) struct Picked<C> {
     forgotten: Option<Vec<u32>>,
     /// The old pass (`VICTORY_HEAP_PASS_FULL=1`).
     full: bool,
+    /// [`scan_every`].
+    scan_every: u64,
 }
 
 impl<C: Clone> Picked<C> {
@@ -82,6 +97,7 @@ impl<C: Clone> Picked<C> {
             by_entry: HashMap::new(),
             forgotten: None,
             full,
+            scan_every: scan_every(),
         }
     }
 
@@ -137,15 +153,20 @@ impl<C: Clone> Picked<C> {
                 );
             }
         }
-        for (&slot, kept) in &self.slots {
-            if record(slot) != Some(kept.record) {
-                due.insert(slot);
+        let scan = pass.is_multiple_of(self.scan_every);
+        if scan {
+            for (&slot, kept) in &self.slots {
+                if record(slot) != Some(kept.record) {
+                    due.insert(slot);
+                }
             }
         }
         let orphans_too = pass.is_multiple_of(ORPHANS_EVERY);
-        for (&slot, &seen) in &self.orphans {
-            if orphans_too || record(slot) != Some(seen) {
-                due.insert(slot);
+        if scan || orphans_too {
+            for (&slot, &seen) in &self.orphans {
+                if orphans_too || record(slot) != Some(seen) {
+                    due.insert(slot);
+                }
             }
         }
         let mut due: Vec<u32> = due.into_iter().collect();
@@ -354,6 +375,21 @@ mod tests {
         assert_eq!(pass(&mut p, &heap, vec![], vec![117, 105]), vec![17]);
         // And the next pass leaves them alone again.
         assert!(pass(&mut p, &heap, vec![], vec![]).is_empty());
+    }
+
+    /// Scanned every fourth pass, a record copied past the API is found by
+    /// the next scan; what the API tells of is looked at at once.
+    #[test]
+    fn records_can_be_compared_every_few_passes() {
+        let mut heap = heap(8);
+        let mut p = Picked::new(false);
+        p.scan_every = 4;
+        pass(&mut p, &heap, vec![], vec![]);
+        heap.records.insert(3, [1, 300, 1]);
+        assert!(pass(&mut p, &heap, vec![], vec![]).is_empty());
+        assert_eq!(pass(&mut p, &heap, vec![6], vec![]), vec![6]);
+        assert!(pass(&mut p, &heap, vec![], vec![]).is_empty());
+        assert_eq!(pass(&mut p, &heap, vec![], vec![]), vec![3]);
     }
 
     #[test]
