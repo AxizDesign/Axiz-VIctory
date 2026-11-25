@@ -7421,6 +7421,123 @@ impl<'a> Lower<'a> {
         Ok(phi)
     }
 
+    /// Registers an immediate sampler constant and returns its slot index.
+    fn register_sampler(&mut self, words: &[u32], cmp: bool) -> Result<u32, Why> {
+        let words: [u32; 4] = words
+            .get(..4)
+            .and_then(|w| w.try_into().ok())
+            .ok_or("a sampler constant")?;
+        let n = match self.samplers.iter().position(|w| *w == words) {
+            Some(n) => n,
+            None => {
+                self.samplers.push(words);
+                self.samplers.len() - 1
+            }
+        };
+        if cmp && n < 64 {
+            self.s.cmp_samplers |= 1 << n;
+        }
+        Ok(n as u32)
+    }
+
+    /// Resolves a control-flow phi of immediate sampler constants into either a
+    /// single static sampler register (`One`) or a uniform `i32` phi index over
+    /// `regs` (`Many`) for branch dispatch at the sample site.
+    fn sampler_phi_choice(
+        &mut self,
+        block: usize,
+        args: &[Source],
+        cmp: bool,
+        depth: u32,
+    ) -> Result<(Option<V>, Vec<u32>), Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let mut distinct: Vec<[u32; 4]> = Vec::new();
+        self.collect_constant_samplers(block, args, depth, &mut distinct)?;
+        if distinct.is_empty() {
+            return Err(WHY);
+        }
+        let mut regs = Vec::with_capacity(distinct.len());
+        for w in &distinct {
+            regs.push(self.register_sampler(w, cmp)?);
+        }
+        if regs.len() == 1 {
+            return Ok((None, regs));
+        }
+        let idx = self.sampler_index_phi(block, args, 0, &distinct, depth)?;
+        Ok((Some(idx), regs))
+    }
+
+    fn collect_constant_samplers(
+        &self,
+        block: usize,
+        args: &[Source],
+        depth: u32,
+        distinct: &mut Vec<[u32; 4]>,
+    ) -> Result<(), Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let p = self.x.p;
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            match arg {
+                Source::Constant(w) if w.len() >= 4 => {
+                    let k: [u32; 4] = w[..4].try_into().unwrap();
+                    if !distinct.contains(&k) {
+                        distinct.push(k);
+                    }
+                }
+                Source::Phi {
+                    block: inner,
+                    args: inner_args,
+                } if depth > 0 => {
+                    self.collect_constant_samplers(*inner, inner_args, depth - 1, distinct)?;
+                }
+                _ => return Err(WHY),
+            }
+        }
+        Ok(())
+    }
+
+    fn sampler_index_phi(
+        &mut self,
+        block: usize,
+        args: &[Source],
+        lower: u32,
+        distinct: &[[u32; 4]],
+        depth: u32,
+    ) -> Result<V, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let p = self.x.p;
+        let mut incoming = Vec::new();
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let idx = match arg {
+                Source::Constant(w) if w.len() >= 4 => {
+                    let k: [u32; 4] = w[..4].try_into().unwrap();
+                    let pos = distinct.iter().position(|d| *d == k).ok_or(WHY)? as u32;
+                    self.s.m.i32(lower + pos)
+                }
+                Source::Phi {
+                    block: inner,
+                    args: inner_args,
+                } if depth > 0 => {
+                    self.sampler_index_phi(*inner, inner_args, lower, distinct, depth - 1)?
+                }
+                _ => return Err(WHY),
+            };
+            incoming.push((idx, at));
+        }
+        let join = self.block[block].ok_or(WHY)?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, incoming);
+        Ok(phi)
+    }
+
     /// The bytes per element of the buffer view `src` names, if the program
     /// picks it from the view heap at an index it computes (root type
     /// `ResourceHeap`): read from the host's table by heap slot in the
