@@ -160,7 +160,10 @@ impl<'a> Lower<'a> {
                 } else if f16 {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
                     let lo = to_f16(self, f);
-                    self.low_half(inst, reg, lo)
+                    // omod and clamp are part of the f16 instruction; op_sel[3]
+                    // picks the destination half.
+                    let lo = self.half_modifiers(inst, lo);
+                    return self.write_half(inst, lo, None);
                 } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
                     let h = 2 * attribute.channel;
