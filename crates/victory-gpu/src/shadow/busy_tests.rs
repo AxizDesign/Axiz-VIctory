@@ -527,3 +527,105 @@ fn a_heaps_buffers_are_ready_for_the_list_submitted_first() {
         unregister(at, at as u64);
     }
 }
+
+/// A frame of submissions that read one big buffer the title made through
+/// the device and never writes again, and a smaller one it writes a little:
+///
+/// cargo test -p victory-gpu --release --lib committed_buffers -- --ignored --nocapture
+#[test]
+#[ignore = "a benchmark"]
+fn submissions_read_committed_buffers() {
+    if crate::host::host().is_none() {
+        return;
+    }
+    let number = |name: &str, default: usize| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+    let (still_mb, live_mb, submissions) = (number("BENCH_MB", 64), number("BENCH_LIVE_MB", 8), number("BENCH_SUBMISSIONS", 24));
+    let (_, still) = crate::list::copy_tests::sized_buffer(still_mb << 20);
+    let (_, live) = crate::list::copy_tests::sized_buffer(live_mb << 20);
+    let queue = title_queue();
+    let mut times = Vec::new();
+    for frame in 0..25usize {
+        for k in 0..64usize {
+            store(live as usize + (k * 7919 * 4096 + frame) % (live_mb << 20), frame as u8);
+        }
+        let started = std::time::Instant::now();
+        let mut made = Vec::new();
+        for _ in 0..submissions {
+            let list = title_list();
+            let h = crate::list::host_list(list).unwrap();
+            for (at, len) in [(still as u64, (still_mb << 20) as u64), (live as u64, (live_mb << 20) as u64)] {
+                let copy = find(at, len).unwrap();
+                copy.refresh(h, at, len);
+                h.keep(&copy.buffer);
+            }
+            close(list);
+            send(queue, &[list]);
+            made.push(list);
+        }
+        crate::host::settle_for_fence();
+        if frame >= 5 {
+            times.push(started.elapsed().as_secs_f64() * 1e3);
+        }
+        for list in made {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(list, 0x10)(list);
+        }
+    }
+    times.sort_by(f64::total_cmp);
+    println!("committed {:7.2} ms a frame", times[times.len() / 2]);
+}
+
+/// Memory given out anew at an address it was given out at before holds
+/// zeros nothing wrote: a copy of what was there takes them.
+#[test]
+fn memory_given_out_again_is_not_shown_as_it_was() {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let _alone = host.alone();
+    let len = 16 << 20;
+    let p = pool(len);
+    // A window of memory no buffer holds.
+    let at = (p + (6 << 20)) as u64;
+    let copy = find(at, 4096).unwrap();
+    let (first, size) = copy.span();
+    assert!(first as usize >= p && (first + size) as usize <= p + len, "all of the window is in the pool");
+    store(at as usize, 0x77);
+    copy.update(at as usize, 4096);
+    copy.update(first as usize, size as usize);
+    assert_eq!(held(&copy, at as usize), 0x77);
+    // SAFETY: the pool is ours, and nothing else reads it.
+    unsafe {
+        assert_ne!(VirtualFree(p as _, 0, MEM_RELEASE), 0);
+        let again = VirtualAlloc(p as _, len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+        if again as usize != p {
+            return; // taken meanwhile
+        }
+    }
+    crate::watch::title_memory_new(p, len);
+    copy.update(at as usize, 4096);
+    assert_eq!(held(&copy, at as usize), 0, "what was there before is still shown");
+}
+
+/// Memory for resources is watched: what is not written is not copied.
+#[test]
+fn a_committed_buffer_is_copied_by_the_pages_written() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let _alone = host.alone();
+    let len = 1 << 20;
+    let (_, data) = crate::list::copy_tests::sized_buffer(len);
+    for at in (data as usize..data as usize + len).step_by(4096) {
+        store(at, 9);
+    }
+    let copy = find(data as u64, len as u64).unwrap();
+    copy.update(data as usize, len);
+    assert_eq!(copy.update(data as usize, len), 0);
+    store(data as usize + 300_000, 1);
+    assert_eq!(copy.update(data as usize, len), 4096);
+    assert_eq!(held(&copy, data as usize + 300_000), 1);
+}

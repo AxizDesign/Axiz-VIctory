@@ -1001,6 +1001,22 @@ fn mapping_write(range: MappingRange) -> Remapping {
 }
 /// Excludes all in-place readers during a mapping change of unknown extent.
 pub fn title_memory_remapping() -> Remapping { mapping_write(None) }
+
+/// The runtime gives out `[at, at + len)`, zeroed and write-watched. The
+/// address may have been given out before: the kernel tells no write of
+/// pages that became zeros that way, and a copy of what was there (a window
+/// outside buffers) would go on showing it.
+pub fn title_memory_new(at: usize, len: usize) {
+    let Some(end) = at.checked_add(len) else {
+        return;
+    };
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    for page in at / PAGE..end.div_ceil(PAGE) {
+        j.note(page, now, u16::MAX);
+    }
+}
 /// Excludes readers overlapping the full range affected by a mapping change.
 pub fn title_memory_remapping_range(at: usize, len: usize) -> Remapping {
     mapping_write(mapping_range(at, len))
@@ -1180,6 +1196,9 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
+        // Memory another test had at the address has its writes noted.
+        let forget = || JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written.retain(|page, _| !(start / PAGE..end / PAGE).contains(page));
+        forget();
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.

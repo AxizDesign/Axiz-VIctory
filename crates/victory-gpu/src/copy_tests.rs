@@ -10,8 +10,13 @@ use crate::object::{S_OK, This, guid, slot};
 const LEN: usize = 0x1_0000;
 
 fn buffer() -> (This, *mut u8) {
-    // A 64 KiB buffer on a default heap, as title descriptions are laid out.
-    let words: [u32; 14] = [1, 0, 0, 0, LEN as u32, 0, 1, 0x1_0001, 0, 1, 0, 1, 4, 0];
+    sized_buffer(LEN)
+}
+
+/// A buffer of `len` bytes on a default heap, as title descriptions are
+/// laid out.
+pub(crate) fn sized_buffer(len: usize) -> (This, *mut u8) {
+    let words: [u32; 14] = [1, 0, 0, 0, len as u32, (len >> 32) as u32, 1, 0x1_0001, 0, 1, 0, 1, 4, 0];
     // SAFETY: plain numbers in the descriptions' layouts.
     let (desc, heap): (crate::resource::ResourceDesc, crate::resource::HeapProperties) =
         unsafe {
@@ -30,8 +35,8 @@ fn buffer() -> (This, *mut u8) {
     let null = std::ptr::null();
     let hr = crate::resource::create_committed(null, &heap, 0, &desc, 0, null.cast(), &iid, &mut made);
     assert_eq!(hr, S_OK);
-    let (data, len) = crate::resource::buffer_bytes(made).unwrap();
-    assert_eq!(len, LEN as u64);
+    let (data, size) = crate::resource::buffer_bytes(made).unwrap();
+    assert_eq!(size, len as u64);
     (made, data)
 }
 
