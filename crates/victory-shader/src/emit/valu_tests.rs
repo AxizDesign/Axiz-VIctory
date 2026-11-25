@@ -1462,6 +1462,8 @@ fn scalar_lshl_add_and_minmax_set_scc() {
                 inp[0], inp[1],
             );
         });
+    }
+}
 #[test]
 fn wave_prefix_f32_uses_signed_flag_and_validates() {
     // 32-thread wave32 inclusive float prefix sum over v5 = float(v0):
@@ -1488,52 +1490,12 @@ fn wave_prefix_f32_uses_signed_flag_and_validates() {
     // Store each lane's prefix sum to UAV[v0].
     words.push(0x340E_0082); // v_lshlrev_b32 v7, 2, v0
     words.extend_from_slice(&[0xE070_1000, 0x8002_0107]); // buffer_store_dword v1, v7, s[8:11], 0 offen
-/// MIMG sampled instruction encoding (`r128 = 0`, `nsa = 0`).
-#[allow(clippy::too_many_arguments)]
-const fn mimg_sample(
-    op: u8,
-    dim: u8,
-    dmask: u8,
-    a16: bool,
-    vdata: u8,
-    vaddr: u8,
-    srsrc: u8,
-    ssamp: u8,
-) -> [u32; 2] {
-    [
-        0x3C << 26
-            | (op as u32 & 0x7F) << 18
-            | (dmask as u32 & 0xF) << 8
-            | (dim as u32 & 7) << 3
-            | (op as u32 >> 7 & 1),
-        (a16 as u32) << 30
-            | ((ssamp as u32 >> 2) & 0x1F) << 21
-            | ((srsrc as u32 >> 2) & 0x1F) << 16
-            | (vdata as u32) << 8
-            | vaddr as u32,
-    ]
-}
-
-fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
-    let mut words = Vec::new();
-    // s[4:5] = view table (SRV at 0, UAV at 8 dwords); s[6:7] = sampler table (offset 0).
-    words.push(s_mov_b32(5, 0x80));
-    words.push(s_mov_b32(7, 0x80));
-    // s_load_dwordx8 s[8:15], s[4:5], 0x0
-    words.extend_from_slice(&[0xF40C_0202, 0xFA00_0000]);
-    // s_load_dwordx4 s[16:19], s[6:7], 0x0
-    words.extend_from_slice(&s_load_dwordx4(16, 6));
-    // s_load_dwordx4 s[20:23], s[4:5], 0x20
-    words.extend_from_slice(&[0xF408_0502, 0xFA00_0020]);
-    words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 20, 0));
     words.push(S_ENDPGM);
 
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
-        vgprs,
         layout: vec![
             RootParam {
                 root: RootType::Constants,
@@ -1565,50 +1527,6 @@ fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1,
             threads: [32, 1, 1],
-            RootParam {
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 6,
-                slot: 2,
-            },
-        ],
-        used: vec![
-            UsedResource {
-                kind: ResourceType::Srv,
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 8,
-                user_data: 4,
-                slot: 1,
-            },
-            UsedResource {
-                kind: ResourceType::Uav,
-                root: RootType::Table,
-                table_offset_dwords: 8,
-                lower_bound: 0,
-                stride: 4,
-                dwords: 4,
-                user_data: 4,
-                slot: 1,
-            },
-            UsedResource {
-                kind: ResourceType::Sampler,
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 4,
-                user_data: 6,
-                slot: 2,
-            },
-        ],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 7 << 1,
-            threads: [1, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -1639,11 +1557,6 @@ fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
         dxil,
         user_data: l.user_data,
         samplers: Vec::new(),
-    HostShader {
-        stage: HwStage::Cs,
-        dxil,
-        user_data: l.user_data,
-        samplers: l.samplers,
         static_samplers: Vec::new(),
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
@@ -1656,6 +1569,26 @@ fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
         if let Ok(host) = Host::new(false)
             && let Ok((root, pso)) = host.compute_pipeline(&shader)
         {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        views: &[View::RawUav(32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            for lane in 0..32u32 {
+                let got = f32::from_bits(out[0][lane as usize]);
+                let want = (lane * (lane + 1) / 2) as f32;
+                assert_eq!(got, want, "lane {lane}: got {got}, want {want}");
+            }
+        }
+    }
+}
 /// MTBUF instruction encoding (`tbuffer_load_format_*`, soffset = inline 0).
 const fn mtbuf(op: u8, format: u8, vdata: u8, vaddr: u8, srsrc: u8, offset: u16) -> [u32; 2] {
     [
@@ -1668,11 +1601,6 @@ const fn mtbuf(op: u8, format: u8, vdata: u8, vaddr: u8, srsrc: u8, offset: u16)
             | ((srsrc as u32 >> 2) & 0x1F) << 16
             | (vdata as u32) << 8
             | vaddr as u32,
-/// MUBUF `buffer_load_*` with `offen = 1`, `soffset = 0`, `offset = 0`.
-const fn mubuf_load_offen(op: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
-    [
-        0x38 << 26 | (op as u32 & 0x7F) << 18 | 1 << 12,
-        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
     ]
 }
 
@@ -1749,6 +1677,136 @@ fn tbuffer_load_format_d16_packs_float_and_int_channels() {
         words.extend_from_slice(&mtbuf(op, fmt, 1, 0, 8, 0)); // load into v[1:2]
         words.extend_from_slice(&buffer_store_dword(1, 12, 0));
         words.extend_from_slice(&buffer_store_dword(2, 12, 4));
+        words.push(S_ENDPGM);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let l = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut dxil).unwrap();
+        }
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil,
+            user_data: l.user_data,
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: Vec::new(),
+        };
+        #[cfg(windows)]
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0, 0, 0, 0, 0]))],
+                        views: &[
+                            View::Buffer {
+                                data: input,
+                                stride: super::host::Stride::Raw,
+                            },
+                            View::RawUav(16),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                [out[0][0], out[0][1]],
+                want,
+                "{backend}: {label}: got [{:#010x}, {:#010x}], want [{:#010x}, {:#010x}]",
+                out[0][0],
+                out[0][1],
+                want[0],
+                want[1],
+            );
+        }
+    }
+}
+/// MUBUF `buffer_load_*` with `offen = 1`, `soffset = 0`, `offset = 0`.
+const fn mubuf_load_offen(op: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | (op as u32 & 0x7F) << 18 | 1 << 12,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+#[test]
 fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
     // CBV contents (64 bytes = 16 dwords, 16-byte rows):
     //   dword 0 (bytes 0..4):   [0x05, 0xFE, 0x7F, 0x81]
@@ -1821,11 +1879,6 @@ fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
             ],
             used: vec![
                 UsedResource {
-                    kind: ResourceType::Srv,
-                    root: RootType::Table,
-                    table_offset_dwords: 0,
-                    lower_bound: 0,
-                    stride: 4,
                     kind: ResourceType::Cbv,
                     root: RootType::Table,
                     table_offset_dwords: 0,
@@ -1885,6 +1938,186 @@ fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
             root_indexed_views: Vec::new(),
         };
         #[cfg(windows)]
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            for &off in offsets {
+                let want = match (bits, signed) {
+                    (8, false) => u32::from(bytes[off as usize]),
+                    (8, true) => (bytes[off as usize] as i8) as i32 as u32,
+                    (16, false) => u32::from(u16::from_le_bytes([
+                        bytes[off as usize],
+                        bytes[off as usize + 1],
+                    ])),
+                    (16, true) => (i16::from_le_bytes([
+                        bytes[off as usize],
+                        bytes[off as usize + 1],
+                    ])) as i32 as u32,
+                    _ => unreachable!(),
+                };
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(vec![off, 0, 0, 0, 0]))],
+                            views: &[View::Cbv(&cbv_data), View::RawUav(16)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    out[0][0], want,
+                    "{backend}: {name} at CBV byte offset {off} = {:#010x}, want {want:#010x}",
+                    out[0][0],
+                );
+            }
+        }
+    }
+}
+/// MIMG sampled instruction encoding (`r128 = 0`, `nsa = 0`).
+#[allow(clippy::too_many_arguments)]
+const fn mimg_sample(
+    op: u8,
+    dim: u8,
+    dmask: u8,
+    a16: bool,
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    ssamp: u8,
+) -> [u32; 2] {
+    [
+        0x3C << 26
+            | (op as u32 & 0x7F) << 18
+            | (dmask as u32 & 0xF) << 8
+            | (dim as u32 & 7) << 3
+            | (op as u32 >> 7 & 1),
+        (a16 as u32) << 30
+            | ((ssamp as u32 >> 2) & 0x1F) << 21
+            | ((srsrc as u32 >> 2) & 0x1F) << 16
+            | (vdata as u32) << 8
+            | vaddr as u32,
+    ]
+}
+
+fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
+    let mut words = Vec::new();
+    // s[4:5] = view table (SRV at 0, UAV at 8 dwords); s[6:7] = sampler table (offset 0).
+    words.push(s_mov_b32(5, 0x80));
+    words.push(s_mov_b32(7, 0x80));
+    // s_load_dwordx8 s[8:15], s[4:5], 0x0
+    words.extend_from_slice(&[0xF40C_0202, 0xFA00_0000]);
+    // s_load_dwordx4 s[16:19], s[6:7], 0x0
+    words.extend_from_slice(&s_load_dwordx4(16, 6));
+    // s_load_dwordx4 s[20:23], s[4:5], 0x20
+    words.extend_from_slice(&[0xF408_0502, 0xFA00_0020]);
+    words.extend_from_slice(body);
+    words.extend_from_slice(&buffer_store_dword(0, 20, 0));
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Sampler,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 7 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .unwrap();
+    let mut dxil = l.dxil;
+    #[cfg(windows)]
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut dxil).unwrap();
+    }
+    HostShader {
+        stage: HwStage::Cs,
+        dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        root_indexed_views: Vec::new(),
     }
 }
 
@@ -2014,63 +2247,12 @@ fn mimg_cube_sample_d_selects_exact_log2_mip() {
                 continue;
             };
             let (root, pso) = host.compute_pipeline(&shader).unwrap();
-            let out = host
-                .dispatch(
-                    &root,
-                    &pso,
-                    &Dispatch {
-                        roots: vec![(0, Root::Constants(vec![0; 5]))],
-                        views: &[View::RawUav(32)],
-                        roots: vec![(0, Root::Constants(vec![0, 0, 0, 0, 0]))],
-                        views: &[
-                            View::Buffer {
-                                data: input,
-                                stride: super::host::Stride::Raw,
-                            },
-                            View::RawUav(16),
-                        ],
-                        samplers: &[],
-                        groups: [1, 1, 1],
-                    },
-                )
-                .unwrap();
-            for lane in 0..32u32 {
-                let got = f32::from_bits(out[0][lane as usize]);
-                let want = (lane * (lane + 1) / 2) as f32;
-                assert_eq!(got, want, "lane {lane}: got {got}, want {want}");
-            }
-            assert_eq!(
-                [out[0][0], out[0][1]],
-                want,
-                "{backend}: {label}: got [{:#010x}, {:#010x}], want [{:#010x}, {:#010x}]",
-                out[0][0],
-                out[0][1],
-                want[0],
-                want[1],
-            );
-            for &off in offsets {
-                let want = match (bits, signed) {
-                    (8, false) => u32::from(bytes[off as usize]),
-                    (8, true) => (bytes[off as usize] as i8) as i32 as u32,
-                    (16, false) => u32::from(u16::from_le_bytes([
-                        bytes[off as usize],
-                        bytes[off as usize + 1],
-                    ])),
-                    (16, true) => (i16::from_le_bytes([
-                        bytes[off as usize],
-                        bytes[off as usize + 1],
-                    ])) as i32 as u32,
-                    _ => unreachable!(),
-                };
             for &(g, want) in cases {
                 let out = host
                     .dispatch(
                         &root,
                         &pso,
                         &Dispatch {
-                            roots: vec![(0, Root::Constants(vec![off, 0, 0, 0, 0]))],
-                            views: &[View::Cbv(&cbv_data), View::RawUav(16)],
-                            samplers: &[],
                             roots: vec![(0, Root::Constants(vec![g.to_bits(), 0, 0, 0, 0, 0, 0]))],
                             views: &[View::CubeMips(8, &mips), View::RawUav(16)],
                             samplers: &sampler,
@@ -2078,10 +2260,6 @@ fn mimg_cube_sample_d_selects_exact_log2_mip() {
                         },
                     )
                     .unwrap();
-                assert_eq!(
-                    out[0][0], want,
-                    "{backend}: {name} at CBV byte offset {off} = {:#010x}, want {want:#010x}",
-                    out[0][0],
                 let got = f32::from_bits(out[0][0]);
                 assert!(
                     (got - want).abs() < 0.05,
