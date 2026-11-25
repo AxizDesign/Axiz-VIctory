@@ -202,7 +202,7 @@ pub fn shader_opt() -> u32 {
 /// The environment variables a translation depends on besides those with a
 /// function of their own here ([`loop_limit`], [`group_sync`],
 /// [`shader_opt`]): read where they matter.
-const SWITCHES: [&str; 10] = [
+const SWITCHES: [&str; 11] = [
     "VICTORY_WAVE_WIDE",
     "VICTORY_WAVE_DEEP_SKIPS",
     "VICTORY_WAVE_OWN_BITS",
@@ -213,6 +213,7 @@ const SWITCHES: [&str; 10] = [
     "VICTORY_FIRSTLANE_OWN",
     "VICTORY_FIRST_HALF",
     "VICTORY_PIXEL_HELPERS",
+    "VICTORY_LDS_FLAGS",
 ];
 
 /// Everything a translation depends on besides the container and this
@@ -2852,12 +2853,13 @@ mod settings_tests {
     #[test]
     fn every_switch_the_translator_reads_is_keyed_on() {
         // Keyed by value, for tests and dumps alone, or only said aloud.
-        const OTHERS: [&str; 14] = [
+        const OTHERS: [&str; 15] = [
             "VICTORY_SEMANTICS_REPORT",
             "VICTORY_GROUP_SYNC",
             "VICTORY_SHADER_LOOP_LIMIT",
             "VICTORY_SHADER_OPT",
             "VICTORY_WAVE_WHY",
+            "VICTORY_WAVE_DUMP",
             "VICTORY_EMIT_DUMP",
             "VICTORY_SHADER_CENSUS",
             "VICTORY_DIFF_ONLY",
