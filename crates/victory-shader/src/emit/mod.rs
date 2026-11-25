@@ -105,6 +105,8 @@ mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
+mod semantics_tests;
+#[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
@@ -2068,7 +2070,8 @@ mod settings_tests {
     #[test]
     fn every_switch_the_translator_reads_is_keyed_on() {
         // Keyed by value, for tests and dumps alone, or only said aloud.
-        const OTHERS: [&str; 13] = [
+        const OTHERS: [&str; 14] = [
+            "VICTORY_SEMANTICS_REPORT",
             "VICTORY_GROUP_SYNC",
             "VICTORY_SHADER_LOOP_LIMIT",
             "VICTORY_SHADER_OPT",
