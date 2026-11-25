@@ -5011,6 +5011,13 @@ impl Host {
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
                 WaitForSingleObject(event, INFINITE);
+                // A device that is gone ends every wait, with nothing
+                // fetched: the bytes are not to be merged (after
+                // reddxd-byte/ShakiraRED-dt c2271e5).
+                if fence.GetCompletedValue() == u64::MAX {
+                    self.device.GetDeviceRemovedReason()?;
+                    return Err(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED.into());
+                }
                 Ok(after)
             })()
         };
@@ -5812,6 +5819,8 @@ impl Host {
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
+        // What copies checked before is checked again (`crate::stamp`).
+        crate::stamp::advance();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
@@ -5829,15 +5838,21 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            let textures = crate::watch::ask_views() > 1;
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    match step {
+                        Step::Refresh(shadow, address, len) if !shadow.unwatched() => {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
+                        Step::Texture(staging) if textures => {
+                            let (at, len) = staging.memory();
+                            spans.insert(std::sync::Arc::as_ptr(staging) as usize, (at, at + len));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -7720,6 +7735,16 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        // Checked already in this submission (`crate::stamp`): nothing to
+        // merge into the batch.
+        if shadow.current(address, len) {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
+            }
+            return;
+        }
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         // Brought up to date in this submission already ([`refresh_once`];
@@ -8097,6 +8122,12 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    write_mapped_now(dst, src, len);
+    // Copies checked while it wrote check again (`crate::stamp`).
+    crate::stamp::advance();
+}
+
+fn write_mapped_now(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
@@ -8115,7 +8146,9 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
+    // In place first, if asked for; a page that is not there goes to the
+    // kernel's copy, which leaves it alone.
+    if len == 0 || crate::plaincopy::write(dst, src, len) || write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
@@ -8406,6 +8439,16 @@ impl Meter {
                 tracing::info!(
                     "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), {first:.1} of those with nothing uploaded yet, which were read around the missing pages"
+                );
+            }
+            let [changes, waiting, under_way] = [0, 1, 2].map(|i| {
+                crate::watch::REMAPS[i].swap(0, Ordering::Relaxed) as f64 / [1.0, 1e3, 1e3][i] / frames
+            });
+            if changes > 0.0 {
+                tracing::info!(
+                    "changes of title memory's mapping per frame: {changes:.0}, {waiting:.1} ms of them waiting for reads in place, \
+                     {under_way:.1} ms under way (each holds {}; VICTORY_MAPPING_RANGES=0 holds all of title memory)",
+                    if crate::watch::by_range() { "the bytes it changes" } else { "all of title memory" }
                 );
             }
         }

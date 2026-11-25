@@ -77,6 +77,8 @@ pub(crate) struct Shadow {
     /// Asks for the copy that gave no length (root views: they read from
     /// their address to the copy's end, whatever lies there).
     unsized_asks: AtomicU64,
+    /// With `crate::stamp` on: the pages checked in this submission.
+    stamp: crate::stamp::Stamp,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -802,15 +804,28 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    let merge = |now: &[u8], held: &mut [u8], title: &mut [u8]| {
+        let mut differs = 0u8;
+        for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+            let wrote = if *n != *h { 0xffu8 } else { 0 };
+            let merged = (*t & !wrote) | (*n & wrote);
+            differs |= merged ^ *t;
+            *t = merged;
+            *h = (*h & !wrote) | (*n & wrote);
+        }
+        differs != 0
+    };
+    // What a shader wrote lies in a few places of a piece: equal stretches
+    // are passed over without a store to either side (after
+    // reddxd-byte/ShakiraRED-dt c2271e5).
+    const STEP: usize = 64;
+    let mut differs = false;
+    for ((n, h), t) in now.chunks(STEP).zip(held.chunks_mut(STEP)).zip(title.chunks_mut(STEP)) {
+        if n != h {
+            differs |= merge(n, h, t);
+        }
     }
-    differs != 0
+    differs
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1383,6 +1398,20 @@ struct Workers {
     more: std::sync::Condvar,
 }
 
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS`; a quarter
+/// of the processor's, 2 to 6, unless set). The fork whose switch this is
+/// (reddxd-byte/ShakiraRED-dt c2271e5) keeps half of them, 2 to 12; the
+/// title's own threads and the recording ones want the rest, so that is to
+/// be measured.
+fn wide_threads() -> usize {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::env::var("VICTORY_WIDE_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map_or((threads / 4).clamp(2, 6), |n| n.min(threads))
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1391,7 +1420,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = wide_threads();
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 WIDE_WORKER.set(true);
@@ -1670,22 +1699,6 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
 /// ranges compared in windows and in buffers' copies.
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
-/// The longest run of shader-written bytes put back with a store of ours
-/// ([`back_store`]); longer ones cost the kernel call little.
-const STORED_MOST: usize = 512;
-
-/// Whether the runs of bytes shaders wrote are put back into title memory
-/// with stores of ours ([`crate::watch::store_checked`]) instead of a
-/// kernel call each (`VICTORY_BACK_STORE=1`; off otherwise). The same runs
-/// either way ([`back_piece`], upstream VIctory #2009: no byte between
-/// them is written), and a run that cannot be stored goes to the kernel as
-/// before. In the open world the kernel calls were a quarter of the
-/// submitting thread (run p1: 98 of 389 ms a frame).
-fn back_store() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_BACK_STORE").is_ok_and(|v| v == "1"))
-}
-
 /// Since the last frame line: stretches of title memory put back into,
 /// the runs in them, their bytes.
 static BACK_RUNS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -1698,9 +1711,8 @@ pub(crate) fn back_line(frames: f64) {
     let [stretches, runs, bytes] = [0, 1, 2].map(|i| BACK_RUNS[i].swap(0, Ordering::Relaxed) as f64 / frames);
     if runs > 0.0 {
         tracing::info!(
-            "shader writes put back per frame: {stretches:.0} stretches, {runs:.0} runs, {:.2} MB (VICTORY_BACK_STORE: now {})",
-            bytes / 1e6,
-            if back_store() { "on" } else { "off" }
+            "shader writes put back per frame: {stretches:.0} stretches, {runs:.0} runs, {:.2} MB",
+            bytes / 1e6
         );
     }
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -2812,6 +2824,7 @@ impl Shadow {
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
+            stamp: crate::stamp::Stamp::default(),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -3032,12 +3045,8 @@ impl Shadow {
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
                 // there since stays.
-                let store = back_store();
                 for &(off, len) in &runs {
-                    let (to, from) = ((start + at + off) as *mut u8, title[off..].as_ptr());
-                    if !(store && len <= STORED_MOST && crate::watch::store_checked(to, from, len)) {
-                        crate::host::write_mapped(to, from, len);
-                    }
+                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
                     written += len;
                 }
                 BACK_RUNS[0].fetch_add(1, Ordering::Relaxed);
@@ -3543,6 +3552,29 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // Around ranges shaders are writing: the gaps, each as below (in
+        // the world most submissions have such ranges; copying the gaps
+        // whole cost ~1 s per frame).
+        // Checked already (`crate::stamp`): each gap on its own. The sequence
+        // is read before the check, so what is written during it is not
+        // marked as seen.
+        let seq = crate::stamp::on().then(crate::stamp::now);
+        let mut bytes = 0;
+        self.gaps(from, to, |a, e| {
+            if seq.is_some_and(|seq| self.stamp.current(seq, a, e, start, end)) {
+                return;
+            }
+            bytes += self.update_free(a, e);
+            if let Some(seq) = seq {
+                self.stamp.mark(seq, a, e, start, end);
+            }
+        });
+        bytes
+    }
+
+    /// Calls `f` with the parts of `[from, to)` (inside the buffer) no range
+    /// shaders may be writing holds, in order.
+    fn gaps(&self, from: usize, to: usize, mut f: impl FnMut(usize, usize)) {
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -3551,24 +3583,36 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
-        if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                if a > at {
-                    bytes += self.update_free(at, a);
-                }
-                at = at.max(e);
+        busy.sort_unstable();
+        let mut at = from;
+        for (a, e) in busy {
+            if a > at {
+                f(at, a);
             }
-            if at < to {
-                bytes += self.update_free(at, to);
-            }
-            return bytes;
+            at = at.max(e);
         }
-        self.update_free(from, to)
+        if at < to {
+            f(at, to);
+        }
+    }
+
+    /// With `crate::stamp` on: whether `[address, address + len)` was
+    /// checked whole in this submission already (a refresh of it has
+    /// nothing to do).
+    pub(crate) fn current(&self, address: usize, len: usize) -> bool {
+        if !crate::stamp::on() {
+            return false;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if self.place.is_some() || from >= to {
+            return true;
+        }
+        // Ranges shaders may be writing are not refreshed anyway.
+        let seq = crate::stamp::now();
+        let mut current = true;
+        self.gaps(from, to, |a, e| current = current && self.stamp.current(seq, a, e, start, end));
+        current
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no

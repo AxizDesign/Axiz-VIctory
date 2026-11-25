@@ -15,6 +15,10 @@ five seconds), world frames only (1,000 draws and more).
 | 9 | the same, `SKIP_WC_COMPARE` off, warm cache | 7.5 | 5.8 | 7.7 | 389 | 528 | 1,168 | 1 | 0 |
 | 10 | 8's settings, warm cache, shared copies kept (below) | 10.8 | 6.7 | 10.6 | 496 | 1,054 | 2,733 | 5 | 0 |
 | 11 | first unified build (`unify/all-forks` ecade07) | 20.1 | 6.8 | 12.9 | 478 | 1,042 | 4,648 | 9 | 0 |
+| 12 | + water copied back, marked-slot heap pass | 25.3 | 6.9 | 11.2 | 283 | 548 | 13,362 | 7 | 0 |
+| 14 | + view slots made side by side, dispatches in parts, NaN guard (a recorder ran beside it) | 8.2 | 7.3 | 10.5 | 201 | 366 | 840 | 0 | 0 |
+| 15 | `--work gpu`, windows of 1 MiB, timing on | 9.3 | 7.5 | 12.8 | 252 | 551 | 3,464 | 2 | 0 |
+| 17 | ray-tracing structure builder on, memory declared by address only | 3.5 | 3.2 | 4.3 | 1,188 | 1,883 | 1,883 | 2 | 0 |
 
 Run 11's first five minutes shared the processor with builds and tests; its
 numbers are low for that part. By three-minute part, frames/s median: 4.8,
@@ -66,3 +70,25 @@ clock. What limits the frame is one step waiting for the next.
 
 Unified tree: 234 of 234 GPU tests, 34 of 34 format tests, 122 and 10 of the
 rest pass (5 and 6 are left out by design).
+
+### Later the same day (runs 12 to 17)
+
+- **Boats float** (run 12): the height map comes back to the title.
+- **Run 13** was started with every saved pipeline invalid (a change to all
+  pixel programs): 2,259 were made in the title at about two a second, with a
+  black picture. The pre-build does the same in two to four minutes with the
+  title closed; it has to run after any change of the translator.
+- **A usual frame of 123 ms (3,700 draws, run 15):** submitting thread 108 ms
+  at work (preparing 67, waiting for the card 23), the title's own passes 79
+  ms of card time in 191 lists, our extra passes 0.8 ms, the card idle 25 ms.
+  No pass is large: the dearest takes 2.6 ms.
+- **No gain:** `VICTORY_REFRESH_ONCE` with `VICTORY_VIEW_KNOWN` (25 readings
+  each way: 128 ms off, 138 on), `--work gpu` with windows of 1 MiB.
+- **Ray tracing:** with the thread counts of `DispatchX`, per-list watermarks
+  of numbered copies and bounded builder writes the structure builder runs
+  whole (53 programs) and the title went on for as long as it was played (a
+  few minutes, no fault). Run 16: 2 to 2.5 s a frame, because 8.1 GB of
+  windows were declared written by programs that cannot store by address. Run
+  17 without that: 200 to 240 ms in a cutscene, of it 43 ms on the card.
+- **Characters black for some seconds after a cut:** their textures had not
+  been uploaded yet. Open.

@@ -19,11 +19,12 @@ $folder = Join-Path $env:LOCALAPPDATA 'victory'
 $store = Join-Path $folder 'launcher.json'
 
 function Read-Choices {
-    $choices = @{ GameExe = ''; Work = 'balanced' }
+    $choices = @{ GameExe = ''; Work = 'balanced'; Lossless = $false }
     try {
         $read = Get-Content -LiteralPath $store -Raw -ErrorAction Stop | ConvertFrom-Json
         if ($read.GameExe) { $choices.GameExe = [string]$read.GameExe }
         if ($read.Work -in 'cpu', 'balanced', 'gpu') { $choices.Work = [string]$read.Work }
+        $choices.Lossless = [bool]$read.Lossless
         # (A LoopLimit an earlier launcher kept there is left out on purpose:
         # it cut compute loops short.)
     } catch { }   # no file yet, or not one of ours: the defaults
@@ -47,11 +48,12 @@ function Get-StartArguments([string[]]$More) {
     ($line + $More) -join ' '
 }
 
-function Get-PlayArguments([string]$Exe, [string]$Work, [bool]$Prebuild) {
+function Get-PlayArguments([string]$Exe, [string]$Work, [bool]$Prebuild, [bool]$Lossless = $false) {
     '-GameExe'
     Format-Argument $Exe
     if ($Work -ne 'balanced') { "-Work $Work" }
     if ($Prebuild) { '-Prebuild' }
+    if ($Lossless -and -not $Prebuild) { '-LosslessScaling' }
 }
 
 function Open-Console([string[]]$More) {
@@ -63,7 +65,7 @@ $choices = Read-Choices
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'VIctory'
-$form.ClientSize = New-Object System.Drawing.Size(560, 216)
+$form.ClientSize = New-Object System.Drawing.Size(560, 244)
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
@@ -91,12 +93,14 @@ $check = Add-Control (New-Object System.Windows.Forms.Button) 16 112 126 34 'Che
 $install = Add-Control (New-Object System.Windows.Forms.Button) 150 112 160 34 'Install what is missing'
 $keys = Add-Control (New-Object System.Windows.Forms.Button) 318 112 90 34 'Keys...'
 $play = Add-Control (New-Object System.Windows.Forms.Button) 416 112 128 34 'Play'
-$status = Add-Control (New-Object System.Windows.Forms.Label) 16 160 528 44 `
+$lossless = Add-Control (New-Object System.Windows.Forms.CheckBox) 16 154 528 22 'Start Lossless Scaling with the title (a Steam application of its own)'
+$lossless.Checked = $choices.Lossless
+$status = Add-Control (New-Object System.Windows.Forms.Label) 16 188 528 44 `
     'The first build takes minutes. The first start translates shaders and loads slowly: pre-build before it, and once more after it.'
 $form.AcceptButton = $play
 
 function Save-Form {
-    Save-Choices @{ GameExe = $path.Text.Trim(); Work = $works[$work.SelectedIndex] }
+    Save-Choices @{ GameExe = $path.Text.Trim(); Work = $works[$work.SelectedIndex]; Lossless = $lossless.Checked }
 }
 
 # A button's work; what goes wrong is shown, not thrown out of the window.
@@ -133,7 +137,7 @@ function Start-Title([bool]$Ahead, [string]$Said) {
         return
     }
     Save-Form
-    Open-Console (Get-PlayArguments $exe $works[$work.SelectedIndex] $Ahead)
+    Open-Console (Get-PlayArguments $exe $works[$work.SelectedIndex] $Ahead $lossless.Checked)
     $status.Text = $Said
 }
 $play.Add_Click({ Invoke-Safely { Start-Title $false 'Building, checking and starting in the other window.' } })
@@ -142,11 +146,13 @@ $prebuild.Add_Click({ Invoke-Safely { Start-Title $true 'Pre-building in the oth
 if ($SelfTest) {
     if (-not (Test-Path -LiteralPath $start)) { throw "no $start" }
     if ((Format-Argument 'D:\a b\t.exe') -ne '"D:\a b\t.exe"') { throw 'quoting' }
-    if ($form.Controls.Count -ne 11) { throw "controls: $($form.Controls.Count)" }
+    if ($form.Controls.Count -ne 12) { throw "controls: $($form.Controls.Count)" }
     $line = (Get-PlayArguments 'D:\a b\t.exe' 'gpu' $false) -join ' '
     if ($line -ne '-GameExe "D:\a b\t.exe" -Work gpu') { throw "play: $line" }
     $line = (Get-PlayArguments 'D:\a b\t.exe' 'balanced' $true) -join ' '
     if ($line -ne '-GameExe "D:\a b\t.exe" -Prebuild') { throw "pre-build: $line" }
+    $line = (Get-PlayArguments 'D:\a b\t.exe' 'balanced' $false $true) -join ' '
+    if ($line -ne '-GameExe "D:\a b\t.exe" -LosslessScaling') { throw "lossless: $line" }
     $form.Dispose()
     'launcher: ok'
     exit 0
