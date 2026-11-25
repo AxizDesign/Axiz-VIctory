@@ -38,6 +38,10 @@
   Where work is done that the processor and the graphics card can both do:
   cpu (less on the card and less of its memory), balanced, gpu (more on it).
 
+.PARAMETER LosslessScaling
+  Also start Lossless Scaling (a Steam application of its own, not part of
+  VIctory), so that its profile for victory.exe or its hotkey can be used.
+
 .PARAMETER Force
   Run the title although `victory doctor` found something missing.
 
@@ -56,6 +60,7 @@ param(
     [ValidateSet('cpu', 'balanced', 'gpu')][string]$Work = 'balanced',
     [switch]$Prebuild,
     [switch]$PrebuildAll,
+    [switch]$LosslessScaling,
     [switch]$Force
 )
 
@@ -161,6 +166,10 @@ try {
         Write-Host "Pre-building from $($files.Count) files. Ctrl+C stops it; the next one goes on from there." -ForegroundColor Cyan
         & $victory translate --cache --pipelines @used @files
     } else {
+        if ($LosslessScaling -and -not (Get-Process LosslessScaling -ErrorAction SilentlyContinue)) {
+            # Steam's number for it; Steam starts it, and says so if it is not there.
+            try { Start-Process 'steam://rungameid/993090' } catch { Write-Warning "Lossless Scaling was not started: $_" }
+        }
         Write-Host 'Starting. The first start translates shaders: parts of the picture come in late.' -ForegroundColor Cyan
         & $victory run $GameExe --execute --work $Work
     }
