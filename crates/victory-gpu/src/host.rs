@@ -4282,6 +4282,8 @@ impl Host {
         }
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        // Ranges to fetch whether or not this submission writes them.
+        let mut owed: Vec<(Arc<crate::shadow::Shadow>, (usize, usize))> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
@@ -4305,7 +4307,11 @@ impl Host {
         // flights' own declared writes (`declared_writes`).
         if crate::census::skip_wc_compare() {
             let before = declared.len();
-            declared.retain(|(shadow, _)| !crate::census::is_wc(shadow.title_start()));
+            if crate::census::keep_shared() {
+                owed = Self::shared_writes(&mut declared);
+            } else {
+                declared.retain(|(shadow, _)| !crate::census::is_wc(shadow.title_start()));
+            }
             crate::census::UNCOMPARED.fetch_add((before - declared.len()) as u64, Ordering::Relaxed);
         }
         // With the relay: the order of the queue is held from here until
@@ -4330,7 +4336,7 @@ impl Host {
                 second.sent_up(&self.queue, sent_as);
             }
         };
-        if declared.is_empty() && dirty.is_empty() {
+        if declared.is_empty() && dirty.is_empty() && owed.is_empty() {
             numbered();
             return None;
         }
@@ -4519,6 +4525,11 @@ impl Host {
                 }
             }
         }
+        for (shadow, (from, to)) in owed {
+            if let Some(span) = shadow.card_span(from, to) {
+                plan.ranges.push(CardRange { shadow, declared: (from, to), span, at: 0, compared: false });
+            }
+        }
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
@@ -4610,6 +4621,63 @@ impl Host {
         }
         work.out += 1;
         Some(plan)
+    }
+
+    /// With `crate::census::keep_shared`: cuts the declared writes of
+    /// copies of write-combining memory to the bytes another copy holds as
+    /// well (copies left with none go), and returns the ranges a copy not
+    /// met before shares with one whose shader writes stayed on the card
+    /// until now: those are fetched once, or a write made before the new
+    /// copy was would never reach it.
+    #[allow(clippy::type_complexity)]
+    fn shared_writes(
+        declared: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+    ) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, (usize, usize))> {
+        use std::collections::HashSet;
+        /// The copies met, and those that shader writes were left in.
+        static MET: Mutex<Option<(HashSet<u64>, HashSet<u64>)>> = Mutex::new(None);
+        let copies = crate::shadow::copies_now();
+        let mut met = MET.lock().unwrap_or_else(|e| e.into_inner());
+        let (met, left) = met.get_or_insert_with(Default::default);
+        let new: Vec<(usize, usize, u64)> = copies.iter().copied().filter(|c| met.insert(c.2)).collect();
+        let mut owed = Vec::new();
+        if !new.is_empty() && !left.is_empty() {
+            for shadow in crate::shadow::carded_now() {
+                if !left.contains(&shadow.id()) {
+                    continue;
+                }
+                let (from, len) = shadow.span();
+                for part in crate::shadow::held_elsewhere(&new, shadow.id(), &[(from as usize, (from + len) as usize)]) {
+                    crate::census::SHARED[4].fetch_add((part.1 - part.0) as u64, Ordering::Relaxed);
+                    owed.push((shadow.clone(), part));
+                }
+            }
+            crate::census::SHARED[3].fetch_add(new.len() as u64, Ordering::Relaxed);
+        }
+        declared.retain_mut(|(shadow, ranges)| {
+            if !crate::census::is_wc(shadow.title_start()) {
+                return true;
+            }
+            left.insert(shadow.id());
+            *ranges = crate::shadow::held_elsewhere(&copies, shadow.id(), ranges);
+            crate::census::SHARED[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+            let bytes: usize = ranges.iter().map(|r| r.1 - r.0).sum();
+            crate::census::SHARED[2].fetch_add(bytes as u64, Ordering::Relaxed);
+            !ranges.is_empty()
+        });
+        let n = crate::census::SHARED[0].fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() || n.is_multiple_of(2000) {
+            let [_, ranges, bytes, copies_met, once] =
+                [0, 1, 2, 3, 4].map(|i| crate::census::SHARED[i].load(Ordering::Relaxed));
+            tracing::info!(
+                "VICTORY_SKIP_WC_SHARED: {n} submissions; kept for other copies {ranges} ranges ({} MB declared); \
+                 {copies_met} copies met, {} MB fetched once for them; {} copies now",
+                bytes >> 20,
+                once >> 20,
+                copies.len()
+            );
+        }
+        owed
     }
 
     /// With [`relay`]: whether the compare's result area is half taken by

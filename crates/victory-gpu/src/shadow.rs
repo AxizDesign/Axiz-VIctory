@@ -1958,6 +1958,22 @@ pub(crate) fn refresh_compare() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_COMPARE").is_some_and(|v| v == "1"))
 }
 
+/// The step of [`refresh_compare`] in bytes (`VICTORY_REFRESH_STEP`, a power
+/// of two from 16 to 4096; [`CHUNK`] by default). With shader writes left on
+/// the card (`VICTORY_SKIP_WC_BACK`) a step goes up whole when the title
+/// changed a byte of it, and takes the old bytes of what a shader wrote
+/// beside it along: a finer step takes less.
+fn refresh_step() -> usize {
+    static STEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *STEP.get_or_init(|| {
+        std::env::var("VICTORY_REFRESH_STEP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| n.is_power_of_two() && (16..=CHUNK).contains(n))
+            .unwrap_or(CHUNK)
+    })
+}
+
 /// Since the last frame-rate line, of [`Shadow::copy_changed`]: bytes of
 /// written pages read and compared, the bytes of them that differed and
 /// were taken, and their runs.
@@ -2037,7 +2053,7 @@ unsafe fn take_changed(at: usize, to: usize, held: *mut u8, out: &mut Taken) {
         if crate::host::read_into(at as *const u8, page) {
             // SAFETY: the caller's.
             let held = unsafe { std::slice::from_raw_parts_mut(held.add(at - first), n) };
-            changed_chunks(page, held, CHUNK, &mut steps);
+            changed_chunks(page, held, refresh_step(), &mut steps);
             for &(r, m) in &steps {
                 held[r..r + m].copy_from_slice(&page[r..r + m]);
                 match out.runs.last_mut() {
@@ -4421,6 +4437,56 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some(shadow)
+}
+
+/// Every host copy of title memory there is now, as (first address, end,
+/// the copy's number): the title buffers', the windows' outside buffers
+/// and the single views' own ([`exact`]).
+pub(crate) fn copies_now() -> Vec<(usize, usize, u64)> {
+    let span = |s: &Shadow| (s.start as usize, (s.start + s.len) as usize, s.id);
+    let mut out: Vec<(usize, usize, u64)> =
+        buffers_shared().values().filter_map(|e| e.shadow.as_deref()).map(span).collect();
+    out.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().map(|s| span(s)));
+    out.extend(EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().map(|(s, _)| span(s)));
+    out
+}
+
+/// The parts of `ranges` (title addresses, `[from, to)`) that a copy of
+/// `copies` ([`copies_now`]) other than number `own` holds as well, in
+/// order and joined.
+pub(crate) fn held_elsewhere(copies: &[(usize, usize, u64)], own: u64, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut parts = Vec::new();
+    for &(from, to) in ranges {
+        for &(a, b, id) in copies {
+            if id != own && a < to && b > from {
+                parts.push((a.max(from), b.min(to)));
+            }
+        }
+    }
+    joined(parts)
+}
+
+/// The copies in the card's memory, alive now.
+pub(crate) fn carded_now() -> Vec<Arc<Shadow>> {
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).values().filter_map(std::sync::Weak::upgrade).collect()
+}
+
+#[cfg(test)]
+mod held_elsewhere_tests {
+    use super::held_elsewhere;
+
+    #[test]
+    fn only_the_bytes_another_copy_holds_are_kept() {
+        // The heap's own copy (1), a view's own bytes (2), a window that
+        // reaches into the range from below (3), one that touches the
+        // view's (4), one that is elsewhere (5).
+        let copies = [(0, 1000, 1), (100, 120, 2), (0, 40, 3), (110, 130, 4), (2000, 3000, 5)];
+        assert_eq!(held_elsewhere(&copies, 1, &[(20, 500)]), [(20, 40), (100, 130)]);
+        // Nothing else holds these bytes: none are kept.
+        assert!(held_elsewhere(&copies, 1, &[(200, 500)]).is_empty());
+        // To the view's copy, the heap's is another.
+        assert_eq!(held_elsewhere(&copies, 2, &[(100, 120)]), [(100, 120)]);
+    }
 }
 
 /// With the frame line: the buffer views that got a copy of their own
