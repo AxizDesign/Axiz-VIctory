@@ -1059,8 +1059,17 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    /// One test at a time: one that unmaps a view and then tells of it would
+    /// tell of another's, mapped at its address meanwhile (the title's
+    /// mappings wait for each other, `title_memory_remapping`).
+    fn turn() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: Mutex<()> = Mutex::new(());
+        TURN.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn written_pages_are_reported_to_every_asker() {
+        let _turn = turn();
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
@@ -1099,6 +1108,7 @@ mod tests {
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        let _turn = turn();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -1156,6 +1166,7 @@ mod tests {
     /// nothing guarded to open.
     #[test]
     fn a_view_guarded_before_it_is_told_of_is_writable_after() {
+        let _turn = turn();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_BASIC_INFORMATION,
             MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READONLY, UnmapViewOfFile,
@@ -1202,6 +1213,7 @@ mod tests {
 
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
+        let _turn = turn();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -1263,6 +1275,7 @@ mod tests {
     /// or mapped since.
     #[test]
     fn a_range_that_begins_in_an_unmapped_block_is_guarded() {
+        let _turn = turn();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -1354,6 +1367,7 @@ mod tests {
     /// again (they cannot be guarded) until the runtime maps them.
     #[test]
     fn unmapped_blocks_are_reported_once_until_mapped() {
+        let _turn = turn();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -1501,6 +1515,7 @@ mod tests {
     /// time; so is one the other view of which is mapped after the guard.
     #[test]
     fn writes_through_another_view_of_the_pages_are_seen() {
+        let _turn = turn();
         let mut shown = Shown::new();
         let (texture, pool) = (shown.map(true), shown.map(true));
         let pages = |at: usize, block: usize| -> Vec<usize> {
@@ -1537,6 +1552,7 @@ mod tests {
     /// when the write is done, and the texture counts as written then.
     #[test]
     fn a_write_under_way_is_not_guarded_again_through_another_view() {
+        let _turn = turn();
         use std::io::{Read, Seek, Write};
         let pages_of = |at: usize, block: usize| -> Vec<usize> {
             ((at + block * BLOCK) / PAGE..(at + (block + 1) * BLOCK) / PAGE).collect()
@@ -1582,6 +1598,7 @@ mod tests {
     /// show them.
     #[test]
     fn physical_pages_written_by_the_runtime_are_seen() {
+        let _turn = turn();
         let mut shown = Shown::new();
         let texture = shown.map(true);
         let own = shown.map(false);
@@ -1606,6 +1623,7 @@ mod tests {
     /// to overflow. Up there no test has guarded blocks.
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
+        let _turn = turn();
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
