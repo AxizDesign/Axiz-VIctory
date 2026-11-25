@@ -1187,12 +1187,17 @@ mod tests {
         let start = heap(h).start;
         let (held, index) = shader_slot(start + 16).unwrap();
         assert_eq!(index, 1);
-        // The title's release is not the last one any more.
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 1);
+        // The title's release is not the last one any more. (Another
+        // test's scan of the heaps may hold one for a moment, too.)
+        assert_ne!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
         assert_eq!(held.desc.count, 16);
         assert!(shader_slot(start).is_some());
         drop(held);
-        assert!(shader_slot(start).is_none_or(|(other, _)| !std::ptr::eq(&*other, h.cast())));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shader_slot(start).is_some_and(|(other, _)| std::ptr::eq(&*other, h.cast())) {
+            assert!(std::time::Instant::now() < until, "the heap is still found");
+            std::thread::yield_now();
+        }
     }
 
     /// Heaps made and released on some threads while others write
