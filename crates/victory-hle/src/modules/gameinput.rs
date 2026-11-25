@@ -1,8 +1,8 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
-//! too. A poll thread turns host state into readings (a new one per change)
-//! and runs device callbacks on connect and disconnect.
+//! (host slots 0-3); while none is connected, the keyboard and the mouse
+//! drive one stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device
+//! of its own too. A poll thread turns host state into readings (a new one
+//! per change) and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+
+pub(crate) mod mouse;
+use mouse::{Mouse, Pace};
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -61,24 +64,43 @@ const DEVICES: usize = PADS + 2;
 const HISTORY: usize = 32;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+const TAB: u8 = 0x09;
+
+/// The stand-in gamepad (virtual key, button); README lists it. A button may
+/// have several keys. Sticks: W/A/S/D left, the mouse or I/J/K/L right.
+const FALLBACK_BUTTONS: [(u8, u32); 29] = [
     (0x1B, MENU), // Esc
-    (0x09, VIEW), // Tab
-    (0x0D, A),    // Enter
-    (0x08, B),    // Backspace
+    (b'P', MENU),
+    (b'V', VIEW),
+    (0x0D, A), // Enter
+    (0xA0, A), // left Shift
+    (0x08, B), // Backspace
+    (b'R', B),
+    (0x20, X), // Space
     (b'X', X),
+    (b'F', Y),
     (b'Y', Y),
     (0x26, UP), // arrows
     (0x28, DOWN),
     (0x25, LEFT),
     (0x27, RIGHT),
-    (b'Q', LEFT_SHOULDER),
-    (b'E', RIGHT_SHOULDER),
-    (b'F', LEFT_STICK),
+    (b'1', UP),
+    (b'2', DOWN),
+    (b'3', LEFT),
+    (b'4', RIGHT),
+    (b'E', RIGHT),
+    (TAB, LEFT_SHOULDER),
+    (mouse::BACK, LEFT_SHOULDER),
+    (b'Q', RIGHT_SHOULDER),
+    (mouse::FORWARD, RIGHT_SHOULDER),
+    (0xA2, LEFT_STICK), // left Ctrl
+    (b'Z', LEFT_STICK),
+    (b'C', RIGHT_STICK),
     (b'H', RIGHT_STICK),
+    (mouse::MIDDLE, RIGHT_STICK),
 ];
+const LEFT_TRIGGER: [u8; 2] = [mouse::RIGHT, b'U'];
+const RIGHT_TRIGGER: [u8; 2] = [mouse::LEFT, b'O'];
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
@@ -111,29 +133,70 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// The mouse's share of the stand-in pad; `wanted` while no pad is
+    /// connected. The title looks at the pad about every `window`.
+    fn mouse(&mut self, _now: u64, _wanted: bool, _window: Duration) -> Mouse {
+        Mouse::default()
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
-            1.0
-        } else {
-            0.0
-        }
-    };
+fn fallback(keys: &[KeyState], mouse: &Mouse) -> PadState {
+    let key = |vk: u8| keys.iter().any(|k| k.virtual_key == vk);
+    // Alt+Tab is the system's.
+    let system = |vk: u8| vk == TAB && key(mouse::RELEASE);
+    let down = |vk: u8| mouse.buttons.contains(&vk) || (key(vk) && !system(vk));
+    let on = |vk: u8| if down(vk) { 1.0_f32 } else { 0.0 };
+    let trigger = |keys: [u8; 2]| on(keys[0]).max(on(keys[1]));
     PadState {
         buttons: FALLBACK_BUTTONS
             .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
+            .filter(|(vk, _)| down(*vk))
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
+        left_trigger: trigger(LEFT_TRIGGER),
+        right_trigger: trigger(RIGHT_TRIGGER),
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        right_x: (on(b'L') - on(b'J') + mouse.stick.0).clamp(-1.0, 1.0),
+        right_y: (on(b'I') - on(b'K') + mouse.stick.1).clamp(-1.0, 1.0),
+    }
+}
+
+/// Presses on the stand-in pad the title has not looked at yet stay: at a
+/// few frames per second a tap falls between two looks.
+#[derive(Default)]
+struct Unseen {
+    buttons: u32,
+    triggers: (f32, f32),
+    since: u64,
+}
+
+impl Unseen {
+    /// No longer than this: the title may not be looking at all.
+    const LONGEST: u64 = 600_000;
+
+    /// `pad` with the presses not looked at.
+    fn add(&mut self, pad: PadState, now: u64) -> PadState {
+        if now >= self.since + Self::LONGEST {
+            self.looked(now);
+        }
+        self.buttons |= pad.buttons;
+        self.triggers.0 = self.triggers.0.max(pad.left_trigger);
+        self.triggers.1 = self.triggers.1.max(pad.right_trigger);
+        PadState {
+            buttons: self.buttons,
+            left_trigger: self.triggers.0,
+            right_trigger: self.triggers.1,
+            ..pad
+        }
+    }
+
+    fn looked(&mut self, now: u64) {
+        *self = Unseen {
+            since: now,
+            ..Default::default()
+        };
     }
 }
 
@@ -325,6 +388,9 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// The title's looks at the stand-in pad.
+    pace: Pace,
+    unseen: Unseen,
 }
 
 pub struct Hub {
@@ -369,6 +435,8 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                pace: Pace::default(),
+                unseen: Unseen::default(),
             }),
             returned: Condvar::new(),
         }));
@@ -401,12 +469,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let window = self.state().pace.interval();
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let wanted = pads.iter().all(Option::is_none);
+            (pads, source.keys(), source.mouse(now(), wanted, window))
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, &mouse);
         self.deliver(events);
     }
 
@@ -451,6 +521,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: &Mouse,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -458,7 +529,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(self.unseen.add(fallback(&keys, mouse), now)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -593,7 +664,7 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
+    let mut state = hub.state();
     let newest = |i: usize| {
         state.slots[i]
             .history
@@ -618,7 +689,14 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    let stand_in = found.is_some_and(|r| std::ptr::eq(r.device, &hub.devices[FALLBACK]));
+    let hr = hand(out, found);
+    if stand_in && hr == S_OK {
+        let now = now();
+        state.pace.look(now);
+        state.unseen.looked(now);
+    }
+    hr
 }
 
 /// The reading after (`forward`) or before `reference` on its device.
@@ -1130,6 +1208,7 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        mouse: mouse::Host,
     }
 
     impl Source for Host {
@@ -1168,7 +1247,7 @@ mod host {
             let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
-                // mouse buttons (below 0x08).
+                // mouse buttons (below 0x08; `mouse` has them).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
                     // SAFETY: plain queries.
@@ -1186,6 +1265,10 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn mouse(&mut self, now: u64, wanted: bool, window: Duration) -> Mouse {
+            self.mouse.poll(now, wanted, window)
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1284,6 +1367,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: Mouse,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1295,6 +1379,13 @@ mod tests {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
+        }
+        fn mouse(&mut self, _: u64, wanted: bool, _: Duration) -> Mouse {
+            if wanted {
+                self.0.lock().unwrap().mouse.clone()
+            } else {
+                Mouse::default()
+            }
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1494,7 +1585,7 @@ mod tests {
         register(hub, KEYBOARD_KIND, 2, &log);
         assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
 
-        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'C')];
+        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'O')];
         host.lock().unwrap().keys = keys.clone();
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
@@ -1521,6 +1612,137 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    /// The stand-in pad's state as the title reads it.
+    fn look(hub: &Hub) -> PadState {
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let state = pad(r);
+        release(r);
+        state
+    }
+
+    #[test]
+    fn every_pad_control_has_a_key_or_the_mouse() {
+        let press = |vk: u8| fallback(&[key(vk)], &Mouse::default());
+        let click = |vk: u8| {
+            let mouse = Mouse {
+                buttons: vec![vk],
+                ..Default::default()
+            };
+            fallback(&[], &mouse)
+        };
+        // The buttons, each from the keyboard alone.
+        let all: [(u32, &[u8]); 14] = [
+            (MENU, &[0x1B, b'P']),
+            (VIEW, b"V"),
+            (A, &[0x0D, 0xA0]),
+            (B, &[0x08, b'R']),
+            (X, b" X"),
+            (Y, b"FY"),
+            (UP, &[0x26, b'1']),
+            (DOWN, &[0x28, b'2']),
+            (LEFT, &[0x25, b'3']),
+            (RIGHT, &[0x27, b'4', b'E']),
+            (LEFT_SHOULDER, &[TAB]),
+            (RIGHT_SHOULDER, b"Q"),
+            (LEFT_STICK, &[0xA2, b'Z']),
+            (RIGHT_STICK, b"CH"),
+        ];
+        for (button, keys) in all {
+            for &vk in keys {
+                let want = PadState {
+                    buttons: button,
+                    ..Default::default()
+                };
+                assert_eq!(press(vk), want, "key {vk:#x}");
+            }
+        }
+        assert_eq!(all.iter().fold(0, |bits, (b, _)| bits | b), 0x3FFF);
+        // Aim and fire, by mouse and by keyboard.
+        let trigger = |s: PadState| (s.left_trigger, s.right_trigger, s.buttons);
+        for state in [click(mouse::RIGHT), press(b'U')] {
+            assert_eq!(trigger(state), (1.0, 0.0, 0));
+        }
+        for state in [click(mouse::LEFT), press(b'O')] {
+            assert_eq!(trigger(state), (0.0, 1.0, 0));
+        }
+        assert_eq!(click(mouse::MIDDLE).buttons, RIGHT_STICK);
+        assert_eq!(click(mouse::BACK).buttons, LEFT_SHOULDER);
+        assert_eq!(click(mouse::FORWARD).buttons, RIGHT_SHOULDER);
+        // Both directions of every stick axis.
+        let left = |vk| (press(vk).left_x, press(vk).left_y);
+        assert_eq!([left(b'W'), left(b'S')], [(0.0, 1.0), (0.0, -1.0)]);
+        assert_eq!([left(b'D'), left(b'A')], [(1.0, 0.0), (-1.0, 0.0)]);
+        let right = |vk| (press(vk).right_x, press(vk).right_y);
+        assert_eq!([right(b'I'), right(b'K')], [(0.0, 1.0), (0.0, -1.0)]);
+        assert_eq!([right(b'L'), right(b'J')], [(1.0, 0.0), (-1.0, 0.0)]);
+        let turned = Mouse {
+            stick: (0.5, -0.75),
+            ..Default::default()
+        };
+        let state = fallback(&[], &turned);
+        assert_eq!((state.right_x, state.right_y), (0.5, -0.75));
+        // No key does two things.
+        let mut keys: Vec<u8> = FALLBACK_BUTTONS.iter().map(|b| b.0).collect();
+        keys.extend(LEFT_TRIGGER.iter().chain(&RIGHT_TRIGGER).chain(b"WASDIJKL"));
+        let count = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), count);
+        // Alt+Tab leaves the title alone.
+        let switching = [key(mouse::RELEASE), key(TAB)];
+        assert_eq!(fallback(&switching, &Mouse::default()), PadState::default());
+    }
+
+    #[test]
+    fn the_mouse_reaches_the_stand_in_pad_and_not_a_connected_one() {
+        let (hub, host) = fake();
+        host.lock().unwrap().mouse = Mouse {
+            buttons: vec![mouse::LEFT, mouse::RIGHT],
+            stick: (0.5, -0.5),
+        };
+        hub.poll();
+        let want = PadState {
+            left_trigger: 1.0,
+            right_trigger: 1.0,
+            right_x: 0.5,
+            right_y: -0.5,
+            ..Default::default()
+        };
+        assert_eq!(look(hub), want);
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r), PadState::default());
+        release(r);
+    }
+
+    #[test]
+    fn a_tap_between_two_looks_is_seen_once() {
+        let (hub, host) = fake();
+        assert_eq!(look(hub), PadState::default());
+        host.lock().unwrap().mouse.buttons = vec![mouse::LEFT];
+        host.lock().unwrap().keys = vec![key(b'R')];
+        hub.poll();
+        host.lock().unwrap().mouse.buttons.clear();
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        hub.poll();
+        let state = look(hub);
+        assert_eq!((state.right_trigger, state.buttons), (1.0, B));
+        hub.poll();
+        assert_eq!(look(hub), PadState::default());
+        // A title that does not look gets no old presses.
+        let mut unseen = Unseen::default();
+        let pressed = PadState {
+            buttons: A,
+            ..Default::default()
+        };
+        assert_eq!(unseen.add(pressed, 1_000), pressed);
+        assert_eq!(unseen.add(PadState::default(), 2_000), pressed);
+        let late = 2_000 + Unseen::LONGEST;
+        assert_eq!(unseen.add(PadState::default(), late), PadState::default());
     }
 
     #[test]
