@@ -108,6 +108,25 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     result
 }
 
+/// Optional validation of translated title shaders, including cache hits.
+/// Normal runs do not load the validator or change the translation.
+fn validate_runtime(dxil: &[u8]) -> Result<(), String> {
+    use victory_shader::emit::validator::Validator;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static VALIDATOR: OnceLock<Result<std::sync::Mutex<Validator>, String>> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_VALIDATE_DXIL").is_some_and(|v| v == "1")) {
+        return Ok(());
+    }
+    let validator = VALIDATOR.get_or_init(|| {
+        Validator::load(Validator::default_path().as_deref()).map(std::sync::Mutex::new)
+    });
+    let validator = validator.as_ref().map_err(|e| format!("DXIL validator unavailable: {e}"))?;
+    // Validate a private copy: the validator signs its input in place.
+    let mut bytes = dxil.to_vec();
+    validator.lock().unwrap_or_else(|e| e.into_inner())
+        .validate(&mut bytes).map_err(|e| format!("DXIL validation rejected shader: {e}"))
+}
+
 fn target() -> [u32; 2] {
     [
         victory_shader::emit::host_max_wave(),
