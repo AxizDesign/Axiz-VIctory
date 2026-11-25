@@ -70,7 +70,9 @@ impl Fields {
             } else {
                 1
             },
-            ComparisonFunc: if reduction == 1 {
+            // (kept beside a minimum or maximum filter too: the comparison
+            // sampler made of this one, [`comparison`], has it)
+            ComparisonFunc: if reduction == 1 || compares {
                 D3D12_COMPARISON_FUNC(self.compare as i32)
             } else {
                 D3D12_COMPARISON_FUNC_NEVER
@@ -224,10 +226,10 @@ mod tests {
 
         w[11] = (-24.0f32).to_bits();
         w[5] = 1; // minimum reduction
-        w[16] = 4; // less-or-equal, ignored when reduction != 1
+        w[16] = 4; // less-or-equal: the host ignores it here, `comparison` takes it
         let d = console(&w);
         assert_eq!(d.MipLODBias, D3D12_MIP_LOD_BIAS_MIN);
-        assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_NEVER);
+        assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
 
         w[11] = f32::NAN.to_bits();
         w[5] = 0; // plain mode, reduction == 1 from compare == 4
