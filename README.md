@@ -84,8 +84,7 @@ are in [docs/test-runs.md](docs/test-runs.md).
 | Loading into the world | works |
 | In the world | 6.4 to 9.9 fps median by run and scene (2,500 draws and more), best about 12. Not measured with a fixed scene |
 | Cutscenes | start and can be skipped. Characters and models can come in coarse, and parts of a room can be missing for a while |
-| Longest session | 25 min 34 s without an error, ended by the player. Other sessions of 11 to 20 minutes were ended by the player too |
-| Faulted sessions (of 18 measured on 25 and 26 November) | one hung: run 18, with ray tracing and several new switches on together, cause not known. One lost the graphics device: run 24, while a graphics driver was being installed |
+| Stability | no crash in 16 of 18 recorded sessions (25 and 26 November); the player closed them. Longest 25 min 34 s. The other two: run 18 hung, with ray tracing and several new switches on together, cause not known; run 24 lost the graphics device while a graphics driver was being installed |
 | Sound | works at first; can break after a long freeze |
 | Mouths | a fix for the network that animates faces is in (from fxceless/victory-fork pull request 927). On this card the old path kept 1 of 65,536 values, all now; in the game it is not confirmed yet |
 | Ray-traced light | off by default. An ambient light stands in for it (`VICTORY_AMBIENT`). With it on, about 4 fps in a cutscene (run 17); the build merged since has not run with it apart from run 18 |
@@ -96,7 +95,7 @@ are in [docs/test-runs.md](docs/test-runs.md).
 | What you see | What is known |
 |---|---|
 | Low frame rate | The submitting thread: about 100 of 108 ms of a usual frame in the last run, 78 of it preparing (copying memory for the card). The card's own work was 43 ms |
-| Water wholly black in some scenes, dark squares elsewhere | Open. Seen in three builds with different settings |
+| Black boxes on the water in places, and a very dark sea in some shots | Open. Seen in runs 19 to 25 with different settings |
 | Eyes white in some shots | Open. The same shot, when a face is lit from the front, so it looks tied to light or view angle (not proven) |
 | Black clothes and objects for a moment, textures that come in late | Textures wait for room on a 12 GB card (thousands at times) |
 | Coarse, blocky characters and missing walls in cutscenes | Open. Likely the title's models come in late |
