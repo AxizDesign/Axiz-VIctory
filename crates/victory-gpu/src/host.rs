@@ -605,7 +605,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            device = Some(pick_device()?);
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -695,6 +695,127 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// What the translated shaders cannot do without, of what `device` lacks:
+/// shader model 6.6 (heaps indexed directly, 64-bit atomics), resource
+/// binding tier 3 (the title's whole view heap) and wave operations.
+fn lacks(device: &ID3D12Device) -> Vec<String> {
+    let mut lacks = Vec::new();
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: each query writes its own structure of the given size.
+    unsafe {
+        // (The query fails for a model the runtime does not know.)
+        if device
+            .CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut model).cast(), size_of_val(&model) as u32)
+            .is_err()
+            || model.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0
+        {
+            lacks.push("shader model 6.6".into());
+        }
+        if device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut options).cast(), size_of_val(&options) as u32)
+            .is_err()
+            || options.ResourceBindingTier.0 < D3D12_RESOURCE_BINDING_TIER_3.0
+        {
+            lacks.push("resource binding tier 3".into());
+        }
+        if device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut waves).cast(), size_of_val(&waves) as u32)
+            .is_err()
+            || !waves.WaveOps.as_bool()
+        {
+            lacks.push("wave operations".into());
+        }
+    }
+    lacks
+}
+
+/// The adapters' order of trying: the ones `VICTORY_ADAPTER` names (a part
+/// of the name, or the place in the system's list), then the rest as the
+/// system lists them, fastest first, software last.
+fn adapter_order(adapters: &[(String, bool)], wanted: Option<&str>) -> Vec<usize> {
+    let wanted = wanted.map(|w| w.trim().to_lowercase()).filter(|w| !w.is_empty());
+    let named = |i: usize| {
+        wanted.as_ref().is_some_and(|w| match w.parse::<usize>() {
+            Ok(n) => n == i,
+            Err(_) => adapters[i].0.to_lowercase().contains(w),
+        })
+    };
+    let mut order: Vec<usize> = (0..adapters.len()).collect();
+    order.sort_by_key(|&i| (!named(i), adapters[i].1));
+    order
+}
+
+/// The device of the first adapter that can run the translated shaders. The
+/// system's default adapter is the one its first screen is on, which on a
+/// laptop is the processor's, beside a card many times as fast. Where none
+/// can, the first one's, and what it lacks is said.
+fn pick_device() -> windows::core::Result<ID3D12Device> {
+    let make = |adapter: Option<&IDXGIAdapter1>| -> windows::core::Result<ID3D12Device> {
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation.
+        unsafe {
+            match adapter {
+                Some(a) => D3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
+        }
+        device.ok_or_else(windows::core::Error::empty)
+    };
+    let mut adapters: Vec<(IDXGIAdapter1, String, bool)> = Vec::new();
+    // SAFETY: plain DXGI enumeration.
+    unsafe {
+        if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) {
+            while let Ok(adapter) =
+                factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(adapters.len() as u32, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            {
+                let (name, software) = adapter.GetDesc1().map_or((String::new(), false), |d| {
+                    let len = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                    (
+                        String::from_utf16_lossy(&d.Description[..len]),
+                        d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+                    )
+                });
+                adapters.push((adapter, name, software));
+            }
+        }
+    }
+    let wanted = std::env::var("VICTORY_ADAPTER").ok();
+    let list: Vec<(String, bool)> = adapters.iter().map(|a| (a.1.clone(), a.2)).collect();
+    let mut first: Option<(ID3D12Device, String, Vec<String>)> = None;
+    for i in adapter_order(&list, wanted.as_deref()) {
+        let (adapter, name, software) = &adapters[i];
+        match make(Some(adapter)) {
+            Ok(device) => {
+                let lacks = lacks(&device);
+                if lacks.is_empty() {
+                    tracing::info!(adapter = %name, software, "host adapter");
+                    if *software {
+                        tracing::warn!("no graphics card can run this: the software adapter will be very slow");
+                    }
+                    return Ok(device);
+                }
+                tracing::warn!(adapter = %name, ?lacks, "an adapter that cannot run the translated shaders is passed over");
+                first.get_or_insert((device, name.clone(), lacks));
+            }
+            Err(e) => tracing::warn!(adapter = %name, error = %e, "no Direct3D 12 device on an adapter"),
+        }
+    }
+    if let Some((device, name, lacks)) = first {
+        tracing::error!(
+            adapter = %name,
+            ?lacks,
+            "no adapter of this PC can run the translated shaders; a newer graphics driver or Windows version may help"
+        );
+        return Ok(device);
+    }
+    // Where the system lists none (or not in this order): its own choice.
+    make(None)
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -755,6 +876,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn adapters_are_tried_by_name_then_speed_and_software_last() {
+        let a = [
+            ("Integrated Graphics".to_owned(), false),
+            ("Basic Render Driver".to_owned(), true),
+            ("Big Card 5070".to_owned(), false),
+        ];
+        let order = |wanted| super::adapter_order(&a, wanted);
+        assert_eq!(order(None), [0, 2, 1]);
+        assert_eq!(order(Some("big card")), [2, 0, 1]);
+        assert_eq!(order(Some(" 1 ")), [1, 0, 2]);
+        assert_eq!(order(Some("nothing like it")), [0, 2, 1]);
+        assert_eq!(order(Some("")), [0, 2, 1]);
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -1710,6 +1846,9 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// The refreshes of a descriptor heap's buffer views, for shaders that
+    /// pick them by index.
+    Heap(std::sync::Arc<HeapPass>),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
@@ -1721,6 +1860,64 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+}
+
+/// What a frame's shaders that pick buffers from one descriptor heap by an
+/// index may read: the spans of the host copies the heap's views show.
+/// Every list that runs such shaders has it ([`Step::Heap`]); the first
+/// submission with one of those lists brings the spans up to date, ahead of
+/// its lists. (The list that was recorded first had the refreshes, for the
+/// frame's lists of all heaps: the others read stale copies where that list
+/// was submitted behind them, or never, or the heap was another.)
+/// shortcut: what the title writes there between two submissions of one
+/// frame is seen a frame late.
+#[derive(Default)]
+pub(crate) struct HeapPass {
+    /// Set when the recording thread that makes the pass is done with it.
+    pub(crate) spans: OnceLock<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>>,
+    /// The number of the submission that brings them up to date (0: none
+    /// yet).
+    taken: std::sync::atomic::AtomicU64,
+}
+
+impl HeapPass {
+    /// The spans still to be brought up to date.
+    fn open(&self) -> &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)] {
+        if self.taken.load(Ordering::Acquire) == 0 {
+            self.spans.get().map_or(&[], Vec::as_slice)
+        } else {
+            &[]
+        }
+    }
+
+    /// The spans, if submission `number` is the one that brings them up to
+    /// date.
+    fn take(&self, number: u64) -> &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)] {
+        let Some(spans) = self.spans.get() else {
+            return &[];
+        };
+        match self.taken.compare_exchange(0, number, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => spans,
+            Err(taken) if taken == number => spans,
+            Err(_) => &[],
+        }
+    }
+}
+
+impl Step {
+    /// The ranges of host copies the step brings up to date in the next
+    /// submission it is part of.
+    fn each_refresh(&self, mut each: impl FnMut(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)) {
+        match self {
+            Step::Refresh(shadow, address, len) => each(shadow, *address, *len),
+            Step::Heap(pass) => {
+                for (shadow, address, len) in pass.open() {
+                    each(shadow, *address, *len);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2312,6 +2509,13 @@ fn flying() -> bool {
     line.settling || line.line.iter().any(|l| matches!(l, Late::Run(_)))
 }
 
+/// Whether what the title wrote may be put into copies beside what shaders
+/// write: always while nothing is in the air (no shader of the submission
+/// being prepared has run), else with [`late_exact`].
+pub(crate) fn merges_under_flights() -> bool {
+    late_exact() || !flying()
+}
+
 /// With flights in the air ([`late`]): why `runs` cannot be prepared
 /// before they are settled, if so. Preparing reads title memory on the
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
@@ -2336,9 +2540,10 @@ fn blocked_in(line: &Line, runs: &[&HostList], count: bool) -> Option<usize> {
 /// Whether `runs` bring host copies up to date with any of `ranges`.
 fn refreshes(ranges: &[(usize, usize)], runs: &[&HostList]) -> bool {
     runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            Step::Refresh(_, at, len) => touches(ranges, *at, *at + *len),
-            _ => false,
+        list.deferred().copies.iter().any(|step| {
+            let mut found = false;
+            step.each_refresh(|_, at, len| found = found || touches(ranges, at, at + len));
+            found
         })
     })
 }
@@ -2381,7 +2586,7 @@ fn blocked_by_steps<'a>(
                 }
             }
             Step::Run(_) => return Some((WHY_RUN, None)),
-            Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+            Step::Refresh(..) | Step::Heap(_) | Step::GpuWrite(..) | Step::Host(_) => {}
         }
     }
     read_stat.map(|stat| (WHY_READ, stat))
@@ -2429,14 +2634,15 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
-            {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+            step.each_refresh(|shadow, address, len| {
+                if !shadow.writes_pending() {
+                    return;
                 }
-            }
+                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
+                    Some(s) => (s.1, s.2) = (s.1.min(address), s.2.max(address + len)),
+                    None => spans.push((shadow.clone(), address, address + len)),
+                }
+            });
         }
     }
     if late_exact() {
@@ -2984,8 +3190,11 @@ fn read_backs(list: &HostList) {
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
+                // (With submissions sent ahead the title may have let go of
+                // the memory, or a texture's guard may have been laid over
+                // it, since the copy was recorded.)
                 for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                    write_mapped((*at as *mut u8).wrapping_add(line * pitch), from.add(line * row.next_multiple_of(256)), *row);
                 }
                 buffer.Unmap(0, None);
             }
@@ -4297,6 +4506,14 @@ impl Host {
         working(was_working);
     }
 
+    /// No submission is prepared while this is held. For tests that bring
+    /// copies up to date themselves: the write journal's asking is the
+    /// submission's that is being prepared.
+    #[cfg(test)]
+    pub(crate) fn alone(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -4359,7 +4576,10 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch {
+            number: this_submission,
+            ..Default::default()
+        };
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -4370,14 +4590,14 @@ impl Host {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
-                    }
+                    step.each_refresh(|shadow, address, len| {
+                        if !shadow.unwatched() {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((address, address + len));
+                            *span = (span.0.min(address), span.1.max(address + len));
+                        }
+                    });
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
@@ -5375,6 +5595,11 @@ impl HostList {
         }
     }
 
+    /// The list's shaders pick buffers from the heap `pass` is of.
+    pub(crate) fn defer_heap(&self, pass: std::sync::Arc<HeapPass>) {
+        self.deferred().copies.push(Step::Heap(pass));
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
@@ -5853,6 +6078,14 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
+                Step::Heap(pass) => {
+                    if batch.heaps.insert(std::sync::Arc::as_ptr(pass) as usize) {
+                        for (shadow, address, len) in pass.take(batch.number) {
+                            batch.add(shadow, *address, *len);
+                        }
+                    }
+                    continue;
+                }
                 Step::Run(work) | Step::Host(work) | Step::HostRead(_, _, work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
@@ -5947,8 +6180,8 @@ mod wide_refresh_tests {
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// union of the requested ranges: done before a step that writes title
+/// memory or gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -5956,7 +6189,7 @@ mod wide_refresh_tests {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<ShadowRefresh>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -5964,20 +6197,65 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Heap passes (by address) added since the last title write.
+    heaps: std::collections::HashSet<usize>,
+    /// The submission's number.
+    number: u64,
+}
+
+type ShadowRefresh = (std::sync::Arc<crate::shadow::Shadow>, RefreshRanges);
+
+/// Keep a single range inline. Merge accumulated overlaps before refreshing.
+enum RefreshRanges {
+    One((usize, usize)),
+    Many(Vec<(usize, usize)>),
+}
+
+impl RefreshRanges {
+    fn add(&mut self, (from, to): (usize, usize)) {
+        match self {
+            Self::One((start, end)) if from <= *end && *start <= to => {
+                *start = (*start).min(from);
+                *end = (*end).max(to);
+            }
+            Self::One(previous) => *self = Self::Many(vec![*previous, (from, to)]),
+            Self::Many(ranges) => ranges.push((from, to)),
+        }
+    }
+
+    fn merge(&mut self) {
+        if let Self::Many(ranges) = self {
+            ranges.sort_unstable();
+            ranges.dedup_by(|next, previous| {
+                if next.0 > previous.1 {
+                    return false;
+                }
+                previous.1 = previous.1.max(next.1);
+                true
+            });
+        }
+    }
+
+    fn as_slice(&self) -> &[(usize, usize)] {
+        match self {
+            Self::One(range) => std::slice::from_ref(range),
+            Self::Many(ranges) => ranges,
+        }
+    }
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
+        if len == 0 {
+            return;
+        }
+        let range = (address, address + len);
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
-            Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
-            }
+            Some(&at) => self.refreshes[at].1.add(range),
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), RefreshRanges::One(range)));
             }
         }
     }
@@ -5988,23 +6266,26 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, mut ranges) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        ranges.merge();
+        Self::update(&shadow, &ranges);
     }
 
-    /// Brings `[from, to)` of a copy up to date, timed.
-    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
-        let started = std::time::Instant::now();
-        let copied = shadow.update(from, to - from);
-        let us = started.elapsed().as_micros() as u64;
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
-        PREPARING[0].fetch_add(us, Ordering::Relaxed);
-        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    /// Brings each requested range of a copy up to date, timed.
+    fn update(shadow: &crate::shadow::Shadow, ranges: &RefreshRanges) {
+        for &(from, to) in ranges.as_slice() {
+            let started = std::time::Instant::now();
+            let copied = shadow.update(from, to - from);
+            let us = started.elapsed().as_micros() as u64;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::range(from, to - from, us, 0);
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
+            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -6018,20 +6299,24 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.heaps.clear();
     }
 
     fn flush(&mut self) {
         self.index.clear();
-        // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        for (_, ranges) in &mut self.refreshes {
+            ranges.merge();
+        }
+        // One write-watch asking for ranges that lie close together.
+        let ahead = self.refreshes.len() > 1
+            || self.refreshes.first().is_some_and(|(_, ranges)| ranges.as_slice().len() > 1);
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
                 .iter()
-                .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .filter(|(shadow, _)| !shadow.unwatched())
+                .flat_map(|(_, ranges)| ranges.as_slice().iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -6045,14 +6330,14 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, ranges)| Box::new(move || Self::update(&shadow, &ranges)) as Box<dyn FnOnce() + Send>)
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, ranges) in self.refreshes.drain(..) {
+                Self::update(&shadow, &ranges);
             }
         }
         if ahead {
@@ -7445,6 +7730,109 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires an isolated process with VICTORY_D3D12_WARP=1"]
+    fn disjoint_refresh_leaves_the_dirty_gap_pending() {
+        use super::{IDXGIAdapter1, Interface, Ordering, PREPARING, host, warp_adapter};
+        use crate::{shadow, watch::PAGE};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+
+        assert!(std::env::var_os("VICTORY_D3D12_WARP").is_some());
+        let host = host().expect("WARP host device");
+        // SAFETY: the WARP adapter and the device are both live.
+        let (adapter, device_luid) = unsafe {
+            (
+                warp_adapter().unwrap().cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap(),
+                host.device.GetAdapterLuid(),
+            )
+        };
+        assert_eq!(device_luid.HighPart, adapter.AdapterLuid.HighPart);
+        assert_eq!(device_luid.LowPart, adapter.AdapterLuid.LowPart);
+        println!("WARP {:04x}:{:04x}", adapter.VendorId, adapter.DeviceId);
+
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const SIZE: usize = 3 * PAGE;
+        // SAFETY: a new committed, write-watched allocation owned by the test.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(title, 0);
+        let fill_page = move |page: usize, value: u8| {
+            assert!(page < 3);
+            // SAFETY: the test retains the committed allocation until all lists finish.
+            unsafe { ((title + page * PAGE) as *mut u8).write_bytes(value, PAGE) };
+        };
+        shadow::register(title, title as u64, SIZE as u64);
+        let shadow = shadow::find(title as u64, SIZE as u64).expect("shared shadow buffer");
+
+        let submit = |ranges: &[(usize, usize)], write: bool| {
+            let list = host.new_list().unwrap();
+            let readback = host.read_back_buffer(SIZE as u64).unwrap();
+            let copied = || PREPARING[1].load(Ordering::Relaxed);
+            let before = copied();
+            for &(offset, len) in ranges {
+                shadow.refresh(&list, (title + offset) as u64, len as u64);
+            }
+            if write {
+                shadow.gpu_writes(&list, title as u64, 4);
+                list.defer_host(move || {
+                    assert_eq!(copied() - before, (2 * PAGE) as u64, "GPU write drains both ranges");
+                });
+                // A title write after the declaration makes the third page stale again.
+                list.defer(move || fill_page(2, 66));
+                shadow.refresh(&list, (title + 2 * PAGE) as u64, PAGE as u64);
+            }
+            // SAFETY: both buffers cover SIZE bytes and live through synchronous execution.
+            unsafe { list.list.CopyBufferRegion(&readback, 0, &shadow.buffer, 0, SIZE as u64) };
+            let mut data = vec![0u8; SIZE];
+            list.defer_read_back(readback, data.as_mut_ptr(), [SIZE, 1, SIZE]);
+            list.close();
+            host.execute(&[&list]);
+            let markers = std::array::from_fn(|page| {
+                let bytes = &data[page * PAGE..(page + 1) * PAGE];
+                assert!(bytes.iter().all(|&byte| byte == bytes[0]), "page {page} is uniform");
+                bytes[0]
+            });
+            (copied() - before, markers)
+        };
+
+        for (page, value) in [1, 2, 3].into_iter().enumerate() {
+            fill_page(page, value);
+        }
+        assert_eq!(submit(&[(0, SIZE)], false), (SIZE as u64, [1, 2, 3]));
+        for (page, value) in [11, 22, 33].into_iter().enumerate() {
+            fill_page(page, value);
+        }
+        let first = submit(&[(2 * PAGE, PAGE), (0, PAGE)], false);
+        let gap = submit(&[(PAGE, PAGE)], false);
+
+        fill_page(0, 44);
+        let overlap = submit(&[(PAGE / 2, PAGE / 2), (0, 3 * PAGE / 4)], false);
+        fill_page(0, 55);
+        fill_page(2, 60);
+        let write = submit(&[(0, PAGE), (2 * PAGE, PAGE)], true);
+
+        drop(shadow);
+        shadow::unregister(title, title as u64);
+        // SAFETY: the allocation is no longer used by any list or shadow.
+        assert_ne!(unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) }, 0);
+
+        println!("copied bytes and page contents: first {first:?}, gap {gap:?}, overlap {overlap:?}, write {write:?}");
+        assert_eq!(overlap, (PAGE as u64, [44, 22, 33]));
+        assert_eq!(write, (SIZE as u64, [55, 22, 66]));
+        assert_eq!(first, ((2 * PAGE) as u64, [11, 2, 33]));
+        assert_eq!(gap, (PAGE as u64, [11, 22, 33]));
     }
 
     /// The hashing a submission does for textures in physical-page memory,

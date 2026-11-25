@@ -128,18 +128,58 @@ const SHADER_VISIBLE: u32 = 1;
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
+
+/// A reference on a heap found in [`SHADER_HEAPS`], so that it lives while
+/// it is used, with no lock held. (A heap was used after the lock was let
+/// go: one the title released meanwhile on another thread was read after
+/// it was freed. Making a view can create host objects and submit work, so
+/// the lock cannot be held for that long.)
+#[cfg(windows)]
+struct Held(*const Heap);
+
+#[cfg(windows)]
+impl Held {
+    /// The heap at `at`, unless its last reference is gone already.
+    ///
+    /// # Safety
+    /// `at` is an entry of [`SHADER_HEAPS`], which the caller has locked:
+    /// [`Heap`]'s drop takes its entry out before the heap is freed.
+    unsafe fn take(at: usize) -> Option<Held> {
+        // (Lazily: a `Held` made and dropped would give back a reference.)
+        object::try_add_ref(at as This).then(|| Held(at as *const Heap))
+    }
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for Held {
+    type Target = Heap;
+    fn deref(&self) -> &Heap {
+        // SAFETY: the reference taken keeps it.
+        unsafe { &*self.0 }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        object::release_boxed::<Heap>(self.0.cast());
+    }
+}
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
-fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let &(_, _, at) = heaps
-        .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))?;
-    // SAFETY: registered heaps are live (removed when dropped).
-    let heap = unsafe { &*(at as *const Heap) };
-    Some((heap, heap.index(handle)?))
+fn shader_slot(handle: u64) -> Option<(Held, u32)> {
+    let held = {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        let &(_, _, at) = heaps
+            .iter()
+            .find(|&&(start, end, _)| (start..end).contains(&handle))?;
+        // SAFETY: an entry, and the lock is held.
+        unsafe { Held::take(at) }
+    }?;
+    let index = held.index(handle)?;
+    Some((held, index))
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
@@ -166,10 +206,19 @@ fn mirror(handle: u64) {
 /// only write-watch pages to reveal which slots changed.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    for &(start, end, at) in heaps.iter() {
-        // SAFETY: registered heaps are live (removed when dropped).
-        let heap = unsafe { &*(at as *const Heap) };
+    // One scan at a time: what one has taken for changed is made when it is
+    // done, and the next finds it made.
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps: Vec<(u64, u64, Held)> = {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .iter()
+            // SAFETY: an entry, and the lock is held.
+            .filter_map(|&(start, end, at)| Some((start, end, unsafe { Held::take(at) }?)))
+            .collect()
+    };
+    for (start, end, heap) in heaps {
         let (Some(Some(host)), Some(written), Some(step)) =
             (heap.host.get(), &heap.written, increment(heap.desc.kind))
         else {
@@ -199,11 +248,16 @@ pub(crate) fn sync_heaps() {
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
+    let held = {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .iter()
+            .any(|&(_, _, h)| h == heap)
+            // SAFETY: an entry, and the lock is held.
+            .then(|| unsafe { Held::take(heap) })
+            .flatten()
+    };
+    if let Some(Some(host)) = held.as_ref().and_then(|heap| heap.host.get()) {
         host.release(first, n);
     }
 }
@@ -212,7 +266,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
     }
 }
@@ -1033,7 +1087,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
@@ -1110,6 +1164,77 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    /// A heap released while another thread uses it lives until that
+    /// thread is done; one whose last reference is gone is not found.
+    #[cfg(windows)]
+    #[test]
+    fn a_heap_in_use_outlives_its_release() {
+        let null = std::ptr::null();
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 16,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = null;
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let start = heap(h).start;
+        let (held, index) = shader_slot(start + 16).unwrap();
+        assert_eq!(index, 1);
+        // The title's release is not the last one any more. (Another
+        // test's scan of the heaps may hold one for a moment, too.)
+        assert_ne!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        assert_eq!(held.desc.count, 16);
+        assert!(shader_slot(start).is_some());
+        drop(held);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shader_slot(start).is_some_and(|(other, _)| std::ptr::eq(&*other, h.cast())) {
+            assert!(std::time::Instant::now() < until, "the heap is still found");
+            std::thread::yield_now();
+        }
+    }
+
+    /// Heaps made and released on some threads while others write
+    /// descriptors into the memory they are placed on.
+    #[cfg(windows)]
+    #[test]
+    fn heaps_come_and_go_while_descriptors_are_written() {
+        let memory = vec![0u64; 4096].leak();
+        let address = (memory.as_ptr() as u64).next_multiple_of(64);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    for _ in 0..2000 {
+                        let desc = HeapDesc {
+                            kind: SAMPLERS,
+                            count: 64,
+                            flags: SHADER_VISIBLE,
+                            nodes: 0,
+                        };
+                        let place = Placement { address, size: 1024 };
+                        let mut h = std::ptr::null();
+                        assert_eq!(create(desc, place, &mut h), S_OK);
+                        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+                    }
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+            for k in 0..3 {
+                let stop = &stop;
+                scope.spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        mirror(address + k * 16);
+                    }
+                });
+            }
+        });
     }
 
     /// A descriptor copied into a placed heap as bytes is mirrored before

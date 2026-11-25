@@ -1541,7 +1541,13 @@ mod tests {
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
             drop(placed);
             // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            // (The adapter lets go of the pages some time after the heap is
+            // released; until then the title's call fails.)
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT) == 0 {
+                assert!(std::time::Instant::now() < until, "the pages are still held");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }

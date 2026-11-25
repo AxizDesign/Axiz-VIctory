@@ -66,11 +66,56 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+/// What the journal knows of a page's writes. The kernel tells them by
+/// [`KERNEL_PAGE`]; a page here is 16 of those, and a copy that has what
+/// was written before the last time needs only the parts written then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Write {
+    /// The asking that last found the page written.
+    pub(crate) last: u64,
+    /// `parts` holds every part written after this asking.
+    since: u64,
+    parts: u16,
+}
+
+/// The bytes of one of a page's parts ([`Write::parts`]).
+pub(crate) const PART: usize = PAGE / 16;
+
+impl Write {
+    /// The parts a copy lacks that last took the page at asking `copied`
+    /// (0: never).
+    pub(crate) fn parts(self, copied: u64) -> u16 {
+        if copied != 0 && copied >= self.since {
+            self.parts
+        } else {
+            u16::MAX
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn whole(last: u64) -> Write {
+        Write {
+            last,
+            since: last,
+            parts: u16::MAX,
+        }
+    }
+}
+
+/// The parts of `page` in the bytes `[from, to)`.
+fn parts_in(page: usize, from: usize, to: usize) -> u16 {
+    let start = page * PAGE;
+    let (a, b) = (from.clamp(start, start + PAGE) - start, to.clamp(start, start + PAGE) - start);
+    let (a, b) = (a / PART, b.div_ceil(PART));
+    // (As 32 bits: all 16 parts are a shift by 16.)
+    if a >= b { 0 } else { (((1u32 << (b - a)) - 1) << a) as u16 }
+}
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    /// Page number → its writes.
+    written: BTreeMap<usize, Write>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -254,8 +299,48 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
     j.asked += 1;
     let now = j.asked;
-    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
+    let end = at.saturating_add(len);
+    for page in at / PAGE..end.div_ceil(PAGE) {
+        j.note(page, now, parts_in(page, at, end));
+    }
+}
+
+impl Journal {
+    /// `parts` of `page` were found written by asking `now`.
+    fn note(&mut self, page: usize, now: u64, parts: u16) {
+        self.written
+            .entry(page)
+            .and_modify(|w| {
+                if w.last == now {
+                    w.parts |= parts;
+                } else {
+                    *w = Write {
+                        last: now,
+                        since: w.last,
+                        parts,
+                    };
+                }
+            })
+            .or_insert(Write {
+                last: now,
+                since: 0,
+                parts,
+            });
+    }
+
+    /// The first `count` of the kernel's answers ([`Journal::found`]), found
+    /// by asking `now`.
+    fn note_found(&mut self, count: usize, now: u64) {
+        let mut k = 0;
+        while k < count {
+            let page = self.found[k] / PAGE;
+            let mut parts = 0;
+            while k < count && self.found[k] / PAGE == page {
+                parts |= parts_in(page, self.found[k], self.found[k] + KERNEL_PAGE);
+                k += 1;
+            }
+            self.note(page, now, parts);
+        }
     }
 }
 
@@ -310,10 +395,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
-    }
+    j.note_found(count, now);
     true
 }
 
@@ -328,7 +410,17 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, w)| (p, w.last)).collect()))
+}
+
+/// While a submission's one asking stands ([`ask_once`]) and holds all of
+/// `[start, end)`: the number of the latest asking or noted write
+/// ([`wrote`]). As long as it stays the same, [`writes`] of the range says
+/// the same.
+pub(crate) fn standing(start: usize, end: usize) -> Option<u64> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    (j.kept && j.ahead.iter().any(|&(a, b)| a <= first && last <= b)).then_some(j.asked)
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -337,6 +429,12 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let (now, written) = written(start, end, guarded)?;
+    Some((now, written.into_iter().map(|(p, w)| (p, w.last)).collect()))
+}
+
+/// As [`writes`], with what is known of each page's parts.
+pub(crate) fn written(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, Write)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -391,9 +489,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    j.note_found(count, now);
+    // (Guards are by 64 KiB.)
+    for page in guarded {
+        j.note(page, now, u16::MAX);
     }
     Some((
         now,

@@ -1473,14 +1473,22 @@ impl State {
         if let Some(buffer) = host.strides_buffer() {
             list.keep(buffer);
         }
-        // The pass itself once per frame: per list it ran up to 51 times a
-        // frame over 81,000 views and 4,100 host copies, 18 s of every
-        // frame (2026-11-24, run 11).
-        // shortcut: what the title writes into such buffers between lists
-        // of one frame is seen a frame late.
-        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+        // The pass itself once per frame and heap: per list it ran up to 51
+        // times a frame over 81,000 views and 4,100 host copies, 18 s of
+        // every frame (2026-11-24, run 11). What it finds is brought up to
+        // date by the first submission with a list that needs it
+        // (`crate::host::HeapPass`).
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        let (pass, made_here) = {
+            let mut kept = host.pass.lock().unwrap_or_else(|e| e.into_inner());
+            let new = kept.0 != frame;
+            if new {
+                *kept = (frame, Default::default());
+            }
+            (kept.1.clone(), new)
+        };
+        list.defer_heap(pass.clone());
+        if !made_here {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
@@ -1552,6 +1560,7 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
+        let mut due = Vec::with_capacity(spans.len());
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
@@ -1572,8 +1581,10 @@ impl State {
                     }
                 }
             }
-            shadow.refresh(list, *from, to - from);
+            // (Cut to the copy, as `Shadow::refresh` does.)
+            due.push((shadow.clone(), *from as usize, shadow.left(*from).min(to - from) as usize));
         }
+        let _ = pass.spans.set(due);
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);

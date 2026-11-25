@@ -10,7 +10,7 @@ use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::list::copy_tests::{close, submit, title_list, title_queue};
+use crate::list::copy_tests::{close, send, title_list, title_queue};
 
 /// Reads `READS` dwords spread over a range and writes 64 dwords.
 const SOURCE: &str = r#"
@@ -157,7 +157,9 @@ fn a_frame_through_the_layer() {
             made.push(list);
         }
         let recorded = started.elapsed();
-        submit(queue, &made);
+        send(queue, &made);
+        // The frame ends as one the title waits for does.
+        crate::host::settle_for_fence();
         let done = started.elapsed();
         for list in made {
             crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(list, 0x10)(list);

@@ -1,21 +1,21 @@
 //! Fingerprint the inputs to the shader translator for its disk cache.
+//!
+//! Only what decides the translation counts: the translator's sources
+//! without its tests, and its own manifest and features. A cache holds
+//! tens of thousands of translations, and an edited test, another crate's
+//! dependency or a new compiler made every one of them anew. (The
+//! translator is ordinary safe Rust over the container's bytes: the
+//! compiler that built it does not change what it writes.)
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-const MANIFESTS: [&str; 4] = [
-    "Cargo.toml",
-    "build.rs",
-    "../../Cargo.toml",
-    "../../Cargo.lock",
-];
+const MANIFESTS: [&str; 2] = ["Cargo.toml", "build.rs"];
 
 fn main() {
     println!("cargo:rerun-if-changed=src");
     for path in MANIFESTS {
         println!("cargo:rerun-if-changed={path}");
     }
-    println!("cargo:rerun-if-env-changed=RUSTC");
 
     // Cargo runs build scripts in the crate directory. Hash only relative
     // file names so identical builds can share a cache across checkouts.
@@ -27,17 +27,7 @@ fn main() {
         .collect();
     files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-    let mut hash = blake3::Hasher::new_derive_key("VIctory shader translator build identity v1");
-    let compiler = Command::new(std::env::var_os("RUSTC").expect("Cargo provides RUSTC"))
-        .arg("-vV")
-        .output()
-        .expect("query rustc version");
-    assert!(compiler.status.success(), "rustc -vV failed");
-    field(&mut hash, "rustc", &compiler.stdout);
-    for name in ["TARGET", "CARGO_CFG_TARGET_FEATURE"] {
-        let value = std::env::var(name).unwrap_or_default();
-        field(&mut hash, name, value.as_bytes());
-    }
+    let mut hash = blake3::Hasher::new_derive_key("VIctory shader translator build identity v2");
     let mut features: Vec<_> = std::env::vars_os()
         .filter_map(|(name, _)| {
             let name = name.into_string().ok()?;
@@ -49,7 +39,9 @@ fn main() {
         field(&mut hash, "feature", feature.as_bytes());
     }
     for (name, path) in files {
-        let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("read {name}: {error}"));
+        let mut bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("read {name}: {error}"));
+        // A checkout's line ends are no part of the source.
+        bytes.retain(|&b| b != 13);
         field(&mut hash, &name, &bytes);
     }
     println!(
@@ -73,8 +65,16 @@ fn sources(dir: &Path, files: &mut Vec<PathBuf>) {
         let path = entry.path();
         if entry.file_type().expect("read source file type").is_dir() {
             sources(&path, files);
-        } else {
+        } else if !is_test(&path) {
             files.push(path);
         }
     }
+}
+
+/// Files compiled only into the crate's tests (`semantics_tests.rs`,
+/// `lower/tests.rs`).
+fn is_test(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem == "tests" || stem.ends_with("_tests"))
 }

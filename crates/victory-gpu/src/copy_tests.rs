@@ -149,12 +149,18 @@ pub(crate) fn close(list: This) {
     );
 }
 
-pub(crate) fn submit(queue: This, lists: &[This]) {
+/// Submits as the title does: with submissions sent ahead nothing is
+/// waited for.
+pub(crate) fn send(queue: This, lists: &[This]) {
     slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(
         queue,
         lists.len() as u32,
         lists.as_ptr(),
     );
+}
+
+pub(crate) fn submit(queue: This, lists: &[This]) {
+    send(queue, lists);
     // (With submissions sent ahead: what they write back is there.)
     if crate::host::late() {
         crate::host::settle_for_fence();
