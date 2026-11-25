@@ -19,11 +19,11 @@ $folder = Join-Path $env:LOCALAPPDATA 'victory'
 $store = Join-Path $folder 'launcher.json'
 
 function Read-Choices {
-    $choices = @{ GameExe = ''; Tuned = $false }
+    $choices = @{ GameExe = ''; Work = 'balanced' }
     try {
         $read = Get-Content -LiteralPath $store -Raw -ErrorAction Stop | ConvertFrom-Json
         if ($read.GameExe) { $choices.GameExe = [string]$read.GameExe }
-        $choices.Tuned = [bool]$read.Tuned
+        if ($read.Work -in 'cpu', 'balanced', 'gpu') { $choices.Work = [string]$read.Work }
         # (A LoopLimit an earlier launcher kept there is left out on purpose:
         # it cut compute loops short.)
     } catch { }   # no file yet, or not one of ours: the defaults
@@ -47,10 +47,10 @@ function Get-StartArguments([string[]]$More) {
     ($line + $More) -join ' '
 }
 
-function Get-PlayArguments([string]$Exe, [bool]$Tuned, [bool]$Prebuild) {
+function Get-PlayArguments([string]$Exe, [string]$Work, [bool]$Prebuild) {
     '-GameExe'
     Format-Argument $Exe
-    if ($Tuned) { '-Tuned' }
+    if ($Work -ne 'balanced') { "-Work $Work" }
     if ($Prebuild) { '-Prebuild' }
 }
 
@@ -80,8 +80,12 @@ $null = Add-Control (New-Object System.Windows.Forms.Label) 16 14 528 20 `
     'Executable of your own copy of the title (no game files come with VIctory):'
 $path = Add-Control (New-Object System.Windows.Forms.TextBox) 16 36 430 24 $choices.GameExe
 $browse = Add-Control (New-Object System.Windows.Forms.Button) 454 34 90 27 'Browse...'
-$tuned = Add-Control (New-Object System.Windows.Forms.CheckBox) 16 74 300 22 'Faster submissions (experimental)'
-$tuned.Checked = $choices.Tuned
+$null = Add-Control (New-Object System.Windows.Forms.Label) 16 77 70 20 'Work split:'
+$work = Add-Control (New-Object System.Windows.Forms.ComboBox) 90 73 226 24
+$work.DropDownStyle = 'DropDownList'
+$works = 'cpu', 'balanced', 'gpu'
+$work.Items.AddRange(@('Processor (saves card memory)', 'Balanced', 'Graphics card (more memory)'))
+$work.SelectedIndex = [Array]::IndexOf($works, $choices.Work)
 $prebuild = Add-Control (New-Object System.Windows.Forms.Button) 330 70 214 30 'Pre-build shaders'
 $check = Add-Control (New-Object System.Windows.Forms.Button) 16 112 170 34 'Check this PC'
 $install = Add-Control (New-Object System.Windows.Forms.Button) 195 112 170 34 'Install what is missing'
@@ -91,7 +95,7 @@ $status = Add-Control (New-Object System.Windows.Forms.Label) 16 160 528 44 `
 $form.AcceptButton = $play
 
 function Save-Form {
-    Save-Choices @{ GameExe = $path.Text.Trim(); Tuned = $tuned.Checked }
+    Save-Choices @{ GameExe = $path.Text.Trim(); Work = $works[$work.SelectedIndex] }
 }
 
 # A button's work; what goes wrong is shown, not thrown out of the window.
@@ -118,7 +122,7 @@ function Start-Title([bool]$Ahead, [string]$Said) {
         return
     }
     Save-Form
-    Open-Console (Get-PlayArguments $exe $tuned.Checked $Ahead)
+    Open-Console (Get-PlayArguments $exe $works[$work.SelectedIndex] $Ahead)
     $status.Text = $Said
 }
 $play.Add_Click({ Invoke-Safely { Start-Title $false 'Building, checking and starting in the other window.' } })
@@ -127,10 +131,10 @@ $prebuild.Add_Click({ Invoke-Safely { Start-Title $true 'Pre-building in the oth
 if ($SelfTest) {
     if (-not (Test-Path -LiteralPath $start)) { throw "no $start" }
     if ((Format-Argument 'D:\a b\t.exe') -ne '"D:\a b\t.exe"') { throw 'quoting' }
-    if ($form.Controls.Count -ne 9) { throw "controls: $($form.Controls.Count)" }
-    $line = (Get-PlayArguments 'D:\a b\t.exe' $true $false) -join ' '
-    if ($line -ne '-GameExe "D:\a b\t.exe" -Tuned') { throw "play: $line" }
-    $line = (Get-PlayArguments 'D:\a b\t.exe' $false $true) -join ' '
+    if ($form.Controls.Count -ne 10) { throw "controls: $($form.Controls.Count)" }
+    $line = (Get-PlayArguments 'D:\a b\t.exe' 'gpu' $false) -join ' '
+    if ($line -ne '-GameExe "D:\a b\t.exe" -Work gpu') { throw "play: $line" }
+    $line = (Get-PlayArguments 'D:\a b\t.exe' 'balanced' $true) -join ' '
     if ($line -ne '-GameExe "D:\a b\t.exe" -Prebuild') { throw "pre-build: $line" }
     $form.Dispose()
     'launcher: ok'

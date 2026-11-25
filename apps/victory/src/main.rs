@@ -12,6 +12,7 @@ mod prebuild;
 mod run;
 mod shader;
 mod translate;
+mod work;
 
 use std::path::PathBuf;
 
@@ -113,6 +114,10 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// Where work is done that the processor and the graphics card can
+        /// both do. Settings set in the environment already stay.
+        #[arg(long, value_enum, default_value_t = work::Work::Balanced)]
+        work: work::Work,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -146,6 +151,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
+    if let Command::Run { work, .. } = &cli.command {
+        // SAFETY: nothing so far has started a thread.
+        unsafe { work.apply() };
+    }
     match cli.command {
         Command::Inspect {
             file,
@@ -197,6 +206,7 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
+            work: _,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),

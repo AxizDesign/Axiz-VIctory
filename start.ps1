@@ -34,9 +34,9 @@
   entries: everything is translated again. 0: the translator's own limits,
   also where VICTORY_SHADER_LOOP_LIMIT is set.
 
-.PARAMETER Tuned
-  Also send submissions ahead of the wait for the card (VICTORY_LATE_WAIT=3,
-  VICTORY_WIDE_BACK=1): faster on the PC they were measured on.
+.PARAMETER Work
+  Where work is done that the processor and the graphics card can both do:
+  cpu (less on the card and less of its memory), balanced, gpu (more on it).
 
 .PARAMETER Force
   Run the title although `victory doctor` found something missing.
@@ -53,7 +53,7 @@ param(
     [string]$GameExe,
     [switch]$Install,
     [ValidateRange(0, 1048576)][int]$LoopLimit = 0,
-    [switch]$Tuned,
+    [ValidateSet('cpu', 'balanced', 'gpu')][string]$Work = 'balanced',
     [switch]$Prebuild,
     [switch]$PrebuildAll,
     [switch]$Force
@@ -146,10 +146,6 @@ $settings = @{ VICTORY_GAME_DIR = (Split-Path -Parent $GameExe) }
 if ($PSBoundParameters.ContainsKey('LoopLimit')) {
     $settings.VICTORY_SHADER_LOOP_LIMIT = if ($LoopLimit) { "$LoopLimit" } else { $null }
 }
-if ($Tuned) {
-    $settings.VICTORY_LATE_WAIT = '3'
-    $settings.VICTORY_WIDE_BACK = '1'
-}
 $code = 1
 try {
     foreach ($name in $settings.Keys) {
@@ -166,7 +162,7 @@ try {
         & $victory translate --cache --pipelines @used @files
     } else {
         Write-Host 'Starting. The first start translates shaders: parts of the picture come in late.' -ForegroundColor Cyan
-        & $victory run $GameExe --execute
+        & $victory run $GameExe --execute --work $Work
     }
     $code = $LASTEXITCODE
 } finally {

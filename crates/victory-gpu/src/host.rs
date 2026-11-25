@@ -2644,6 +2644,11 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Whether flights in the air may write title memory `[from, to)`.
+pub(crate) fn flights_write(from: usize, to: usize) -> bool {
+    touches(&line().written, from, to)
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.

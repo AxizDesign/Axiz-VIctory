@@ -879,6 +879,7 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && !gpu_buffer_copy(list, to, from, len as usize)
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -983,12 +984,77 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            if !gpu_buffer_copy(list, to, from, a.min(b) as usize) {
+                list.defer_copy(to, from, a.min(b) as usize);
+            }
         }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
 }
+
+/// Whether a title buffer copy runs on the card (`VICTORY_GPU_BUFFER_COPY=1`;
+/// off by default until measured), only where the copy at submission on the
+/// CPU would read or write bytes a flight in the air may write: that copy
+/// waits for the flights to land, about once a frame (run 10: 21 ms median,
+/// 43 at the ninetieth of a hundred), where the card runs a copy in its
+/// queue's order, behind them, as the console does. The source's host copy
+/// is brought up to date first, the destination's range is declared written
+/// by the card. False if it could not: the caller copies on the CPU as
+/// before. (Trexies e6d37be.)
+#[cfg(windows)]
+fn gpu_buffer_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: usize) -> bool {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_TYPE_UAV};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_GPU_BUFFER_COPY").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    let (dst, src) = (to as usize, from as usize);
+    if len == 0
+        || !crate::host::late()
+        || !(crate::host::flights_write(src, src + len) || crate::host::flights_write(dst, dst + len))
+    {
+        return false;
+    }
+    let (Some(d), Some(s)) = (
+        crate::shadow::find(dst as u64, len as u64),
+        crate::shadow::find(src as u64, len as u64),
+    ) else {
+        return false;
+    };
+    // Both copies hold the whole range, and one buffer does not copy over
+    // itself where the ranges overlap.
+    let (Some(d_at), Some(s_at)) = (d.offset_in(dst as u64), s.offset_in(src as u64)) else {
+        return false;
+    };
+    if d.left(dst as u64) < len as u64
+        || s.left(src as u64) < len as u64
+        || (std::sync::Arc::ptr_eq(&d, &s) && src < dst + len && dst < src + len)
+    {
+        return false;
+    }
+    s.refresh(list, src as u64, len as u64);
+    d.refresh(list, dst as u64, len as u64);
+    d.gpu_writes(list, dst as u64, len as u64);
+    let uav = || D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
+    // SAFETY: an open list; both host copies are live and hold the ranges
+    // (checked above). Shaders' writes before the copy first, then the
+    // copy's before what follows.
+    unsafe {
+        list.list.ResourceBarrier(&[uav()]);
+        list.list.CopyBufferRegion(&d.buffer, d_at, &s.buffer, s_at, len as u64);
+        list.list.ResourceBarrier(&[uav()]);
+    }
+    let n = GPU_BUFFER_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(n, bytes = len, "title buffer copies run on the card behind the flights (VICTORY_GPU_BUFFER_COPY=1)");
+    }
+    true
+}
+
+/// Title buffer copies run on the card ([`gpu_buffer_copy`]).
+#[cfg(windows)]
+static GPU_BUFFER_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A whole-texture copy between host copies that leave out different
 /// numbers of levels (`crate::resource::drop_levels`): each title level both
