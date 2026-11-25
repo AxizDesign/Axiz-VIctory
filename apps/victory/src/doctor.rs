@@ -2,7 +2,6 @@
 //! no title.
 
 use anyhow::{Result, bail};
-use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -149,81 +148,131 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Lists the adapters; whether the one Windows gives by default (the one
-/// a run uses when none is chosen) has what is needed.
+/// An adapter, in the system's list (fastest first).
+#[derive(Debug, Clone)]
+struct Adapter {
+    name: String,
+    software: bool,
+    memory_mib: usize,
+    /// `Err`: why it gives no Direct3D 12 device.
+    gpu: std::result::Result<Gpu, String>,
+}
+
+/// Whether a run passes the adapter over where another will do (`lacks` in
+/// victory-gpu's host.rs, which does not ask for mesh shaders).
+fn passed_over(gpu: &Gpu) -> bool {
+    gpu.shader_model < (6, 6) || gpu.binding_tier < 3 || gpu.wave_lanes.is_none()
+}
+
+/// The adapter a run takes: the same choice as `pick_device` in victory-gpu's
+/// host.rs. `wanted` is `VICTORY_ADAPTER`: a part of the name, or the place in
+/// the list.
+fn chosen(adapters: &[Adapter], wanted: Option<&str>) -> Option<usize> {
+    let wanted = wanted.map(|w| w.trim().to_lowercase()).filter(|w| !w.is_empty());
+    let named = |i: usize| {
+        wanted.as_ref().is_some_and(|w| match w.parse::<usize>() {
+            Ok(n) => n == i,
+            Err(_) => adapters[i].name.to_lowercase().contains(w),
+        })
+    };
+    let mut order: Vec<usize> = (0..adapters.len()).filter(|&i| adapters[i].gpu.is_ok()).collect();
+    order.sort_by_key(|&i| (!named(i), adapters[i].software));
+    let fits = |i: usize| adapters[i].gpu.as_ref().is_ok_and(|gpu| !passed_over(gpu));
+    order
+        .iter()
+        .copied()
+        .find(|&i| fits(i))
+        .or_else(|| order.first().copied())
+}
+
+/// Whether the adapter draws: a card that lacks nothing a run fails without.
+fn draws(adapter: &Adapter) -> bool {
+    !adapter.software
+        && adapter
+            .gpu
+            .as_ref()
+            .is_ok_and(|gpu| lacks(gpu).iter().all(|(level, _)| *level != Level::Fail))
+}
+
+/// Lists the adapters; whether the one a run takes has what is needed.
 fn adapters() -> Result<bool> {
     println!("Graphics");
-    let default = device(None).ok().map(|d| {
-        // SAFETY: a plain query.
-        unsafe { d.GetAdapterLuid() }
-    });
-    let same = |a: LUID, b: LUID| (a.LowPart, a.HighPart) == (b.LowPart, b.HighPart);
-    let (mut default_good, mut other_good) = (false, None);
+    let adapters = list()?;
+    let wanted = std::env::var("VICTORY_ADAPTER").ok();
+    let Some(taken) = chosen(&adapters, wanted.as_deref()) else {
+        println!("  FAIL  no adapter here gives a Direct3D 12 device at feature level 12.0");
+        return Ok(false);
+    };
+    for (i, adapter) in adapters.iter().enumerate() {
+        // The software adapter is always there; it matters only when taken.
+        if adapter.software && i != taken {
+            continue;
+        }
+        println!(
+            "  {}, {} MiB{}",
+            adapter.name,
+            adapter.memory_mib,
+            if i == taken { " (a run uses this one)" } else { "" }
+        );
+        match &adapter.gpu {
+            Err(e) => println!("    note  no Direct3D 12 device at feature level 12.0: {e}"),
+            Ok(gpu) => {
+                for (level, text) in lacks(gpu) {
+                    let level = match level {
+                        _ if i != taken => "note",
+                        Level::Fail => "FAIL",
+                        Level::Warn => "WARN",
+                    };
+                    println!("    {level}  {text}");
+                }
+            }
+        }
+        if draws(adapter) {
+            println!("    ok    can draw");
+        }
+    }
+    if draws(&adapters[taken]) {
+        return Ok(true);
+    }
+    match adapters.iter().find(|a| draws(a)) {
+        Some(other) => println!(
+            "  FAIL  a run does not take {}, which can draw: set VICTORY_ADAPTER to a part of its \
+             name",
+            other.name
+        ),
+        None => println!("  FAIL  no graphics card here can draw"),
+    }
+    Ok(false)
+}
+
+fn list() -> Result<Vec<Adapter>> {
+    let mut out = Vec::new();
     // SAFETY: plain DXGI enumeration.
     unsafe {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-        for i in 0.. {
-            let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
-                i,
-                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-            ) else {
-                break;
-            };
+        while let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+            out.len() as u32,
+            DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+        ) {
             let d = adapter.GetDesc1()?;
-            if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
-                continue;
-            }
             let end = d.Description.iter().position(|&c| c == 0);
-            let name =
-                String::from_utf16_lossy(&d.Description[..end.unwrap_or(d.Description.len())]);
-            let is_default = default.is_some_and(|l| same(l, d.AdapterLuid));
-            println!(
-                "  {name}, {} MiB{}",
-                d.DedicatedVideoMemory >> 20,
-                if is_default { " (Windows' default)" } else { "" }
-            );
-            let device = match device(Some(&adapter)) {
-                Ok(device) => device,
-                Err(e) => {
-                    println!("    FAIL  no Direct3D 12 device at feature level 12.0: {}", e.message());
-                    continue;
-                }
-            };
-            let lacks = lacks(&read(&device));
-            for (level, text) in &lacks {
-                let level = if *level == Level::Fail { "FAIL" } else { "WARN" };
-                println!("    {level}  {text}");
-            }
-            if lacks.iter().all(|(level, _)| *level != Level::Fail) {
-                println!("    ok    can draw");
-                if is_default {
-                    default_good = true;
-                } else {
-                    other_good.get_or_insert(name);
-                }
-            }
+            out.push(Adapter {
+                name: String::from_utf16_lossy(
+                    &d.Description[..end.unwrap_or(d.Description.len())],
+                ),
+                software: d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+                memory_mib: d.DedicatedVideoMemory >> 20,
+                gpu: device(&adapter).map(|d| read(&d)).map_err(|e| e.message()),
+            });
         }
     }
-    if let (false, Some(name)) = (default_good, &other_good) {
-        println!(
-            "  FAIL  Windows' default is not {name}, which can draw: choose High performance for \
-             victory.exe in Settings > System > Display > Graphics"
-        );
-    } else if !default_good {
-        println!("  FAIL  no graphics card here can draw");
-    }
-    Ok(default_good)
+    Ok(out)
 }
 
-fn device(adapter: Option<&IDXGIAdapter1>) -> windows::core::Result<ID3D12Device> {
+fn device(adapter: &IDXGIAdapter1) -> windows::core::Result<ID3D12Device> {
     let mut device: Option<ID3D12Device> = None;
-    // SAFETY: device creation on a live adapter, or the default one.
-    unsafe {
-        match adapter {
-            Some(a) => D3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, &mut device)?,
-            None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
-        }
-    }
+    // SAFETY: device creation on a live adapter.
+    unsafe { D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device)? };
     device.ok_or_else(windows::core::Error::empty)
 }
 
@@ -292,7 +341,7 @@ fn commit_gib() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Gpu, Level, lacks};
+    use super::{Adapter, Gpu, Level, chosen, draws, lacks};
 
     fn good() -> Gpu {
         Gpu {
@@ -303,6 +352,73 @@ mod tests {
             int64: true,
             rovs: true,
         }
+    }
+
+    fn adapter(name: &str, gpu: Gpu) -> Adapter {
+        Adapter {
+            name: name.into(),
+            software: false,
+            memory_mib: 0,
+            gpu: Ok(gpu),
+        }
+    }
+
+    fn old() -> Gpu {
+        Gpu {
+            shader_model: (6, 5),
+            mesh: false,
+            ..good()
+        }
+    }
+
+    fn software() -> Adapter {
+        Adapter {
+            software: true,
+            ..adapter("Basic Render Driver", good())
+        }
+    }
+
+    #[test]
+    fn the_card_that_fits_is_taken_whatever_comes_first() {
+        let list = [adapter("Old", old()), software(), adapter("New", good())];
+        assert_eq!(chosen(&list, None), Some(2));
+        assert!(draws(&list[2]));
+        // Named, but passed over: as in a run.
+        assert_eq!(chosen(&list, Some("old")), Some(2));
+    }
+
+    #[test]
+    fn a_named_card_goes_first() {
+        let list = [adapter("Fast A", good()), adapter("Slow B", good())];
+        assert_eq!(chosen(&list, None), Some(0));
+        assert_eq!(chosen(&list, Some(" slow ")), Some(1));
+        assert_eq!(chosen(&list, Some("1")), Some(1));
+        assert_eq!(chosen(&list, Some("")), Some(0));
+    }
+
+    #[test]
+    fn a_run_does_not_look_for_mesh_shaders() {
+        let no_mesh = Gpu {
+            mesh: false,
+            ..good()
+        };
+        let list = [adapter("A", no_mesh), adapter("B", good())];
+        assert_eq!(chosen(&list, None), Some(0));
+        assert!(!draws(&list[0]) && draws(&list[1]));
+    }
+
+    #[test]
+    fn software_and_broken_adapters_do_not_count_as_drawing() {
+        let broken = Adapter {
+            gpu: Err("no".into()),
+            ..adapter("Broken", good())
+        };
+        assert_eq!(chosen(std::slice::from_ref(&broken), None), None);
+        let list = [broken, adapter("Old", old()), software()];
+        assert_eq!(chosen(&list, None), Some(2));
+        assert!(!draws(&list[2]));
+        assert_eq!(chosen(&list[..2], None), Some(1));
+        assert_eq!(chosen(&[], None), None);
     }
 
     #[test]
