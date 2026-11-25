@@ -721,6 +721,83 @@ fn small_floats_widen_as_halves() {
 }
 
 #[test]
+fn dual_back_edge_branch_produces_valid_counter_phis() {
+    // Inverted nested loop: inner_hdr (w[5]) branches back to itself on
+    // taken and falls through directly to outer_hdr (w[8]) on not_taken,
+    // so both arms of w[7]'s conditional branch are back edges.
+    let words = [
+        0xBE85_0380,                             // w[0] s_mov_b32 s5, 0
+        (0x3D << 26) | (0x02 << 18) | (8 << 6) | 2,
+        125 << 25,                               // w[1..2] s_load_dwordx4 s[8:11], s[4:5], 0
+        0xBE81_0380,                             // w[3] s_mov_b32 s1, 0
+        0xBF82_0003,                             // w[4] s_branch outer_hdr (w[8])
+        0x8001_8101,                             // w[5] inner_hdr: s_add_u32 s1, s1, 1
+        0xBF0A_8401,                             // w[6] s_cmp_lt_u32 s1, 4
+        0xBF85_FFFD,                             // w[7] s_cbranch_scc1 inner_hdr; fallthrough outer_hdr
+        0x8000_C100,                             // w[8] outer_hdr: s_add_u32 s0, s0, -1
+        0xBF08_8000,                             // w[9] s_cmp_gt_u32 s0, 0
+        0xBF85_FFFA,                             // w[10] s_cbranch_scc1 inner_hdr; fallthrough exit
+        0x7E00_0201,                             // w[11] exit: v_mov_b32 v0, s1
+        (0x38 << 26) | (0x1C << 18),
+        (0x80 << 24) | (2 << 16),                // w[12..13] buffer_store_dword v0, off, s[8:11], 0
+        S_ENDPGM,                                // w[14]
+    ];
+    let layout = vec![
+        RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        },
+        RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 1,
+        },
+    ];
+    let used = vec![UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    }];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, false, 16).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let order = ir::reverse_postorder(&p.blocks);
+    let mut rpo = vec![usize::MAX; p.blocks.len()];
+    for (i, &b) in order.iter().enumerate() {
+        rpo[b] = i;
+    }
+    // Confirm the synthetic CFG actually exercises a dual back-edge branch.
+    assert!(
+        st.exits.iter().enumerate().any(|(b, ex)| matches!(
+            ex,
+            structure::LaneExit::Branch { taken, not_taken, .. }
+                if rpo[*taken] <= rpo[b] && rpo[*not_taken] <= rpo[b]
+        )),
+        "expected a conditional branch with two back edges"
+    );
+    let lowered = lower_with(&words, layout, used).expect("dual back-edge shader must lower");
+    if let Ok(mut v) =
+        super::super::validator::Validator::load(super::super::validator::Validator::default_path().as_deref())
+    {
+        let mut copy = lowered.dxil.clone();
+        v.validate(&mut copy)
+            .expect("DXIL validator must accept dual back-edge counter PHIs");
+    }
+}
+
+#[test]
 fn permlane16_sets_console_lanes_and_lowers_cleanly() {
     // VOP3: v_permlane16_b32 (0x377) and v_permlanex16_b32 (0x378) v1, v0, 0, 0
     for opcode in [0x377u32, 0x378u32] {
