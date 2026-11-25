@@ -11167,14 +11167,15 @@ impl<'a> Lower<'a> {
         // runs to the limit in every lane. A million iterations a pixel
         // hung the GPU for seconds a draw until Windows reset it
         // (PS_Textured_Eight, 2026-11-24, run 12).
-        // shortcut: a pixel loop past 128 iterations, a vertex or mesh loop
-        // past 256 or a compute loop past 4,096 is cut short. (They were
+        // shortcut: a pixel, vertex or mesh loop past 256 iterations or a compute loop past 4,096 is cut short. (They were
         // 1,024, 4,096 and 65,536: the opening cutscene then lost the card
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
-        // stop reading data that is not there yet.)
+        // stop reading data that is not there yet. Pixel loops were cut at
+        // 128 while helper lanes never left theirs, see `helper_reads_own`:
+        // hair layers and light lists past that were dropped pixels.)
         let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
+            LOOP_LIMIT if self.s.pixel => 1 << 8,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT => 1 << 12,
             named => named,

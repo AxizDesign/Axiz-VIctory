@@ -58,9 +58,6 @@ pub(crate) struct Staging {
     used: std::sync::atomic::AtomicU64,
 }
 
-/// How long a texture whose hash changed is hashed at every check.
-const LIVE_FRAMES: u64 = 30;
-
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
@@ -69,11 +66,45 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
-    /// The frame a hash last found the texture changed in.
-    changed: Option<u64>,
+    /// Until this frame the texture is hashed at every check: its memory
+    /// changed behind the guard's back (a write through another view of
+    /// the same pages, as a video decoder's planes get) when last hashed.
+    hot_until: u64,
+    /// The frame the hash last found the texture changed in. The texture's
+    /// next check hashes it once more (`verify`): if it changed again it is
+    /// hot. A texture that streams in changes once and is not hashed on. A
+    /// video's planes cycle through a ring of textures, each sampled only
+    /// every third frame, so "again" cannot mean "the next frame".
+    changed_at: u64,
+    verify: bool,
 }
 
+/// How many frames a texture that keeps changing stays hashed at every
+/// check after its last change.
+const HOT_FRAMES: u64 = 24;
+/// How long after a change the next check still counts as "again".
+const VERIFY_FRAMES: u64 = 24;
+
 impl Last {
+    /// The hash found the texture changed in `frame`.
+    fn changed(&mut self, frame: u64) {
+        if (self.verify && frame <= self.changed_at + VERIFY_FRAMES) || frame < self.hot_until {
+            self.hot_until = frame + HOT_FRAMES;
+        }
+        self.changed_at = frame;
+        self.verify = true;
+    }
+
+    /// The hash found the texture as it was.
+    fn unchanged(&mut self) {
+        self.verify = false;
+    }
+
+    /// Whether the hash is due at `frame` whatever the turns say.
+    fn hash_due(&self, frame: u64) -> bool {
+        frame < self.hot_until || (self.verify && frame > self.changed_at && frame <= self.changed_at + VERIFY_FRAMES)
+    }
+
     /// Throttle polling, not a refresh prompted by a known new write.
     fn partial_due(&self, frame: u64, written: bool) -> bool {
         written || self.partial.is_none_or(|at| frame.saturating_sub(at) >= 30)
@@ -767,14 +798,14 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             guard_written = last.asked != 0 && !unwritten;
             last.asked = now;
+            // A texture the hash found changed lately is hashed at every
+            // check: the Bink video planes of the intro are written through
+            // the CPU view of their pages, which the guard does not see, and
+            // every eighth frame showed them up to seven frames late (the
+            // picture jumped between three older frames).
             let frame = crate::frame::current();
-            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            // A texture that changed lately is hashed at every check: the
-            // guard misses writes through another view (a video decoder
-            // filling a ring of frames), and every eighth frame showed such
-            // a ring out of order.
-            let live = last.changed.is_some_and(|at| frame < at + LIVE_FRAMES);
-            if unwritten && !turn && !live {
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY) || last.hash_due(frame);
+            if unwritten && !turn {
                 return 0;
             }
         }
@@ -833,10 +864,13 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    last.unchanged();
                     return size;
                 }
+                if last.hash.is_some() {
+                    last.changed(crate::frame::current());
+                }
                 last.hash = Some(hash);
-                last.changed = Some(crate::frame::current());
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -850,10 +884,13 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            last.unchanged();
             return size;
         }
+        if last.hash.is_some() {
+            last.changed(crate::frame::current());
+        }
         last.hash = Some(hash);
-        last.changed = Some(crate::frame::current());
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1386,5 +1423,52 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hot_texture_tests {
+    use super::{HOT_FRAMES, Last, VERIFY_FRAMES};
+
+    /// A video's planes cycle through a ring of three textures, each sampled
+    /// and checked every third frame, and each found changed at every check:
+    /// from the second change on the texture is hot, and stays so.
+    #[test]
+    fn a_texture_changing_at_every_check_goes_hot() {
+        let mut last = Last::default();
+        last.changed(10);
+        assert!(!last.hash_due(10), "the check that found the change is done");
+        assert!(last.hash_due(13), "the next check verifies it");
+        last.changed(13);
+        assert!(last.hash_due(14), "changed twice: hot");
+        last.changed(16);
+        assert!(last.hash_due(16 + HOT_FRAMES - 1));
+    }
+
+    /// A texture that streams in changes once: it is hashed once more at its
+    /// next check, found as it was, and not hashed again between turns.
+    #[test]
+    fn a_texture_that_changed_once_is_not_hot() {
+        let mut last = Last::default();
+        last.changed(100);
+        assert!(last.hash_due(101), "verified at the next check");
+        last.unchanged();
+        assert!(!last.hash_due(102));
+        assert!(!last.hash_due(100 + VERIFY_FRAMES));
+        // A change long after the first is a first change again.
+        last.changed(500);
+        assert!(!last.hash_due(500));
+        assert!(last.hash_due(501));
+    }
+
+    /// A hot texture that stops changing falls back to the turns.
+    #[test]
+    fn a_hot_texture_cools_down() {
+        let mut last = Last::default();
+        last.changed(1);
+        last.changed(4);
+        assert!(last.hash_due(4 + HOT_FRAMES - 1));
+        last.unchanged();
+        assert!(!last.hash_due(4 + HOT_FRAMES + 1));
     }
 }
