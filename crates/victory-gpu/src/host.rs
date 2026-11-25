@@ -1762,6 +1762,44 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// What the list has taken of the numbered copies of title memory.
+    memory: MemoryTaken,
+}
+
+/// What a list has taken of the numbered copies of title memory by address
+/// ([`crate::memory`]; copies are only ever added): the title records its
+/// lists on several threads, and a list's shaders reach a copy another list
+/// numbered since through the directory all the same. After
+/// fxceless/victory-fork #205 and #370.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MemoryTaken {
+    /// How many are brought up to date, since the last step that writes
+    /// title memory.
+    read: usize,
+    /// How many there were when the list first took them, and how many at
+    /// its last dispatch that can store.
+    first: Option<usize>,
+    written: Option<usize>,
+}
+
+impl MemoryTaken {
+    /// At a dispatch, of `total` copies now and `before` ahead of what the
+    /// dispatch itself had numbered: from which copy on they are to be
+    /// brought up to date, and with `writes`, from which on they are ones
+    /// numbered while the list is recorded and not declared written yet.
+    fn take(&mut self, before: usize, total: usize, writes: bool) -> (usize, usize) {
+        let from = self.read.min(total);
+        self.read = total;
+        let first = *self.first.get_or_insert(before);
+        let new = if writes {
+            let new = self.written.unwrap_or(first);
+            self.written = Some(total);
+            new
+        } else {
+            total
+        };
+        (from, new.min(total))
+    }
 }
 
 impl Deferred {
@@ -1988,6 +2026,26 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
 
 #[cfg(test)]
 mod relay_tests {
+    /// Copies another list numbered meanwhile are brought up to date and
+    /// looked for in what is written, each once; all again after a step
+    /// that writes title memory.
+    #[test]
+    fn a_list_takes_the_copies_other_lists_numbered() {
+        let (mut a, mut b) = (super::MemoryTaken::default(), super::MemoryTaken::default());
+        // Ten there are, two of them numbered by the dispatch itself.
+        assert_eq!(a.take(8, 10, true), (0, 8));
+        assert_eq!(a.take(10, 10, true), (10, 10));
+        // Another list only reads, and numbers five.
+        assert_eq!(b.take(10, 15, false), (0, 15));
+        // The first list's next dispatch has those too.
+        assert_eq!(a.take(15, 15, true), (10, 10));
+        // The other's first that stores: what was numbered since it began.
+        assert_eq!(b.take(15, 17, true), (15, 10));
+        a.read = 0;
+        assert_eq!(a.take(17, 17, false), (0, 17));
+        assert_eq!(a.take(17, 17, true), (17, 15));
+    }
+
     use super::{Step, WHY_READ, WHY_RUN, blocked_by_steps, flagged_pieces, landable};
 
     /// Two flights and what follows each: nothing of the second lands
@@ -5269,6 +5327,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.memory.read = 0;
         deferred.gpu_written.clear();
         deferred.constants.clear();
     }
@@ -5655,12 +5714,19 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// What the list is still to take of the numbered copies of title
+    /// memory ([`MemoryTaken::take`]).
+    pub(crate) fn memory_taken(&self, before: usize, total: usize, writes: bool) -> (usize, usize) {
+        self.deferred().memory.take(before, total, writes)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
+        deferred.memory.read = 0;
         deferred.gpu_written.clear();
         deferred.constants.clear();
     }
