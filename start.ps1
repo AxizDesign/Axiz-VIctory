@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-  Checks this PC, builds VIctory and, given a title's executable, runs it.
+  Checks this PC, builds Vertex and, given a title's executable, runs it.
 
 .DESCRIPTION
   Without -GameExe: checks the build tools, builds, and runs `victory doctor`.
   With -GameExe: the same, then runs your own copy of the title. The copy must
-  be outside this folder. No game file comes with VIctory.
+  be outside this folder. No game file comes with Vertex.
 
   The build is the `diag` profile with the `diagnostics` feature: the switches
   for finding faults (README, "Debugging") are there when a run needs them.
@@ -128,7 +128,7 @@ if ($GameExe) {
 }
 
 $manifest = Join-Path $PSScriptRoot 'Cargo.toml'
-Write-Host 'Building VIctory (minutes the first time)...' -ForegroundColor Cyan
+Write-Host 'Building Vertex (minutes the first time)...' -ForegroundColor Cyan
 & cargo build --locked --profile diag -p victory --features diagnostics --manifest-path $manifest
 if ($LASTEXITCODE -ne 0) { Stop-Start "the build failed (exit code $LASTEXITCODE)." }
 $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $PSScriptRoot 'target' }

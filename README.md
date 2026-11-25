@@ -1,7 +1,9 @@
-# VIctory (fork)
+# Vertex
 
-Runs an Xbox Series X|S title natively on Windows, from files you supply. This
-is a work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory).
+Vertex runs an Xbox Series X|S title natively on Windows, from files you supply.
+It is a work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory)
+by Marvisak; the program, its settings (`VICTORY_*`) and its crates keep that
+name so that work can still be shared between the forks.
 
 **There are no game files, code or assets here.** You need your own copy of the
 game. This project is not affiliated with or endorsed by the game's developer
@@ -37,7 +39,7 @@ or publisher.
 
 ### Getting started
 
-1. Get the code: `git clone https://github.com/proneonn/victory-unified`
+1. Get the code: `git clone https://github.com/proneonn/Vertex`
 2. Double-click `Launcher.cmd`. It finds your copy's executable, checks this
    PC, installs what is missing and starts the title.
 

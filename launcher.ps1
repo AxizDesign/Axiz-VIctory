@@ -64,7 +64,7 @@ function Open-Console([string[]]$More) {
 $choices = Read-Choices
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'VIctory'
+$form.Text = 'Vertex'
 $form.ClientSize = New-Object System.Drawing.Size(560, 244)
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
@@ -79,7 +79,7 @@ function Add-Control($Control, [int]$X, [int]$Y, [int]$W, [int]$H, [string]$Text
 }
 
 $null = Add-Control (New-Object System.Windows.Forms.Label) 16 14 528 20 `
-    'Executable of your own copy of the title (no game files come with VIctory):'
+    'Executable of your own copy of the title (no game files come with Vertex):'
 $path = Add-Control (New-Object System.Windows.Forms.TextBox) 16 36 430 24 $choices.GameExe
 $browse = Add-Control (New-Object System.Windows.Forms.Button) 454 34 90 27 'Browse...'
 $null = Add-Control (New-Object System.Windows.Forms.Label) 16 77 70 20 'Work split:'
