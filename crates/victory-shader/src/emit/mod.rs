@@ -123,7 +123,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit,
+    set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -199,7 +199,7 @@ pub fn shader_opt() -> u32 {
 /// The environment variables a translation depends on besides those with a
 /// function of their own here ([`loop_limit`], [`group_sync`],
 /// [`shader_opt`]): read where they matter.
-const SWITCHES: [&str; 7] = [
+const SWITCHES: [&str; 9] = [
     "VICTORY_WAVE_WIDE",
     "VICTORY_WAVE_DEEP_SKIPS",
     "VICTORY_WAVE_OWN_BITS",
@@ -207,6 +207,8 @@ const SWITCHES: [&str; 7] = [
     "VICTORY_F16_NEAREST",
     "VICTORY_MESH_OUTPUT_STRICT",
     "VICTORY_STRICT_JOINS",
+    "VICTORY_FIRSTLANE_OWN",
+    "VICTORY_FIRST_HALF",
 ];
 
 /// Everything a translation depends on besides the container and this

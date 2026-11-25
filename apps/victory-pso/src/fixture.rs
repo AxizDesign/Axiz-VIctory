@@ -142,12 +142,14 @@ pub(crate) fn container_of(code: &[u8], r: &Record) -> Vec<u8> {
     fssm.extend(0x101u32.to_le_bytes());
     fssm.extend((payload.len() as u64).to_le_bytes());
     fssm.extend(payload);
-    let packed = miniz_oxide::deflate::compress_to_vec_zlib(&fssm, 6);
+    let mut room = vec![0u8; zlib_rs::compress_bound(fssm.len())];
+    let (packed, done) = zlib_rs::compress_slice(&mut room, &fssm, zlib_rs::DeflateConfig::new(6));
+    assert_eq!(done, zlib_rs::ReturnCode::Ok, "room for every input");
     let mut xbch = b"XBCH".to_vec();
     xbch.extend(3u32.to_le_bytes());
     xbch.extend((packed.len() as u64).to_le_bytes());
     xbch.extend((fssm.len() as u64).to_le_bytes());
-    xbch.extend(packed);
+    xbch.extend_from_slice(packed);
 
     // The `DXIL` part: the program header's room, then `XDAT` naming one
     // native blob (kind 0x0d) by offset and size.
