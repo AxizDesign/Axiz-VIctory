@@ -1452,7 +1452,12 @@ impl HostHeap {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            // Few lines for it: the title writes its whole heap in order at
+            // start-up, and every slot past the end was a new highest one.
+            static HIGHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index
+                && (HIGHER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).is_power_of_two()
+            {
                 tracing::warn!(
                     index,
                     count = self.count,
