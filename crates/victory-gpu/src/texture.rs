@@ -35,7 +35,6 @@ macro_rules! once {
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// Its bytes.
-    #[cfg(feature = "diagnostics")]
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -941,8 +940,10 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
+            // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
+            // keeping the slice strictly inside the mapped staging buffer even when
+            // GetCopyableFootprints does not pad the final row of the last subresource.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -955,6 +956,18 @@ impl Staging {
             }
         }
     }
+}
+
+/// Bytes available in the staging buffer for a subresource at `offset`.
+/// D3D12's `GetCopyableFootprints` omits trailing row-pitch padding on the
+/// final row of the final subresource, so `pitch * rows * depth` can exceed
+/// `total - offset`.
+fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
+    let padded = pitch
+        .saturating_mul(rows as usize)
+        .saturating_mul(depth as usize);
+    let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
+    padded.min(remaining)
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
@@ -1264,7 +1277,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: total,
         data,
         footprints,
@@ -1280,6 +1292,45 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subresource_len_stays_inside_staging_total() {
+        // A 4x4 RGBA8 texture has RowPitch=256, rows=4, last_row=16 -> total=784.
+        // Padded size (1024) must be clamped to 784 so from_raw_parts_mut stays in bounds.
+        assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
+        assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
+        assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+    }
+
+    #[test]
+    fn committed_rejects_overflow_and_noaccess_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        assert!(!committed(usize::MAX as *const u8, 16));
+        // SAFETY: reserving and committing one private page for the test, freed below.
+        let noaccess =
+            unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS) };
+        assert!(!noaccess.is_null());
+        assert!(!committed(noaccess.cast::<u8>(), 4096));
+        // SAFETY: freeing the allocation above.
+        unsafe { VirtualFree(noaccess, 0, MEM_RELEASE) };
+
+        // Negative control: a readable committed page still passes.
+        // SAFETY: reserving and committing one private page for the test, freed below.
+        let rw =
+            unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!rw.is_null());
+        assert!(committed(rw.cast::<u8>(), 4096));
+        // SAFETY: freeing the allocation above.
+        unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
 }
 
 #[cfg(test)]
