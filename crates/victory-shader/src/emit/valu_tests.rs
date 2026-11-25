@@ -1336,6 +1336,42 @@ const DS_MIN_RTN_F32: u8 = 0x32;
 const DS_MAX_RTN_F32: u8 = 0x33;
 const DS_READ_B32: u8 = 0x36;
 
+/// Accesses past the 512 bytes of LDS the program has: reads give 0, writes
+/// and atomics do nothing, and what is in bounds is untouched.
+#[test]
+fn lds_accesses_out_of_bounds_read_zero_and_drop_writes() {
+    let inside = vop1(0x001, 5, 0x80); // v5 = 0
+    let outside = |at: u32| [vop1(0x001, 6, 0xFF), at]; // v6 = `at`
+    for at in [512u32, 516, 1024, 0x4000, 0x8000_0000] {
+        // LDS[0] = v1; LDS[at] = v2; v0 = LDS[at].
+        let mut read = vec![inside];
+        read.extend(outside(at));
+        read.extend(ds(DS_WRITE_B32, 0, 5, 1));
+        read.extend(ds(DS_WRITE_B32, 0, 6, 2));
+        read.extend(ds(DS_READ_B32, 0, 6, 0));
+        // The same, with an atomic's old value.
+        let mut atomic = vec![inside];
+        atomic.extend(outside(at));
+        atomic.extend(ds(DS_WRITE_B32, 0, 5, 1));
+        atomic.extend(ds(DS_MAX_RTN_F32, 0, 6, 2));
+        // The first dword afterwards.
+        let mut kept = vec![inside];
+        kept.extend(outside(at));
+        kept.extend(ds(DS_WRITE_B32, 0, 5, 1));
+        kept.extend(ds(DS_WRITE_B32, 0, 6, 2));
+        kept.extend(ds(DS_MAX_F32, 0, 6, 2));
+        kept.extend(ds(DS_READ_B32, 0, 5, 0));
+        for (body, first) in [(read, false), (atomic, false), (kept, true)] {
+            let shader = build_cs(&body, 1, 512);
+            let cases = [[0x3F80_0000, 0x4000_0000, 0, 0], [0x1234_5678, 0x4100_0000, 0, 0]];
+            run_cases_on(&shader, &cases, &[("hardware", false)], |backend, _, inp, got| {
+                let want = if first { inp[0] } else { 0 };
+                assert_eq!(got, want, "{backend}: LDS at {at:#x}, first dword: {first}");
+            });
+        }
+    }
+}
+
 /// What RDNA2 writes for `ds_max_f32` / `ds_min_f32` over a dword holding
 /// `old` with `data` (bits), as measured on gfx1036 with f32 denormals kept:
 /// an sNaN, data first, then memory, is written quieted; otherwise a NaN
