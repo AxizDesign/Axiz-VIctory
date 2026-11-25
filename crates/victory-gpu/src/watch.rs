@@ -1329,9 +1329,22 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(block);
+    }
+    // Neighbours in one call (each call tells every processor the title
+    // runs on); one by one if the call fails, as over more than one view
+    // (after reddxd-byte/ShakiraRED-dt c2271e5).
+    let set = |from: usize, to: usize| {
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // SAFETY: blocks we made read-only.
+        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) != 0 }
+    };
+    for run in blocks.chunk_by(|a, b| a + 1 == *b) {
+        let (from, to) = (run[0], run[run.len() - 1] + 1);
+        if !set(from, to) && run.len() > 1 {
+            for block in from..to {
+                set(block, block + 1);
+            }
+        }
     }
     !blocks.is_empty()
 }
