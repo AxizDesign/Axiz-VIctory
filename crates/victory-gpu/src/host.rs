@@ -4982,6 +4982,13 @@ impl Host {
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
                 WaitForSingleObject(event, INFINITE);
+                // A device that is gone ends every wait, with nothing
+                // fetched: the bytes are not to be merged (after
+                // reddxd-byte/ShakiraRED-dt c2271e5).
+                if fence.GetCompletedValue() == u64::MAX {
+                    self.device.GetDeviceRemovedReason()?;
+                    return Err(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED.into());
+                }
                 Ok(after)
             })()
         };
