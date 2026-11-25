@@ -752,10 +752,11 @@ impl Staging {
         // where two textures change (run 58). It is guarded now, as buffers
         // in view memory are: a write of the title's to it faults once and
         // is noted, a mapping is announced by the runtime. While neither
-        // happened the texture is as it was. What the guard cannot see (a
-        // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // happened the texture is as it was. Writes to the same pages
+        // through another view are seen as well (`crate::watch`, links);
+        // what the guard still misses is found by the hash, which is taken
+        // every eighth frame only, by the texture's address, so the
+        // textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let mut guard_written = false;
