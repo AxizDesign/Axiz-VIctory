@@ -28,6 +28,9 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
+    /// Draws and dispatches that asked for it and found it not made: the
+    /// workers make the most wanted one first.
+    asked: AtomicU64,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -53,6 +56,7 @@ impl Pending {
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
+            asked: AtomicU64::new(0),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -139,10 +143,38 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        p.asked.fetch_add(1, Ordering::Relaxed);
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
+}
+
+/// Starts `p` on the workers, before anything asks for it.
+pub(crate) fn begin(p: &Arc<Pending>) {
+    start(p, REQUESTED);
+}
+
+/// Why each of `pipelines` that is made and is none the host has is not
+/// there, for the log.
+pub(crate) fn failures(pipelines: &[Arc<Pending>]) -> Vec<String> {
+    pipelines
+        .iter()
+        .filter(|p| matches!(p.made.get(), Some(None)))
+        .map(|p| {
+            let untranslated: Vec<String> = p
+                .shaders
+                .iter()
+                .filter(|s| matches!(s.translated.get(), Some(None)))
+                .map(|s| format!("{} {} does not translate", s.stage, s.hash))
+                .collect();
+            if untranslated.is_empty() {
+                format!("the host refuses {:?}", p.shaders)
+            } else {
+                untranslated.join(", ")
+            }
+        })
+        .collect()
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -224,21 +256,26 @@ impl Spent {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits for `p` while frame `frame` has budget left. Dispatches have a
+/// budget of their own, as large: what a dropped draw leaves out is drawn
+/// in the next frame, but what a pass that runs once would have written is
+/// lost, and draws (far more of them) came first and spent it all.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
     if budget.is_zero() {
         return;
     }
-    static SPENT: Mutex<Spent> = Mutex::new(Spent::new());
+    static SPENTS: [Mutex<Spent>; 2] = [const { Mutex::new(Spent::new()) }; 2];
     // Each thread's waits count on their own without the shared budget.
-    static ALONE: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    static ALONES: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    let kind = usize::from(p.graphics.is_none());
+    let (spent_of, alone_of) = (&SPENTS[kind], &ALONES[kind]);
     let shared = shared_budget();
     let started = Instant::now();
     let left = if shared {
-        SPENT.lock().unwrap_or_else(|e| e.into_inner()).begin(frame, budget, started)
+        spent_of.lock().unwrap_or_else(|e| e.into_inner()).begin(frame, budget, started)
     } else {
-        let mut spent = ALONE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = alone_of.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -258,9 +295,9 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     if shared {
-        SPENT.lock().unwrap_or_else(|e| e.into_inner()).end(Instant::now());
+        spent_of.lock().unwrap_or_else(|e| e.into_inner()).end(Instant::now());
     } else {
-        let mut spent = ALONE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = alone_of.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             spent.1 += started.elapsed().min(left);
@@ -307,8 +344,18 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
+    /// The most asked for of the requested ones (the first of equals), then
+    /// the early ones in order. In the order of the first request, one that
+    /// thousands of draws a frame want waited behind hundreds wanted once.
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
+        let mut most: Option<(usize, u64)> = None;
+        for (at, p) in self.requested.iter().enumerate() {
+            let asked = p.asked.load(Ordering::Relaxed);
+            if most.is_none_or(|(_, m)| asked > m) {
+                most = Some((at, asked));
+            }
+        }
+        let p = most.and_then(|(at, _)| self.requested.remove(at)).or_else(|| {
             // An early entry can have been promoted and claimed already.
             std::iter::from_fn(|| self.early.pop_front())
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
@@ -471,6 +518,36 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
+    }
+
+    #[test]
+    fn the_most_wanted_pipeline_is_made_first() {
+        let new = |asked: u64| {
+            let p = Arc::new(Pending::new(Vec::new(), None));
+            p.asked.store(asked, Ordering::Relaxed);
+            p
+        };
+        let (once, often, also_once, unasked) = (new(1), new(900), new(1), new(0));
+        let mut queue = Queue::new();
+        for p in [&unasked, &once, &also_once, &often] {
+            assert_eq!(queue.push(p, REQUESTED), Some(true));
+        }
+        // More draws ask while it waits.
+        also_once.asked.fetch_add(5, Ordering::Relaxed);
+        for p in [&often, &also_once, &once, &unasked] {
+            assert!(Arc::ptr_eq(&queue.pop().unwrap(), p));
+        }
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn only_pipelines_the_host_does_not_have_are_failures() {
+        let (refused, waiting) = (
+            Arc::new(Pending::new(Vec::new(), None)),
+            Arc::new(Pending::new(Vec::new(), None)),
+        );
+        refused.make_with(|| None);
+        assert_eq!(failures(&[refused, waiting]).len(), 1);
     }
 
     #[test]

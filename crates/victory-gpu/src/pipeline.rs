@@ -224,15 +224,15 @@ struct Builder {
     pipelines: Vec<Arc<make::Pending>>,
     /// Every one of `pipelines` has a host pipeline.
     whole: bool,
-    /// One could not be made.
-    off: bool,
+    /// Why none runs for the rest of the run.
+    off: Option<&'static str>,
 }
 
 #[cfg(windows)]
 static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     pipelines: Vec::new(),
     whole: false,
-    off: false,
+    off: None,
 });
 
 /// Whether `shaders` are a pipeline of the structure builder.
@@ -275,43 +275,85 @@ pub(crate) fn is_builder(this: This) -> bool {
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if !b.off {
-        b.off = true;
+    if b.off.is_none() {
+        b.off = Some(why);
         tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
     }
+}
+
+/// Whether the structure builder is asked for (`VICTORY_BVH_BUILDER=1`).
+#[cfg(windows)]
+fn builder_asked() -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    *ASKED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// Why the structure builder's stages do not run, for the frame report.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn builder_why() -> String {
+    let why = if builder_asked() {
+        let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+        b.off.unwrap_or("its programs are being made")
+    } else {
+        "not asked for (VICTORY_BVH_BUILDER=1 asks for it)"
+    };
+    format!("a stage of the ray-tracing structure builder, which is off: {why}")
 }
 
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_asked() {
         return false;
     }
-    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off {
-        return false;
-    }
-    if b.whole {
+    loop {
+        let pipelines = {
+            let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+            if b.off.is_some() {
+                return false;
+            }
+            if b.whole {
+                return true;
+            }
+            b.pipelines.clone()
+        };
+        // Made without the lock (the title creates pipelines on other
+        // threads meanwhile): by the workers, all at once, with this thread
+        // making from the other end what none has begun.
+        for p in &pipelines {
+            make::begin(p);
+        }
+        for p in pipelines.iter().rev() {
+            make::now(p);
+        }
+        let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+        if b.off.is_some() {
+            return false;
+        }
+        let missing = make::failures(&pipelines);
+        if !missing.is_empty() {
+            b.off = Some("not all of its programs have a host pipeline");
+            tracing::warn!(
+                missing = missing.len(),
+                of = pipelines.len(),
+                ?missing,
+                "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
+            );
+            return false;
+        }
+        if b.pipelines.len() != pipelines.len() {
+            continue; // the title made another one meanwhile
+        }
+        if !b.whole {
+            tracing::info!(
+                pipelines = pipelines.len(),
+                "the ray-tracing structure builder runs: all of its programs have host pipelines"
+            );
+            b.whole = true;
+        }
         return true;
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
-    if missing > 0 {
-        b.off = true;
-        tracing::warn!(
-            missing,
-            of = b.pipelines.len(),
-            "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
-        );
-        return false;
-    }
-    tracing::info!(
-        pipelines = b.pipelines.len(),
-        "the ray-tracing structure builder runs: all of its programs have host pipelines"
-    );
-    b.whole = true;
-    true
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -515,6 +557,11 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        drop(b);
+        // Started now: its first dispatch waits for what is left of it.
+        if builder_asked() {
+            make::begin(&host);
+        }
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),

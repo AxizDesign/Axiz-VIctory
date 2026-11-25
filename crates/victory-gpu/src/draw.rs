@@ -1769,7 +1769,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                crate::pipeline::note_why(crate::pipeline::builder_why());
                 self.list_dropped_roots([x, y, z]);
             }
             return;
@@ -2359,7 +2359,30 @@ impl State {
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
+    ///
+    /// A stage of the ray-tracing structure builder that does not run here
+    /// stops the others too, as in [`State::dispatch`].
     pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        record: (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        if builder && !crate::pipeline::builder_runs() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(crate::pipeline::builder_why());
+            return false;
+        }
+        let ran = self.run_indirect(list, record, arguments, count);
+        if builder && !ran {
+            crate::pipeline::builder_off("one of its indirect dispatches was not run");
+        }
+        ran
+    }
+
+    fn run_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
@@ -2370,9 +2393,6 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
-            return false;
-        }
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
         }
         const DRAW: u32 = 0;
