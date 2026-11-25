@@ -6,7 +6,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
 use super::*;
-use crate::list::copy_tests::{close, submit, title_list, title_queue};
+use crate::list::copy_tests::{close, send, submit, title_list, title_queue};
 
 /// Write-watched memory, as the runtime's GPU memory is; kept for the process.
 fn pool(bytes: usize) -> usize {
@@ -92,21 +92,39 @@ fn title_writes_under_a_busy_range_go_to_the_card() {
 
 /// Copies the dword at the root SRV to the root UAV.
 fn reader() -> (ID3D12RootSignature, ID3D12PipelineState) {
-    const SOURCE: &str = r#"
+    program(
+        r#"
         ByteAddressBuffer i : register(t0);
         RWByteAddressBuffer o : register(u0);
         [RootSignature("SRV(t0), UAV(u0)")]
         [numthreads(1, 1, 1)]
         void main() { o.Store(0, i.Load(0)); }
-    "#;
+    "#,
+    )
+}
+
+/// Writes 64 dwords at the root UAV: the root constant and up.
+fn writer() -> (ID3D12RootSignature, ID3D12PipelineState) {
+    program(
+        r#"
+        RWByteAddressBuffer o : register(u0);
+        cbuffer C : register(b0) { uint first; }
+        [RootSignature("UAV(u0), RootConstants(num32BitConstants=1, b0)")]
+        [numthreads(64, 1, 1)]
+        void main(uint3 id : SV_DispatchThreadID) { o.Store(id.x * 4, first + id.x); }
+    "#,
+    )
+}
+
+fn program(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
     let device = &crate::host::host().unwrap().device;
     let mut code = None;
     // SAFETY: source and names outlive the call; the blob's own bytes.
     unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("reader"),
+            source.as_ptr().cast(),
+            source.len(),
+            s!("program"),
             None,
             None,
             s!("main"),
@@ -250,5 +268,71 @@ fn many_views_of_one_heap() {
     }
     times.sort_by(f64::total_cmp);
     println!("views {:7.2} ms a submission, on the card: {}", times[times.len() / 2], copy.carded());
+    unregister(p, p as u64);
+}
+
+/// A frame of many submissions, each binding one big buffer as a whole for
+/// writing (root views have no size) and writing 64 dwords of it:
+///
+/// cargo test -p victory-gpu --release --lib many_submissions -- --ignored --nocapture
+#[test]
+#[ignore = "a benchmark"]
+fn many_submissions_declare_one_heap() {
+    if crate::host::host().is_none() {
+        return;
+    }
+    let number = |name: &str, default: usize| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+    let (mb, submissions, per) = (number("BENCH_MB", 174), number("BENCH_SUBMISSIONS", 40), number("BENCH_PER", 4));
+    let len = (mb << 20).max((submissions * per + 2) << 16);
+    let p = pool(len);
+    register(p, p as u64, len as u64);
+    let copy = find(p as u64, len as u64).unwrap();
+    let work = writer();
+    let queue = title_queue();
+    let mut times = Vec::new();
+    for frame in 0..number("BENCH_FRAMES", 30) {
+        let mut made = Vec::new();
+        let started = std::time::Instant::now();
+        for l in 0..submissions {
+            for k in 0..10usize {
+                store(p + ((l * 10 + k) * 7919 + frame * 13) % (len / 4096) * 4096 + 2048, frame as u8);
+            }
+            let list = title_list();
+            let h = crate::list::host_list(list).unwrap();
+            for d in 0..per {
+                let at = (p + (l * per + d) * 65536) as u64;
+                copy.refresh(h, at, (p + len) as u64 - at);
+                copy.gpu_writes(h, at, (p + len) as u64 - at);
+                // SAFETY: an open list and live objects.
+                unsafe {
+                    h.list.SetComputeRootSignature(&work.0);
+                    h.list.SetPipelineState(&work.1);
+                    h.list.SetComputeRootUnorderedAccessView(0, copy.gpu(at));
+                    h.list.SetComputeRoot32BitConstants(1, 1, [(frame * 1000 + l) as u32].as_ptr().cast(), 0);
+                    h.list.Dispatch(1, 1, 1);
+                }
+            }
+            h.keep(&copy.buffer);
+            h.keep(&work.0);
+            h.keep(&work.1);
+            close(list);
+            send(queue, &[list]);
+            made.push(list);
+        }
+        let sent = started.elapsed().as_secs_f64() * 1e3;
+        crate::host::settle_for_fence();
+        if frame >= 5 {
+            times.push((started.elapsed().as_secs_f64() * 1e3, sent));
+        }
+        for (l, list) in made.into_iter().enumerate() {
+            // SAFETY: inside the pool.
+            let got = unsafe { ((p + l * per * 65536) as *const u32).read_volatile() };
+            assert_eq!(got, (frame * 1000 + l) as u32, "frame {frame} submission {l}");
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(list, 0x10)(list);
+        }
+    }
+    times.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (total, sent) = times[times.len() / 2];
+    println!("submissions {total:7.2} ms a frame, {sent:7.2} ms on the submitting thread");
     unregister(p, p as u64);
 }
