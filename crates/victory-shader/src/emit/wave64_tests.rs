@@ -677,3 +677,144 @@ fn a_read_after_a_cache_invalidation_is_a_read_of_its_own() {
     assert_eq!(reads(&[0xE1C4_0000, 0]), (2, 1), "buffer_gl0_inv");
     assert_eq!(reads(&[0xE1C8_0000, 0]), (2, 1), "buffer_gl1_inv");
 }
+
+/// A wave OR (so that the two host waves exchange), then `body` behind a branch each lane takes
+/// by its own number (`t < s0`), in a group that writes each thread's number to its dword of
+/// shared memory first. `meet`: the group's barrier between the writes and the branch.
+fn behind_a_lane_branch(meet: bool, body: &[u32]) -> NativeProgram {
+    let mut words = vec![
+        0x3412_0082, // v_lshlrev_b32 v9, 2, v0
+        0xD834_0000,
+        0x0000_0009, // ds_write_b32 v9, v0
+    ];
+    if meet {
+        words.push(0xBF8A_0000); // s_barrier
+    }
+    words.push(0x7E0E_0300); // v_mov_b32 v7, v0
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x7D88_0000,                     // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A,                     // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | body.len() as u32, // s_cbranch_execz past the body
+    ]);
+    words.extend_from_slice(body);
+    words.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    let mut native = native(&words);
+    let StageIo::Cs(cs) = &mut native.io else { unreachable!() };
+    cs.rsrc2 |= 1 << 15; // 512 bytes of shared memory
+    native
+}
+
+/// `v8 = shared[s1]`, the first lane's of it, stored to dword 0 of the UAV.
+const FIRST_LANE_OF_A_SHARED_READ: [u32; 7] = [
+    0x7E0A_0201, // v_mov_b32 v5, s1
+    0xD8D8_0000,
+    0x0800_0005, // ds_read_b32 v8, v5
+    0x7E0C_0508, // v_readfirstlane_b32 s6, v8
+    0x7E00_0206, // v_mov_b32 v0, s6
+    0x38 << 26 | 0x1C << 18,
+    0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+];
+
+/// Where lanes have parted, the two host waves cannot meet to ask for the console's first lane.
+/// They need not when every lane reads the same dword of shared memory, which nobody writes
+/// between the group's barriers around the read.
+#[test]
+fn the_first_lane_of_one_shared_dword_needs_no_meeting() {
+    let native = behind_a_lane_branch(true, &FIRST_LANE_OF_A_SHARED_READ);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (below, thread) in [(50u32, 40u32), (20, 40), (64, 3), (1, 63)] {
+        let Some(got) = on_the_card(&shader, [below, thread * 4]) else { return };
+        assert_eq!(got, thread, "the threads below {below} read thread {thread}'s dword");
+    }
+}
+
+/// The same read is not one value where a write may come between the two host waves' reads: no
+/// barrier after the writes, or a write behind the read with no barrier before it. Nor where
+/// each lane reads its own dword.
+#[test]
+fn a_shared_read_a_write_may_come_before_is_not_one_value() {
+    let refused = |native: &NativeProgram| {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        lower::take_needs();
+        let r = lowered(native, &p, &HashSet::new());
+        lower::take_needs();
+        matches!(r, Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what))
+    };
+    // (with reads and writes behind one lane branch it is left to hosts of 64-lane waves)
+    let left = |native: &NativeProgram| {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, native).expect("io::raise");
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let r = lower::lower(&lower::Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        });
+        lower::TEST_HOST_WAVE.set(was);
+        r.expect("lower").wave_size == Some(64)
+    };
+    assert!(refused(&behind_a_lane_branch(false, &FIRST_LANE_OF_A_SHARED_READ)), "no barrier");
+    let mut written = FIRST_LANE_OF_A_SHARED_READ.to_vec();
+    written.extend_from_slice(&[0xD834_0000, 0x0000_0009]); // ds_write_b32 v9, v0
+    assert!(left(&behind_a_lane_branch(true, &written)), "a write behind it");
+    let mut own = FIRST_LANE_OF_A_SHARED_READ.to_vec();
+    own[0] = 0x7E0A_0309; // v_mov_b32 v5, v9
+    assert!(refused(&behind_a_lane_branch(true, &own)), "each lane's own dword");
+}
+
+/// What an instruction reads without naming it makes its result each lane's own too: the
+/// accumulator of `v_fmac_f32`, the VCC of `v_cndmask_b32`.
+#[test]
+fn values_made_of_implicit_reads_are_each_lanes_own() {
+    let refused = |make: &[u32]| {
+        let mut body = make.to_vec();
+        body.extend_from_slice(&[
+            0x7E0C_0508, // v_readfirstlane_b32 s6, v8
+            0x7E00_0206, // v_mov_b32 v0, s6
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        ]);
+        let native = behind_a_lane_branch(true, &body);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        lower::take_needs();
+        let r = lowered(&native, &p, &HashSet::new());
+        lower::take_needs();
+        match r {
+            Ok(_) => false,
+            Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what) => true,
+            Err(e) => panic!("stopped for another reason: {e:?}"),
+        }
+    };
+    assert!(!refused(&[0x7E10_02F4]), "v_mov_b32 v8, 2.0 is one value");
+    assert!(
+        refused(&[
+            0x7E10_0D00, // v_cvt_f32_u32 v8, v0
+            0x7E12_02F4, // v_mov_b32 v9, 2.0
+            0x5610_12F2, // v_fmac_f32 v8, 1.0, v9
+        ]),
+        "v_fmac_f32 adds to each lane's own"
+    );
+    assert!(
+        refused(&[
+            0x7E12_02F4, // v_mov_b32 v9, 2.0
+            0x7D82_00A0, // v_cmp_lt_u32 vcc, 32, v0
+            0x0210_12F2, // v_cndmask_b32 v8, 1.0, v9, vcc
+        ]),
+        "v_cndmask_b32 picks by each lane's own bit"
+    );
+}

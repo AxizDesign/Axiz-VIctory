@@ -618,7 +618,7 @@ fn need(block: usize) {
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+fn lane_uniform(p: &Program, st: &Structured, all: &[bool], fences: &HashSet<usize>) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let mut same: HashSet<Value> = HashSet::new();
     for b in crate::ir::reverse_postorder(&p.blocks) {
@@ -631,26 +631,40 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
         for (i, inst) in block.insts.iter().enumerate() {
             let name = inst.name();
+            if st.guards[b][i].is_some() {
+                continue; // lanes outside EXEC keep another value
+            }
             let ops: Vec<Operand> = match &inst.fields {
                 Fields::Valu(v)
                     if v.dpp.is_none()
                         && v.sdwa.is_none()
                         && !name.starts_with("v_mbcnt")
                         && !name.starts_with("v_cmpx")
-                        && !name.contains("lane") =>
+                        && !name.contains("lane")
+                        && !name.contains("movrel")
+                        && !name.contains("swaprel") =>
                 {
                     v.src.clone()
                 }
+                // one dword of shared memory, the same for every lane
+                Fields::Ds { addr: Some(addr), gds: false, .. } if name == "ds_read_b32" => {
+                    if !settled_shared_read(p, all, fences, b, i) {
+                        continue;
+                    }
+                    vec![*addr]
+                }
                 _ => continue,
             };
-            if st.guards[b][i].is_some() {
-                continue; // lanes outside EXEC keep another value
+            if !implicit_reads_alike(inst, &ops, &same, &is_mask) {
+                continue;
             }
             let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
+                Operand::Vector { reg, dwords } => {
+                    // every dword of the operand (not the old destination behind it, which is
+                    // there for lanes outside EXEC)
+                    let of = reg..reg.saturating_add(dwords);
                     let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if of.contains(&x))).map(|r| r.1).collect();
                     !read.is_empty() && read.iter().all(|x| same.contains(x))
                 }
                 // a scalar is one value; a lane mask is not, unless a compare of such values made it
@@ -665,6 +679,126 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// Whether what `inst` reads without naming it as a source (`ops`) is the same in every lane
+/// holding it (`same`): the accumulator of `v_fmac`/`v_mac`/`v_dot*c`, the half of the old
+/// destination a 16-bit write keeps, VCC. The old value of a destination written whole is
+/// listed among the reads for lanes outside EXEC only; these lanes are all in it.
+fn implicit_reads_alike(
+    inst: &Inst,
+    ops: &[Operand],
+    same: &HashSet<Value>,
+    is_mask: &impl Fn(Value) -> bool,
+) -> bool {
+    let name = inst.name();
+    let named = |r: u8| {
+        ops.iter().any(|op| {
+            matches!(*op, Operand::Vector { reg, dwords } if r >= reg && r < reg.saturating_add(dwords))
+        })
+    };
+    // Instructions that write one 32-bit (or wider) result made of their sources alone.
+    let sixteen = ["_f16", "_u16", "_i16", "_b16", "f16_", "i16_", "u16_"];
+    let keeps = name.contains("mac")
+        || name.contains("dot2c")
+        || name.contains("dot4c")
+        || name.contains("dot8c")
+        || name.contains("_mix")
+        || sixteen.iter().any(|t| name.contains(t));
+    let written = |r: u8| inst.writes.iter().any(|w| w.0 == Reg::V(r));
+    inst.reads.iter().all(|&(reg, v)| match reg {
+        Reg::V(r) if named(r) => true, // looked at as a source
+        Reg::V(r) if !keeps && written(r) => true,
+        Reg::V(_) => same.contains(&v),
+        Reg::S(code) if code == EXEC || code == EXEC + 1 => {
+            !ops.iter().any(|op| matches!(*op, Operand::Scalar { code: c, .. } if c == code))
+        }
+        Reg::S(_) => !is_mask(v) || same.contains(&v),
+        _ => true,
+    })
+}
+
+/// Whether the shared-memory read that is instruction `i` of block `b` gives two host waves of
+/// one console wave the same for the same address. The console's wave reads all lanes at once;
+/// the host waves read one after the other, so no write of shared memory may come between
+/// them: none on any way to the read since the group last met, and none on any way on from it
+/// before the group meets again. (The group meets at an `s_barrier` every lane reaches, `all`,
+/// that is not left out as a wait: `fences`.)
+/// Not in a loop: lanes may leave with what different rounds read.
+fn settled_shared_read(p: &Program, all: &[bool], fences: &HashSet<usize>, b: usize, i: usize) -> bool {
+    /// What an instruction is on the way: the group meets, shared memory may change, neither.
+    enum Way {
+        Meets,
+        Writes,
+        Passes,
+    }
+    let way = |k: usize, inst: &Inst| match inst.name() {
+        "s_barrier" if super::group_sync() != 0 && all.get(k).copied().unwrap_or(false) && !fences.contains(&k) => Way::Meets,
+        n if n.starts_with("ds_read") => Way::Passes,
+        n if n.starts_with("ds_") || n.starts_with("flat_") => Way::Writes,
+        _ => Way::Passes,
+    };
+    /// Some(true): met before any write. Some(false): a write first. None: passed through.
+    fn met<'a>(insts: impl Iterator<Item = &'a Inst>, way: impl Fn(&Inst) -> Way) -> Option<bool> {
+        for inst in insts {
+            match way(inst) {
+                Way::Meets => return Some(true),
+                Way::Writes => return Some(false),
+                Way::Passes => {}
+            }
+        }
+        None
+    }
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); p.blocks.len()];
+    for (k, block) in p.blocks.iter().enumerate() {
+        for &q in &block.preds {
+            succ[q].push(k);
+        }
+    }
+    // Can the block come to itself again?
+    let mut seen = vec![false; p.blocks.len()];
+    let mut todo = succ[b].clone();
+    while let Some(k) = todo.pop() {
+        if k == b {
+            return false;
+        }
+        if !std::mem::replace(&mut seen[k], true) {
+            todo.extend(&succ[k]);
+        }
+    }
+    for back in [true, false] {
+        let insts = &p.blocks[b].insts;
+        let first = if back {
+            met(insts[..i].iter().rev(), |x| way(b, x))
+        } else {
+            met(insts[i + 1..].iter(), |x| way(b, x))
+        };
+        match first {
+            Some(true) => continue,
+            Some(false) => return false,
+            None => {}
+        }
+        let next = |k: usize| if back { &p.blocks[k].preds } else { &succ[k] };
+        let mut seen = vec![false; p.blocks.len()];
+        let mut todo = next(b).clone();
+        while let Some(k) = todo.pop() {
+            if std::mem::replace(&mut seen[k], true) {
+                continue;
+            }
+            let insts = &p.blocks[k].insts;
+            let there = if back {
+                met(insts.iter().rev(), |x| way(k, x))
+            } else {
+                met(insts.iter(), |x| way(k, x))
+            };
+            match there {
+                Some(true) => {}
+                Some(false) => return false,
+                None => todo.extend(next(k)),
+            }
+        }
+    }
+    true
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -1675,7 +1809,7 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all, &fence_only),
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
