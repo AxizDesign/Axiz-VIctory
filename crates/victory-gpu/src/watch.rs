@@ -2085,8 +2085,9 @@ mod tests {
                 });
             }
         });
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // Kept to the end of the process: the journal remembers these pages
+        // as written, and another test given the same addresses would find
+        // them there.
     }
 
     #[test]
