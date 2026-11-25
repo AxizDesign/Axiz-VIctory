@@ -2322,7 +2322,7 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 
 #[cfg(all(test, windows))]
 #[path = "copy_tests.rs"]
-mod copy_tests;
+pub(crate) mod copy_tests;
 
 #[cfg(test)]
 mod tests {

@@ -35,7 +35,7 @@ fn buffer() -> (This, *mut u8) {
     (made, data)
 }
 
-fn title_list() -> This {
+pub(crate) fn title_list() -> This {
     let null = std::ptr::null();
     let allocator_iid = guid(
         0x6102dee4,
@@ -55,7 +55,7 @@ fn title_list() -> This {
     list
 }
 
-fn title_queue() -> This {
+pub(crate) fn title_queue() -> This {
     let iid = guid(
         0x0ec870a6,
         0x5d7e,
@@ -142,14 +142,14 @@ fn copy(list: This, to: (This, u64), from: (This, u64)) {
     slot::<Copy>(list, 0x78)(list, to.0, to.1, from.0, from.1, 256);
 }
 
-fn close(list: This) {
+pub(crate) fn close(list: This) {
     assert_eq!(
         slot::<extern "system" fn(This) -> crate::object::HRESULT>(list, 0x48)(list),
         S_OK
     );
 }
 
-fn submit(queue: This, lists: &[This]) {
+pub(crate) fn submit(queue: This, lists: &[This]) {
     slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(
         queue,
         lists.len() as u32,

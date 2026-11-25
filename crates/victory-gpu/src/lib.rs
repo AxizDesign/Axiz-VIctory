@@ -35,6 +35,8 @@ mod indirect;
 mod inplace;
 pub mod list;
 #[cfg(all(test, windows))]
+mod frame_bench;
+#[cfg(all(test, windows))]
 mod list_copy_tests;
 pub mod object;
 pub mod pipeline;
