@@ -92,3 +92,30 @@ rest pass (5 and 6 are left out by design).
   17 without that: 200 to 240 ms in a cutscene, of it 43 ms on the card.
 - **Characters black for some seconds after a cut:** their textures had not
   been uploaded yet. Open.
+
+### Later the same day (runs 18 to 21)
+
+One build, `d63ad3f` (`FX3` and `ShakiraRED` merged). Speeds are the median
+over frame lines with 2,500 draws and more. The scenes were played by hand and
+differ, so small differences mean nothing.
+
+| Run | Added to the base | World readings | fps | 90 % under (ms) | Result |
+|---|---|---|---|---|---|
+| 18 | ray tracing, `TABLE_BUFFERS`, `TEXTURE_HEAPS`, `STAGING_BLOCKS`, `SECTION_MB=2`, `TEXTURE_ROOM_PERCENT=96`, `DISPLAY_MODE=2560x1440`, `FRAME_LOG`, `CARD_METER` | 0 | | | **hung at the first ray-traced frames**; the title ended itself after about 30 s |
+| 19 | nothing | 29 | 9.9 | 216 | closed normally; more than half of the readings are one steady scene |
+| 20 | `DISPLAY_MODE=2560x1440` | 21 | 7.8 | 156 | closed normally |
+| 21 | `TABLE_BUFFERS=1` | 30 | 7.3 | 265 | closed normally; no gain, not kept |
+
+- **Run 18's hang has no known cause.** The title's report names a wait between
+  queues that was never signalled; our log has no error and no lost device.
+  Runs 19 to 21 (ray tracing off) did not hang, so the merge alone is not
+  enough to cause it. The switches are being turned on one per run. **Ray
+  tracing together with the merged build is untested apart from run 18.**
+- `DISPLAY_MODE` changes the mode the title is told; the window's buffer stayed
+  3840x2160 in run 20 as in 19.
+- Open, seen in pictures: the sea is wholly black in some scenes with every
+  setting so far; eyes are blotched white in some shots and right in others;
+  mouths are reported not to move; characters are coarse in some cutscenes;
+  clouds differ in detail between runs 19 and 20 (one picture each, not proven).
+- The title holds about 7.6 GB of an 11.2 GB card budget while about 4,600
+  textures still wait (run 19's end).
