@@ -272,6 +272,16 @@ fn the_24_bit_multiplies_lower_both_halves() {
 }
 
 #[test]
+fn sums_of_absolute_differences_lower() {
+    // VOP3 `op v0, v1, v2, v3`: v_sad_u8, v_sad_hi_u8, v_sad_u16,
+    // v_sad_u32 and v_msad_u8.
+    for op in [0x15Au32, 0x15B, 0x15C, 0x15D, 0x171] {
+        let words = [0xD400_0000 | op << 16, 0x101 | 0x102 << 9 | 0x103 << 18];
+        lowers_valu(&words).unwrap_or_else(|e| panic!("VOP3 {op:#x}: {e}"));
+    }
+}
+
+#[test]
 fn buffer_cache_invalidations_lower() {
     // MUBUF opcode 0x071/0x072 with no data operand.
     assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
