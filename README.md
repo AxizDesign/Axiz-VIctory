@@ -144,6 +144,7 @@ submodules, and no files from AnyXboxX, Leonida or TomBox, are needed):
 .\start.ps1                                  # check the tools, build, check this PC
 .\start.ps1 -Install                         # the same, installing what is missing
 .\start.ps1 -GameExe <the title's exe>       # the same, then run your own copy
+.\start.ps1 -GameExe <the exe> -Prebuild     # its shaders, and the pipelines earlier runs asked for, ahead of a run
 ```
 
 If PowerShell refuses scripts: `powershell -ExecutionPolicy Bypass -File start.ps1`.
@@ -151,9 +152,8 @@ If PowerShell refuses scripts: `powershell -ExecutionPolicy Bypass -File start.p
 binding tier 3, mesh shaders), system DLLs, memory, folders. Every FAIL line is
 a reason for a black picture or a run that does not start. On the first start
 shaders are translated and compiled for your card, and parts of the picture
-come in late. `start.ps1` makes the `diag` build, because a plain release build
-ignores `VICTORY_SHADER_LOOP_LIMIT` and long shader loops can make Windows
-reset the graphics driver.
+come in late. `start.ps1` makes the `diag` build, which has the switches under
+"Debugging"; it shares its shader cache with a plain release build.
 
 By hand:
 
@@ -336,7 +336,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | every translated shader loop stops after `n` iterations per lane, instead of 256 in pixel, vertex and mesh shaders and 4,096 in compute (own shader cache entries: everything is translated again; a low `n` cuts genuine compute loops short); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

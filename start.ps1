@@ -7,9 +7,8 @@
   With -GameExe: the same, then runs your own copy of the title. The copy must
   be outside this folder. No game file comes with VIctory.
 
-  The build is the `diag` profile with the `diagnostics` feature: a plain
-  release build ignores VICTORY_SHADER_LOOP_LIMIT, and a translated loop that
-  runs to the full limit can keep the card busy until Windows resets it.
+  The build is the `diag` profile with the `diagnostics` feature: the switches
+  for finding faults (README, "Debugging") are there when a run needs them.
 
 .PARAMETER GameExe
   The title's executable.
@@ -18,8 +17,22 @@
   Install what is missing with winget (Rust, the C++ build tools, the Visual
   C++ runtime). Windows may ask for permission.
 
+.PARAMETER Prebuild
+  With -GameExe: translates the title's shaders, and makes the pipelines that
+  earlier runs asked for, ahead of a run instead of starting it. On every
+  core; an interrupted one goes on from where it last saved. On a PC without
+  an earlier run it translates only: run once, then pre-build again.
+
+.PARAMETER PrebuildAll
+  As -Prebuild, but with every pipeline the title lists (tens of thousands,
+  most of which a run may never ask for): hours, and many gigabytes.
+
 .PARAMETER LoopLimit
-  Iterations after which a translated shader loop stops (default 256).
+  For finding faults: iterations after which every translated shader loop
+  stops. Without it the translator's own limits hold (256 in pixel, vertex
+  and mesh shaders, 4,096 in compute). Another limit has its own shader cache
+  entries: everything is translated again. 0: the translator's own limits,
+  also where VICTORY_SHADER_LOOP_LIMIT is set.
 
 .PARAMETER Tuned
   Also send submissions ahead of the wait for the card (VICTORY_LATE_WAIT=3,
@@ -39,8 +52,10 @@
 param(
     [string]$GameExe,
     [switch]$Install,
-    [ValidateRange(1, 1048576)][int]$LoopLimit = 256,
+    [ValidateRange(0, 1048576)][int]$LoopLimit = 0,
     [switch]$Tuned,
+    [switch]$Prebuild,
+    [switch]$PrebuildAll,
     [switch]$Force
 )
 
@@ -100,6 +115,8 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 }
 
 # Before the build, which takes minutes.
+if ($PrebuildAll) { $Prebuild = $true }
+if ($Prebuild -and -not $GameExe) { Stop-Start '-Prebuild needs -GameExe.' }
 if ($GameExe) {
     if (-not (Test-Path -LiteralPath $GameExe -PathType Leaf)) { Stop-Start "no file $GameExe" }
     $GameExe = (Resolve-Path -LiteralPath $GameExe).ProviderPath
@@ -126,8 +143,8 @@ if ($missing -and -not $Force) { Stop-Start 'see the FAIL lines above (-Force ru
 $saved = @{}
 $settings = @{ VICTORY_GAME_DIR = (Split-Path -Parent $GameExe) }
 # What is set already stays.
-if (-not $env:VICTORY_SHADER_LOOP_LIMIT -or $PSBoundParameters.ContainsKey('LoopLimit')) {
-    $settings.VICTORY_SHADER_LOOP_LIMIT = "$LoopLimit"
+if ($PSBoundParameters.ContainsKey('LoopLimit')) {
+    $settings.VICTORY_SHADER_LOOP_LIMIT = if ($LoopLimit) { "$LoopLimit" } else { $null }
 }
 if ($Tuned) {
     $settings.VICTORY_LATE_WAIT = '3'
@@ -139,8 +156,18 @@ try {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name)
         [Environment]::SetEnvironmentVariable($name, $settings[$name])
     }
-    Write-Host 'Starting. The first start translates shaders: parts of the picture come in late.' -ForegroundColor Cyan
-    & $victory run $GameExe --execute
+    if ($Prebuild) {
+        # The files that hold shaders (README, "Getting started").
+        $folder = Split-Path -Parent $GameExe
+        $files = @($GameExe) + @('shaders.rpf', 'XboxBvhBuilder.dll', 'amd_fidelityfx_upscaler_xbox.dll' |
+            ForEach-Object { Join-Path $folder $_ } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+        $used = if ($PrebuildAll) { @() } else { @('--used-pipelines') }
+        Write-Host "Pre-building from $($files.Count) files. Ctrl+C stops it; the next one goes on from there." -ForegroundColor Cyan
+        & $victory translate --cache --pipelines @used @files
+    } else {
+        Write-Host 'Starting. The first start translates shaders: parts of the picture come in late.' -ForegroundColor Cyan
+        & $victory run $GameExe --execute
+    }
     $code = $LASTEXITCODE
 } finally {
     foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }

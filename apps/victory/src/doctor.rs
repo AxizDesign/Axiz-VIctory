@@ -117,12 +117,6 @@ pub fn run() -> Result<()> {
             failed = true;
         }
     }
-    if cfg!(not(feature = "diagnostics")) {
-        println!(
-            "  note  this build ignores VICTORY_SHADER_LOOP_LIMIT (only builds with the \
-             diagnostics feature read it; start.ps1 makes one)"
-        );
-    }
 
     failed |= !adapters()?;
 

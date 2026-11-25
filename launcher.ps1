@@ -19,12 +19,13 @@ $folder = Join-Path $env:LOCALAPPDATA 'victory'
 $store = Join-Path $folder 'launcher.json'
 
 function Read-Choices {
-    $choices = @{ GameExe = ''; Tuned = $false; LoopLimit = 256 }
+    $choices = @{ GameExe = ''; Tuned = $false }
     try {
         $read = Get-Content -LiteralPath $store -Raw -ErrorAction Stop | ConvertFrom-Json
         if ($read.GameExe) { $choices.GameExe = [string]$read.GameExe }
         $choices.Tuned = [bool]$read.Tuned
-        if ([int]$read.LoopLimit -ge 1) { $choices.LoopLimit = [Math]::Min([int]$read.LoopLimit, 1048576) }
+        # (A LoopLimit an earlier launcher kept there is left out on purpose:
+        # it cut compute loops short.)
     } catch { }   # no file yet, or not one of ours: the defaults
     $choices
 }
@@ -44,6 +45,13 @@ function Format-Argument([string]$Text) { '"' + ($Text -replace '(\\*)"', '$1$1\
 function Get-StartArguments([string[]]$More) {
     $line = @('-NoProfile', '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', (Format-Argument $start))
     ($line + $More) -join ' '
+}
+
+function Get-PlayArguments([string]$Exe, [bool]$Tuned, [bool]$Prebuild) {
+    '-GameExe'
+    Format-Argument $Exe
+    if ($Tuned) { '-Tuned' }
+    if ($Prebuild) { '-Prebuild' }
 }
 
 function Open-Console([string[]]$More) {
@@ -74,21 +82,16 @@ $path = Add-Control (New-Object System.Windows.Forms.TextBox) 16 36 430 24 $choi
 $browse = Add-Control (New-Object System.Windows.Forms.Button) 454 34 90 27 'Browse...'
 $tuned = Add-Control (New-Object System.Windows.Forms.CheckBox) 16 74 300 22 'Faster submissions (experimental)'
 $tuned.Checked = $choices.Tuned
-$null = Add-Control (New-Object System.Windows.Forms.Label) 330 76 112 20 'Shader loop limit:'
-$limit = New-Object System.Windows.Forms.NumericUpDown
-$limit.Minimum = 1
-$limit.Maximum = 1048576
-$limit = Add-Control $limit 454 73 90 24 ''
-$limit.Value = $choices.LoopLimit
+$prebuild = Add-Control (New-Object System.Windows.Forms.Button) 330 70 214 30 'Pre-build shaders'
 $check = Add-Control (New-Object System.Windows.Forms.Button) 16 112 170 34 'Check this PC'
 $install = Add-Control (New-Object System.Windows.Forms.Button) 195 112 170 34 'Install what is missing'
 $play = Add-Control (New-Object System.Windows.Forms.Button) 374 112 170 34 'Play'
 $status = Add-Control (New-Object System.Windows.Forms.Label) 16 160 528 44 `
-    'The first build takes minutes. The first start translates shaders: parts of the picture come in late.'
+    'The first build takes minutes. The first start translates shaders and loads slowly: pre-build before it, and once more after it.'
 $form.AcceptButton = $play
 
 function Save-Form {
-    Save-Choices @{ GameExe = $path.Text.Trim(); Tuned = $tuned.Checked; LoopLimit = [int]$limit.Value }
+    Save-Choices @{ GameExe = $path.Text.Trim(); Tuned = $tuned.Checked }
 }
 
 # A button's work; what goes wrong is shown, not thrown out of the window.
@@ -106,23 +109,29 @@ $install.Add_Click({ Invoke-Safely {
     Open-Console @('-Install')
     $status.Text = 'Installing, building and checking in the other window.'
 } })
-$play.Add_Click({ Invoke-Safely {
+
+# Plays the chosen title, or pre-builds its shaders.
+function Start-Title([bool]$Ahead, [string]$Said) {
     $exe = $path.Text.Trim()
     if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
         $status.Text = 'Choose the executable first (Browse...).'
         return
     }
     Save-Form
-    $more = @('-GameExe', (Format-Argument $exe), '-LoopLimit', "$([int]$limit.Value)")
-    if ($tuned.Checked) { $more += '-Tuned' }
-    Open-Console $more
-    $status.Text = 'Building, checking and starting in the other window.'
-} })
+    Open-Console (Get-PlayArguments $exe $tuned.Checked $Ahead)
+    $status.Text = $Said
+}
+$play.Add_Click({ Invoke-Safely { Start-Title $false 'Building, checking and starting in the other window.' } })
+$prebuild.Add_Click({ Invoke-Safely { Start-Title $true 'Pre-building in the other window; Ctrl+C there stops it.' } })
 
 if ($SelfTest) {
     if (-not (Test-Path -LiteralPath $start)) { throw "no $start" }
     if ((Format-Argument 'D:\a b\t.exe') -ne '"D:\a b\t.exe"') { throw 'quoting' }
-    if ($form.Controls.Count -ne 10) { throw "controls: $($form.Controls.Count)" }
+    if ($form.Controls.Count -ne 9) { throw "controls: $($form.Controls.Count)" }
+    $line = (Get-PlayArguments 'D:\a b\t.exe' $true $false) -join ' '
+    if ($line -ne '-GameExe "D:\a b\t.exe" -Tuned') { throw "play: $line" }
+    $line = (Get-PlayArguments 'D:\a b\t.exe' $false $true) -join ' '
+    if ($line -ne '-GameExe "D:\a b\t.exe" -Prebuild') { throw "pre-build: $line" }
     $form.Dispose()
     'launcher: ok'
     exit 0
