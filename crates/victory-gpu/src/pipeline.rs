@@ -138,6 +138,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to title memory by address
+    /// ([`stores_by_address`]): not through a view, so anywhere.
+    pub(crate) stores_by_address: bool,
     /// Compute thread-group dimensions `[x, y, z]` (`[0; 3]` for non-compute).
     pub(crate) threads: [u32; 3],
     /// Whether the shader walks ray-tracing structures ([`walks`]).
@@ -202,6 +205,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let walks = programs.iter().any(walks);
     let main = programs.into_iter().find(|p| {
         matches!(
@@ -218,6 +222,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         host,
         used,
         stores,
+        stores_by_address,
         threads,
         walks,
     })
@@ -616,6 +621,29 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
             _ => false,
         }
+    })
+}
+
+/// Whether a console program can store to title memory by address: it has
+/// a global or flat store or atomic, or code that is not all known (as
+/// [`stores`]). Only such a program can have written any copy that title
+/// memory by address leads to; one that walks ray-tracing structures loads
+/// by address and stores through views. Taken for every program that can
+/// store at all, 8.1 GB of windows were snapshotted and compared a frame
+/// with the structure builder on (run 16: 2 to 2.5 s a frame, the card at
+/// 2 %).
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| match i.encoding {
+        Encoding::Flat | Encoding::Global => {
+            i.name().is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+        }
+        Encoding::Sop1 => i.name().is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+        _ => false,
     })
 }
 

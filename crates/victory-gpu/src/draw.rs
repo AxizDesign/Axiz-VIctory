@@ -651,6 +651,14 @@ fn look_at_slots(
     parts.into_iter().flat_map(|p| p.1).collect()
 }
 
+/// Whether every program that can store at all declares all of title memory
+/// it can reach by address written (`VICTORY_MEMORY_DECLARE=all`), not only
+/// those that store by address.
+fn memory_marks_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_DECLARE").is_some_and(|v| v == "all"))
+}
+
 /// Whether a texture that has its host copy is still brought up to date
 /// while the card has no room for new ones (`VICTORY_REUPLOAD_WHEN_FULL=0`:
 /// no).
@@ -1275,7 +1283,9 @@ impl State {
                     };
                     heap.and_then(|heap| crate::memory::empty(list, heap))
                 } else {
-                    self.memory_ready(list, compute, writes)
+                    // Declared written only by a program that can store by
+                    // address; what it stores through views its views say.
+                    self.memory_ready(list, compute, writes && (t.stores_by_address || memory_marks_all()))
                 };
                 let Some(ready) = ready else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
