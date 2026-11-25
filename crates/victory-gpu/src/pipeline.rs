@@ -67,6 +67,9 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Whether it is the program [`crate::ambient`] follows.
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -126,6 +129,8 @@ impl Shader {
             translated: OnceLock::new(),
             #[cfg(windows)]
             walks: OnceLock::new(),
+            #[cfg(windows)]
+            resolves_light: bytes.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM),
         }
     }
 }
