@@ -408,57 +408,105 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n.checked_mul(PAGE).is_none_or(|s| s == 0) {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
+    }
+    let Some(numbers) = make_pages(n, section_pages()) else {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
         return 0;
-    }
+    };
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
-    let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
+    for (index, number) in numbers.into_iter().enumerate() {
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(number) };
     }
     1
+}
+
+/// Pages (64 KiB) in one section of the title's physical memory
+/// (`VICTORY_SECTION_MB`, in MiB; unset or 0: one section for each request,
+/// as before).
+///
+/// After RyanCase94's measurement (fxceless issue 1089; this code is ours):
+/// the title asks for 6.1 GiB at once and maps it 64 KiB at a time, and
+/// Windows' worker that rebuilds large pages takes the pages of a section
+/// one at a time, looks through all its views for each, and holds the
+/// section meanwhile: every map and unmap of any page of it waits. With one
+/// section for all that is all of the title's physical memory (11,000 slow
+/// calls, 60 s of 90, against 31 and 55 ms with sections of 2 MiB there).
+///
+/// What it costs: a read into pages of two sections is written through a
+/// buffer, not in place ([`page_window`]).
+fn section_pages() -> usize {
+    static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGES.get_or_init(|| {
+        let mb = std::env::var("VICTORY_SECTION_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+        let pages = mb.saturating_mul((1 << 20) / PAGE);
+        if pages > 0 {
+            tracing::info!(mb, pages, "physical pages: one section for every so many MiB (VICTORY_SECTION_MB)");
+        }
+        pages
+    })
+}
+
+/// `n` new pages, in sections of `per` pages (0: all in one): their numbers,
+/// in order. `None` if the host refuses a section, with nothing made.
+fn make_pages(n: usize, per: usize) -> Option<Vec<usize>> {
+    let per = if per == 0 { n } else { per };
+    let mut sections: Vec<(Arc<Section>, usize)> = Vec::new();
+    let mut made = 0;
+    while made < n {
+        let here = per.min(n - made);
+        let size = here * PAGE;
+        // A pagefile-backed section of `size` bytes, its pages committed
+        // when first mapped or written (`commit`): the title asks for 6.1
+        // GiB at once, which a busy host often cannot commit (error 1450).
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                // Under Wine a committed section is a sparse file, free
+                // until touched, and committing a reserved one page by page
+                // costs a wineserver request each that scans every range
+                // committed so far: commit it whole there.
+                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            // (The ones made so far are closed with `sections`.)
+            return None;
+        }
+        sections.push((Arc::new(Section(handle)), here));
+        made += here;
+    }
+    // For the GPU side's in-place census: only a committed section can be
+    // opened as a host heap.
+    for (section, here) in &sections {
+        victory_gpu::title_memory_section(section.0 as usize, (here * PAGE) as u64, on_wine());
+    }
+    let mut physical = physical();
+    let first = physical.next_page;
+    physical.next_page += n * FRAMES;
+    let mut numbers = Vec::with_capacity(n);
+    for (section, here) in sections {
+        for index in 0..here {
+            let number = first + numbers.len() * FRAMES;
+            physical.pages.insert(number, Slice { section: section.clone(), index });
+            numbers.push(number);
+        }
+    }
+    Some(numbers)
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -1429,6 +1477,48 @@ mod tests {
         }
         assert!(shown_at(&pages, 0, 3 * PAGE).is_empty());
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// Pages in several sections: a write into pages of two of them, a view
+    /// of each run, and the contents through views mapped over the boundary.
+    #[test]
+    fn pages_of_several_sections_are_written_and_mapped_across_their_bounds() {
+        // Five pages in sections of two.
+        let pages = make_pages(5, 2).expect("sections");
+        let lengths = |offset, len| runs(&pages, offset, len).map(|r| r.iter().map(|&(_, n)| n).collect::<Vec<_>>());
+        assert_eq!(lengths(0, 5 * PAGE), Some(vec![2, 2, 1]));
+        assert_eq!(lengths(PAGE, 2 * PAGE), Some(vec![1, 1]));
+        // One section's pages in place; two sections' go through a buffer.
+        assert!(page_window(&pages, 0, 2 * PAGE).is_some());
+        assert!(page_window(&pages, PAGE, 2 * PAGE).is_none());
+        let data: Vec<u8> = (0..3 * PAGE).map(|i| (i % 251) as u8).collect();
+        assert!(write_physical(&pages, PAGE / 2, &data));
+        let seen: Vec<u8> = pages.iter().flat_map(|&p| page_bytes(p)).collect();
+        assert_eq!(seen[PAGE / 2..PAGE / 2 + data.len()], data[..]);
+        // Mapped one after the other over the sections' bounds.
+        // SAFETY: a placeholder of our own, unmapped below.
+        unsafe {
+            let base = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                5 * PAGE,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert!(!base.is_null());
+            assert_eq!(XMemMapPhysicalPages(base, 5, pages.as_ptr()), base);
+            let whole = std::slice::from_raw_parts(base as *const u8, 5 * PAGE);
+            assert_eq!(whole, &seen[..]);
+            // A write through the view over a bound shows in the pages.
+            (base as *mut u8).add(2 * PAGE - 1).write_bytes(0xee, 2);
+            assert_eq!(page_bytes(pages[1])[PAGE - 1], 0xee);
+            assert_eq!(page_bytes(pages[2])[0], 0xee);
+            assert_eq!(XMemMapPhysicalPages(base, 5, std::ptr::null()), base);
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
+        assert_eq!(XMemFreePhysicalPages(5, pages.as_ptr()), 1);
     }
 
     #[test]

@@ -272,12 +272,14 @@ struct Views {
     /// page is a write of the bytes every other view shows
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
-    /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    /// Sections by handle: bytes, and whether made committed (thousands of
+    /// them with `VICTORY_SECTION_MB`, and looked up by every store through a
+    /// view of ours).
+    sections: BTreeMap<usize, (u64, bool)>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: BTreeMap::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -287,9 +289,7 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     {
-        let mut v = views();
-        v.sections.retain(|s| s.0 != section);
-        v.sections.push((section, bytes, committed));
+        views().sections.insert(section, (bytes, committed));
     }
     // A view of our own made on an earlier section that had this handle's
     // number shows that section's pages, not this one's: it is forgotten
@@ -493,7 +493,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         if shown.len() > crate::watch::MANY_VIEWS {
             return None;
         }
-        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
+        let section_bytes = v.sections.get(&section)?.0;
         (section, offset, shown, section_bytes)
     };
     if offset + bytes.len() as u64 > section_bytes {
@@ -515,11 +515,17 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
                 );
                 return None;
             }
-            tracing::info!(
-                section,
-                mb = section_bytes >> 20,
-                "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
-            );
+            // The first few, then now and then: there may be thousands.
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let so_far = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if so_far <= 4 || so_far.is_power_of_two() {
+                tracing::info!(
+                    section,
+                    mb = section_bytes >> 20,
+                    so_far,
+                    "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
+                );
+            }
             Some(Own {
                 base: at.Value as usize,
                 bytes: section_bytes,
@@ -1137,11 +1143,12 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    for &(bytes, committed) in v.sections.values().take(16) {
         lines.push(format!(
-            "census, a section of {} MB, {}",
+            "census, a section of {} MB, {} (of {} sections)",
             bytes >> 20,
-            if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
+            if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" },
+            v.sections.len()
         ));
     }
     lines

@@ -718,6 +718,78 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// What the window's caption says of us: the fork's name, the card and the
+/// processor (as they name themselves, without their marks).
+fn caption_name() -> &'static str {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let card = host().and_then(|h| h.adapter.as_ref()).and_then(|a| {
+            // SAFETY: plain query of an adapter.
+            let desc = unsafe { a.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()? };
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            Some(String::from_utf16_lossy(&desc.Description[..end]))
+        });
+        let mut name = String::from("VIctory - myokex");
+        for part in [card.as_deref().map(short_name), processor_name().as_deref().map(short_name)].into_iter().flatten() {
+            if !part.is_empty() {
+                name.push_str(" | ");
+                name.push_str(&part);
+            }
+        }
+        name
+    })
+}
+
+/// The processor's own name (`cpuid`'s brand string).
+fn processor_name() -> Option<String> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::__cpuid;
+        if __cpuid(0x8000_0000).eax < 0x8000_0004 {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(48);
+        for leaf in 0x8000_0002..=0x8000_0004u32 {
+            let r = __cpuid(leaf);
+            for word in [r.eax, r.ebx, r.ecx, r.edx] {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    None
+}
+
+/// A card's or processor's name without its marks and what says nothing
+/// more ("(R)", "(TM)", "6-Core Processor", the speed).
+fn short_name(name: &str) -> String {
+    let mut words: Vec<&str> = Vec::new();
+    for word in name.split_whitespace() {
+        // "AMD Ryzen 5 7500F 6-Core Processor", "... CPU @ 3.40GHz".
+        if word.ends_with("-Core") || matches!(word, "Processor" | "CPU" | "@") {
+            break;
+        }
+        words.push(word);
+    }
+    words.join(" ").replace("(R)", "").replace("(TM)", "").replace("(tm)", "")
+}
+
+#[cfg(test)]
+mod caption_tests {
+    use super::short_name;
+
+    #[test]
+    fn names_lose_their_marks() {
+        assert_eq!(short_name("AMD Ryzen 5 7500F 6-Core Processor             "), "AMD Ryzen 5 7500F");
+        assert_eq!(short_name("AMD Radeon RX 7800 XT"), "AMD Radeon RX 7800 XT");
+        assert_eq!(short_name("Intel(R) Core(TM) i7-10700K CPU @ 3.80GHz"), "Intel Core i7-10700K");
+        assert_eq!(short_name(""), "");
+        assert!(super::caption_name().starts_with("VIctory - myokex"));
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -8091,7 +8163,7 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = format!(" | {} | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame", caption_name());
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
