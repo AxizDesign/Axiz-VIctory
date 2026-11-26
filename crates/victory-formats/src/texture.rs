@@ -791,42 +791,35 @@ impl Layout {
         if tiled_len < self.bytes_from(mip) as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
-        let Some(flips) = &self.flips else {
+        if self.flips.is_none() && m.pitch == m.width && row_pitch == bytes {
             let active_plane = need - (depth as usize - 1) * depth_pitch;
-            let tiled_pitch = m.pitch as usize * n;
             for z in 0..depth {
                 let (s, _) = self.split(first + z);
                 let base = (u64::from(s) * self.slice_size + m.offset) as usize;
-                let linear = z as usize * depth_pitch;
-                // Each mip plane is separate, even when its rows have no padding.
-                if tiled_pitch == bytes && row_pitch == bytes {
-                    copy_run::<DETILE>(src, dst, base, linear, active_plane);
-                } else {
-                    for y in 0..m.height as usize {
-                        copy_run::<DETILE>(src, dst, base + y * tiled_pitch, linear + y * row_pitch, bytes);
-                    }
-                }
+                copy_run::<DETILE>(src, dst, base, z as usize * depth_pitch, active_plane);
             }
             return Ok(());
-        };
+        }
         // The row and slice add whole blocks to every column and XOR the same
         // bits into each block offset, so the same runs repeat on every row,
         // including mip tails: no run reaches the lowest bit a row may flip,
         // since that bit is the row's own, which no column sets (checked for
         // every pattern by `rows_flip_a_low_bit_of_their_own`).
         let mut runs = Vec::new();
-        let mut first_linear = 0;
-        let mut first_tiled = self.column(flips, m, 0) as usize;
-        for x in 1..m.width {
-            let offset = self.column(flips, m, x) as usize;
-            let at = x as usize * n;
-            if offset != first_tiled + (at - first_linear) {
-                runs.push((first_tiled, first_linear, at - first_linear));
-                first_tiled = offset;
-                first_linear = at;
+        if let Some(flips) = &self.flips {
+            let mut first_linear = 0;
+            let mut first_tiled = self.column(flips, m, 0) as usize;
+            for x in 1..m.width {
+                let offset = self.column(flips, m, x) as usize;
+                let at = x as usize * n;
+                if offset != first_tiled + (at - first_linear) {
+                    runs.push((first_tiled, first_linear, at - first_linear));
+                    first_tiled = offset;
+                    first_linear = at;
+                }
             }
+            runs.push((first_tiled, first_linear, bytes - first_linear));
         }
-        runs.push((first_tiled, first_linear, bytes - first_linear));
         // A mip can end partway through the last run. Check the other runs
         // once so each row can copy them as fixed-size chunks.
         let (body, last) = runs.split_at(runs.len().saturating_sub(1));
@@ -839,6 +832,11 @@ impl Layout {
             let base = u64::from(s) * self.slice_size + m.offset;
             for y in 0..m.height {
                 let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                let Some(flips) = &self.flips else {
+                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
+                    copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
+                    continue;
+                };
                 let (row, xor) = self.row(flips, m, y, first + z);
                 let mut tiled_row = (base + row) as usize;
                 let columns = flips[0].iter().fold(0, |a, &f| a | f);
