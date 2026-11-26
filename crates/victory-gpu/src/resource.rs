@@ -1662,8 +1662,18 @@ fn candidates() -> Vec<Owned> {
 /// gone (indices).
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
     let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
+    if over == 0 {
+        return uses
+            .iter()
+            .enumerate()
+            .filter_map(|(i, usage)| idle(usage).then_some(i))
+            .collect();
+    }
     let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
     let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
+    if over == 0 {
+        return gone;
+    }
     rest.sort_by_key(|&i| uses[i].1);
     for i in rest {
         if over == 0 {
@@ -2487,8 +2497,42 @@ mod tests {
         assert_eq!(choose(&uses, frame, now, 10), vec![1], "the idle one covers the excess");
         assert_eq!(choose(&uses, frame, now, 11), vec![1, 2], "then the least recently used");
         assert_eq!(choose(&uses, frame, now, 1 << 20), vec![1, 2, 0], "all of them if need be");
+        assert_eq!(choose(&[recent, idle, recent], frame, now, 11), vec![1, 0], "equal ages keep their input order");
         let early = (frame - 1, now - IDLE_MS, 10);
         assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
+    }
+
+    #[test]
+    #[ignore = "synthetic CPU benchmark"]
+    fn performance_eviction_selection() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let frame = IDLE_FRAMES + 1;
+        let now = IDLE_MS + 16_384;
+        let uses: Vec<_> = (0..16_384)
+            .map(|i| {
+                if i % 256 == 0 {
+                    (0, 0, 65_536)
+                } else {
+                    let age = (i * 8191) % 16_384;
+                    (frame, now - age, 65_536)
+                }
+            })
+            .collect();
+        for (over, expected) in [(0, 64), (1 << 20, 64), (8 << 20, 128)] {
+            let mut samples = [0u128; 15];
+            for sample in &mut samples {
+                let start = Instant::now();
+                for _ in 0..32 {
+                    let chosen = choose(black_box(&uses), frame, now, black_box(over));
+                    assert_eq!(black_box(chosen.len()), expected);
+                }
+                *sample = start.elapsed().as_nanos() / 32;
+            }
+            samples.sort_unstable();
+            eprintln!("eviction over={over}: {} ns/selection", samples[7]);
+        }
     }
 
     /// Title textures of one memory share a key in any format of the same

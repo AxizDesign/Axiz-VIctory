@@ -75,3 +75,16 @@ Separate checkout at [upstream PR #2825](https://github.com/Marvisak/VIctory/pul
 | f16 multiply + add | 3.682 ms | 0.133 ms | 27.6× |
 
 Each comparison matched all 262,144 threads. Four focused native-path correctness tests passed. This experiment uses the PR's timing protocol and has no rendering or frame-pacing measurements. The shipped candidate keeps its existing f16 path.
+
+## Residency selection and shader I/O
+
+Compare `4263a2c8` with just the benchmark fixtures attached against `887b1c72`. Windows 11, Rust 1.98.1 Release and Core Ultra 9 275HX. Each number is the median of 15 batches of 32 calls, with inputs constructed outside the timed sections.
+
+| Synthetic workload | Baseline | Candidate |
+| --- | ---: | ---: |
+| Shader I/O, 4,096 compute instructions without interpolation | 213.637 µs | 3.893 µs |
+| Texture selection, 16,384 entries, no budget excess | 296.621 µs | 5.721 µs |
+| Same selection with 1 MiB excess fully covered by idle entries | 288.662 µs | 12.293 µs |
+| Same selection with 8 MiB excess requiring active entries | 296.912 µs | 307.834 µs |
+
+The active-entry case uses the same stable sort and was about 4% slower in this run. The first three rows measure CPU stages only. Scope includes neither a whole shader compile nor a rendered frame. The eviction benchmark checks output counts, and targeted tests check idle and LRU order, tie handling, and interpolation semantics.

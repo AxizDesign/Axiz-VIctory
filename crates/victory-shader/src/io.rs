@@ -323,35 +323,8 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         },
         ..Io::default()
     };
-    let defs: std::collections::HashMap<Value, Site> = p
-        .blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(b, block)| {
-            block
-                .insts
-                .iter()
-                .enumerate()
-                .flat_map(move |(i, inst)| inst.writes.iter().map(move |w| (w.1, (b, i))))
-        })
-        .collect();
-    let phis: std::collections::HashMap<Value, (usize, usize)> = p
-        .blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(b, block)| {
-            block
-                .phis
-                .iter()
-                .enumerate()
-                .map(move |(i, phi)| (phi.value, (b, i)))
-        })
-        .collect();
-    let halves = Halves {
-        p,
-        defs: &defs,
-        phis: &phis,
-    };
+    // Only a second interpolation half needs the SSA definition indexes.
+    let halves = std::cell::LazyCell::new(|| Halves::new(p));
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -487,11 +460,39 @@ impl Pair {
 /// Finds the first halves of interpolations.
 struct Halves<'a> {
     p: &'a Program,
-    defs: &'a std::collections::HashMap<Value, Site>,
-    phis: &'a std::collections::HashMap<Value, (usize, usize)>,
+    defs: std::collections::HashMap<Value, Site>,
+    phis: std::collections::HashMap<Value, (usize, usize)>,
 }
 
-impl Halves<'_> {
+impl<'a> Halves<'a> {
+    fn new(p: &'a Program) -> Self {
+        let defs = p
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(b, block)| {
+                block
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .flat_map(move |(i, inst)| inst.writes.iter().map(move |w| (w.1, (b, i))))
+            })
+            .collect();
+        let phis = p
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(b, block)| {
+                block
+                    .phis
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, phi)| (phi.value, (b, i)))
+            })
+            .collect();
+        Self { p, defs, phis }
+    }
+
     /// The interpolation whose second half reads the first half's result
     /// `acc`, the barycentric `j`, and attribute `attr`: every first half
     /// must read the same attribute channel and the same kind's i.
@@ -794,3 +795,36 @@ mod tests {
         );
     }
 }
+    #[test]
+    #[ignore = "synthetic CPU benchmark"]
+    fn performance_io_without_interpolation() {
+        use crate::native::ComputeIo;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let words = std::iter::repeat_n(0x4A00_0081u32, 4_096).chain([0xBF81_0000]);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [32, 1, 1],
+            }),
+            code: words.flat_map(u32::to_le_bytes).collect(),
+        };
+        let program = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let mut samples = [0u128; 15];
+        for sample in &mut samples {
+            let start = Instant::now();
+            for _ in 0..32 {
+                let io = raise(black_box(&program), black_box(&native)).unwrap();
+                assert!(black_box(io).interps.is_empty());
+            }
+            *sample = start.elapsed().as_nanos() / 32;
+        }
+        samples.sort_unstable();
+        eprintln!("compute shader I/O: {} ns/raise", samples[7]);
+    }

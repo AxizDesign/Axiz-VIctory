@@ -16,3 +16,9 @@
 - Verified that all five original problem tests run successfully on the RTX. The remaining structured read failure also reproduced on the preserved baseline with only the test-adapter selector applied. The zero-count root-constant crash reproduced there as well and the current dispatch passes.
 - The full Release workspace run with NVIDIA selected recorded 878 passes, one failure and 13 ignored tests, excluding the nested fixture runner. All-features Clippy passed. The single failing shader assertion remained enabled.
 - Measured native FP16 in a separate source checkout. See [benchmarks](BENCHMARKS.md) for GPU timestamps, memory calculations and the shader compilation microbenchmark.
+
+### Cool Fox and residency follow-up
+
+- Recovered the licensed Cool Fox snapshot from two public forks and compared its RTX 5090 reports and renderer settings. See the [source and benchmark review](OPTIMIZATION_MATRIX.md#cool-fox-source-and-rtx-claims).
+- Adapted the fork's interpolation-analysis shortcut in `41136239` and independently skipped unnecessary texture age sorting in `887b1c72`. Kept the prior Release at `target/validated/01806bde`. The 18 resource tests and five interpolation tests passed. The two synthetic benchmark fixtures ran separately.
+- Next review the copy-queue descriptor publication and pool backoff in isolation, using the existing RTX structured-buffer failure and explicit resource lifetime tests as correctness gates. Record budget and residency on the 12 GB GPU before choosing a policy for representative workloads.
