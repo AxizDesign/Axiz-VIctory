@@ -208,37 +208,49 @@ impl HostHeap {
         Some(h)
     }
 
-    /// Makes the first `total` slots null: one null slot in a CPU-side heap,
-    /// doubled by copies to a block, the block copied over the heap.
+    /// Copies an immutable CPU-side template over the shader-visible heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
-        const BLOCK: u32 = 1 << 16;
+        use victory_shader::emit::HEAP_SAMPLERS;
+        static VIEWS: Mutex<Option<ID3D12DescriptorHeap>> = Mutex::new(None);
+        static SAMPLERS: Mutex<Option<ID3D12DescriptorHeap>> = Mutex::new(None);
+        let (template, slots) = if self.sampler { (&SAMPLERS, HEAP_SAMPLERS) } else { (&VIEWS, 1 << 16) };
         let Some(host) = host() else { return Ok(()) };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
-            let block: ID3D12DescriptorHeap =
-                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: BLOCK,
-                    ..Default::default()
-                })?;
-            let start = block.GetCPUDescriptorHandleForHeapStart();
-            let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
-                ptr: start.ptr + (i * self.step) as usize,
+            let block = {
+                let mut cached = template.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(block) = cached.as_ref() {
+                    block.clone()
+                } else {
+                    let block: ID3D12DescriptorHeap =
+                        host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: kind,
+                            NumDescriptors: slots,
+                            ..Default::default()
+                        })?;
+                    let start = block.GetCPUDescriptorHandleForHeapStart();
+                    if self.sampler {
+                        null_sampler(start);
+                    } else {
+                        null_view(start);
+                    }
+                    let mut filled = 1;
+                    while filled < slots {
+                        let dst = D3D12_CPU_DESCRIPTOR_HANDLE {
+                            ptr: start.ptr + (filled * self.step) as usize,
+                        };
+                        let n = filled.min(slots - filled);
+                        host.device.CopyDescriptorsSimple(n, dst, start, kind);
+                        filled += n;
+                    }
+                    *cached = Some(block.clone());
+                    block
+                }
             };
-            if self.sampler {
-                null_sampler(start);
-            } else {
-                null_view(start);
-            }
-            let mut filled = 1;
-            while filled < BLOCK {
-                let n = filled.min(BLOCK - filled);
-                host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
-                filled += n;
-            }
+            let start = block.GetCPUDescriptorHandleForHeapStart();
             let mut done = 0;
             while done < total {
-                let n = BLOCK.min(total - done);
+                let n = slots.min(total - done);
                 host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                 done += n;
             }
