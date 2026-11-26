@@ -42,3 +42,36 @@ On a hybrid system, confirm from the process or GPU capture that both builds use
 Gameplay and user-reported captures are pending. The synthetic copy example does not measure rendering or GPU utilization.
 
 For an analyzer smoke test, a generated 1,000-interval CSV with 999 intervals of 20 ms and one of 100 ms yielded 49.801 average FPS, 50.000 median FPS, 35.714 and 10.000 for the two lows, and one budget miss and stutter. This fixture only checks arithmetic.
+
+## D3D12 heap creation on RTX 5070 Ti Laptop GPU
+
+```powershell
+$env:VICTORY_D3D12_NVIDIA='1'
+cargo test --release --locked -p victory-gpu host_heap_creation_throughput -- --ignored --nocapture
+```
+
+The Release harness discards one warm-up and times 21 sequential heap creations per case, with destruction outside each timed interval. The earlier candidate was measured with only the benchmark attached. Times are median / P90 in microseconds.
+
+| Title descriptors | Previous candidate | Bounded heap | With reusable null template |
+| --- | ---: | ---: | ---: |
+| 128 samplers | 893 / 954 | 951 / 1,059 | 355 / 395 |
+| 4,096 views | 3,260 / 3,489 | 8,735 / 8,860 | 7,854 / 8,100 |
+| 262,144 views | 5,924 / 6,179 | 9,889 / 10,017 | 8,939 / 9,175 |
+
+The bounded heap backs all one million addressable slots and costs more to initialize than the older undersized heap. Reusing the immutable CPU template reduces median initialization 10–63% relative to the bounded heap alone. The new stride and write-mark buffers request 12,000,000 bytes total per view heap, down from 25,165,824 bytes for these title sizes. These are buffer sizes, with process RAM and dedicated VRAM residency still unmeasured.
+
+## Shared constant expressions in the DXIL emitter
+
+The Release benchmark `constant_analysis_of_shared_subexpressions` builds a 15-level expression graph outside the timed interval, checks the result against the CPU formula and reports the median of 21 evaluations. With KainanP's constant-dot lowering as the baseline, caching proven values by instruction and remaining depth reduced the median from **1,001,400 ns** to **2,600 ns** on the Intel Core Ultra 9 275HX. This tests repeated visits to a shared expression graph. It does not estimate a title's total shader or PSO compilation time.
+
+## Experimental native FP16 on Blackwell
+
+Separate checkout at [upstream PR #2825](https://github.com/Marvisak/VIctory/pull/2825), head `47078d7f3cb90335ec6efc921ef8f3f3ce4d178c`, with the NVIDIA test-adapter selector applied. Rust 1.98.1 Release, Windows 11 build 26300, RTX 5070 Ti Laptop GPU, driver 621.14. The PR's `translated_f16_math_costs` harness reports GPU timestamps for synthetic dependent arithmetic chains and compares results per thread.
+
+| Instruction chain | f32 path | Native f16 | Speedup |
+| --- | ---: | ---: | ---: |
+| Packed f16 FMA | 8.376 ms | 0.630 ms | 13.3× |
+| Scalar f16 FMA | 4.636 ms | 0.630 ms | 7.4× |
+| f16 multiply + add | 3.682 ms | 0.133 ms | 27.6× |
+
+Each comparison matched all 262,144 threads. Four focused native-path correctness tests passed. This experiment uses the PR's timing protocol and has no rendering or frame-pacing measurements. The shipped candidate keeps its existing f16 path.
