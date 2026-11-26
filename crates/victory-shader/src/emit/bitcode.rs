@@ -324,11 +324,16 @@ impl Module {
     /// over such values (the builder itself folds nothing, a driver does).
     /// `None` when it depends on anything else.
     pub fn known_i32(&self, v: V) -> Option<u32> {
-        self.known_int(v, 32)
+        self.known_int(v, 32, &mut HashMap::new())
     }
 
-    fn known_int(&self, v: V, depth: u32) -> Option<u32> {
+    fn known_int(&self, v: V, depth: u32, resolved: &mut HashMap<(V, u32), u32>) -> Option<u32> {
         let depth = depth.checked_sub(1)?;
+        // A shared expression can appear at different depths. Keep the
+        // original depth bound even when its value is already known.
+        if let Some(&value) = resolved.get(&(v, depth)) {
+            return Some(value);
+        }
         let (bits, int) = match self.types[self.type_of(v).0 as usize] {
             TypeDef::Int(bits) if bits <= 32 => (bits, true),
             TypeDef::Float => (32, false),
@@ -343,7 +348,10 @@ impl Module {
             },
             V::Inst(i) => match self.insts[i as usize].op {
                 Op::Bin(op, a, b) if int => {
-                    let (a, b) = (self.known_int(a, depth)?, self.known_int(b, depth)?);
+                    let (a, b) = (
+                        self.known_int(a, depth, resolved)?,
+                        self.known_int(b, depth, resolved)?,
+                    );
                     let signed = |x: u32| ((x << (32 - bits)) as i32) >> (32 - bits);
                     match op {
                         Bin::Add => a.wrapping_add(b),
@@ -364,25 +372,29 @@ impl Module {
                         TypeDef::Float if op == Cast::Bitcast => 32,
                         _ => return None,
                     };
-                    let y = self.known_int(x, depth)?;
+                    let y = self.known_int(x, depth, resolved)?;
                     match op {
                         Cast::Trunc | Cast::ZExt | Cast::Bitcast => y & u32::MAX >> (32 - from),
                         Cast::SExt => (((y << (32 - from)) as i32) >> (32 - from)) as u32,
                         _ => return None,
                     }
                 }
-                Op::Select(cond, t, f) => match self.known_int(cond, depth) {
-                    Some(c) => self.known_int(if c & 1 != 0 { t } else { f }, depth)?,
+                Op::Select(cond, t, f) => match self.known_int(cond, depth, resolved) {
+                    Some(c) => self.known_int(if c & 1 != 0 { t } else { f }, depth, resolved)?,
                     None => {
-                        let t = self.known_int(t, depth)?;
-                        (Some(t) == self.known_int(f, depth)).then_some(t)?
+                        let t = self.known_int(t, depth, resolved)?;
+                        (Some(t) == self.known_int(f, depth, resolved)).then_some(t)?
                     }
                 },
                 _ => return None,
             },
             _ => return None,
         };
-        Some(x & mask)
+        let value = x & mask;
+        if matches!(v, V::Inst(_)) {
+            resolved.insert((v, depth), value);
+        }
+        Some(value)
     }
 
     /// Gives constant `old` the content of `new` (both stay valid).
@@ -1280,6 +1292,30 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "synthetic constant analysis benchmark"]
+    fn constant_analysis_of_shared_subexpressions() {
+        let mut module = Module::default();
+        let block = module.new_block();
+        let one = module.i32(1);
+        let mut value = one;
+        for _ in 0..15 {
+            let left = module.bin(block, Bin::Add, value, one);
+            let right = module.bin(block, Bin::Sub, value, one);
+            value = module.bin(block, Bin::Add, left, right);
+        }
+        let mut samples = [std::time::Duration::ZERO; 21];
+        for sample in &mut samples {
+            let start = std::time::Instant::now();
+            let result = std::hint::black_box(&module).known_i32(std::hint::black_box(value));
+            *sample = start.elapsed();
+            // The expression should be known and double on every iteration.
+            assert_eq!(result, Some(1 << 15));
+        }
+        samples.sort_unstable();
+        eprintln!("shared subexpressions: median {} ns", samples[10].as_nanos());
+    }
 
     #[test]
     fn vbr_and_blocks() {
