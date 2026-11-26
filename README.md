@@ -1,4 +1,15 @@
-# Vertex
+# Axiz-VIctory alpha integration
+
+This branch builds Axiz-VIctory on Vertex's multi-fork Rust and D3D12
+backend. See the [integration record](docs/axiz-alpha-integration.md) for
+the source pins, Axiz ports, validation and build status. The existing
+Vertex notes below describe its own measurements and settings. Use the
+candidate's defaults for graphics comparisons.
+
+To select the RTX adapter on a hybrid system, set `$env:VICTORY_D3D12_NVIDIA = '1'`
+before running `victory doctor` or `victory run`.
+
+## Upstream Vertex notes
 
 Vertex runs an Xbox Series X|S title natively on Windows, from files you supply.
 It is a work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory)

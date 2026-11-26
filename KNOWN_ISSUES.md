@@ -1,0 +1,10 @@
+# Known issues
+
+The entries below describe the prior Axiz line. The [Vertex alpha integration record](docs/axiz-alpha-integration.md) describes the current branch, its validation and its remaining rendering and performance gaps.
+
+- Upstream CPU texture and descriptor behavior can be tested with generated fixtures. Representative gameplay timing, image fidelity, the dominant frame bottleneck and sustained stability remain unmeasured on the target system.
+- Both inherited descriptor assertions and the null-buffer dispatch pass with a shared one-million-slot bound and reserved null views. The runtime still truncates guest heaps larger than its supported title range. Detect and remap oversized title ranges before relying on those descriptors. [Upstream NVIDIA descriptor-limit report](https://github.com/Marvisak/VIctory/issues/1835)
+- The typed 64-bit atomic test runs unchanged and passes on RTX and WARP. Running the hardware leg on the Intel adapter produces a capability error because the device reports no support for typed 64-bit atomics. Runtime feature gating already handles that capability.
+- `a_heap_buffer_read_by_element_takes_the_views_stride` remains a reproducible NVIDIA failure, including on the preserved baseline with only the adapter selector applied. The read uses the wrong elements through a structured view and returns zeros for later lanes. A fix must preserve logical stride, bounds, write tracking and placement alignment when changing the host view kind. [Upstream raw-structured proposal](https://github.com/Marvisak/VIctory/pull/2178)
+- The repository's [asset policy](docs/asset-policy.md) identifies the inherited BCPack table as outside the upstream GPL license. The candidate adds source and synthetic measurement tooling. The local executable retains the upstream dependency and is kept local.
+- External reports include GPU device removal entering the world on other NVIDIA setups. A synthetic texture throughput result cannot resolve that issue. [Upstream RTX 5070 Ti report](https://github.com/Marvisak/VIctory/issues/1216)

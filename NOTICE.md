@@ -15,3 +15,13 @@ licensed under the Apache License, Version 2.0
   `tools/shader-compiler/src/hlsl/scalar_bits.rs`).
 
 Marked in the source at each ported site with the upstream commit.
+
+The complete Apache License 2.0 text is in docs/LICENSE-APACHE.txt.
+
+The RB+ swizzle patterns in `crates/victory-formats/src/texture/patterns.rs`
+were generated from AMD's Mesa addrlib at
+265a2d4f0f842a28e0dfd150637fa91fb70345a2. The file carries AMD's copyright and
+MIT identifier. The full text is in docs/LICENSE-AMD-ADDRLIB.txt. The
+associated texture layout port credits MiamiGame/XTP commits
+00c60fb197434c4987156779466a2ab41d5be2df and
+188d895814255c72518c21d96994164072fac688, by Simon (GPL-3.0).
