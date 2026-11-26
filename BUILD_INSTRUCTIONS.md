@@ -30,5 +30,6 @@ SHA-256 values for the local executables:
 | Previous candidate release | `9e4abb9b66d9902c939350a061d8b39728bf7fb798ac6c2b3614327fadffc1e8` |
 | Previous candidate diagnostics | `46e45b40ddba98ea0e2ca7677af37e2ef9c91ed44219805a331680c6b74a5cf6` |
 | Blackwell candidate release | `8a89b1164c54f987ac805060fdd0fa967834bd59d1287cfeed729a6502805d1e` |
+| Residency candidate release | `1f4a4e65b54c854cf909a7734360bea92d049dac4307bc263bb8de3353191725` |
 
 For the hybrid laptop, set `$env:VICTORY_D3D12_NVIDIA='1'` before launching the candidate or running the workspace tests against the RTX.

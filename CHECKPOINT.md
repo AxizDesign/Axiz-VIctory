@@ -15,3 +15,12 @@ Resume on `codex/residency-efficiency`. The verified stack is [#1 texture copy a
 3. **Evaluate optional native FP16 or pipeline warm-up after correctness.** Keep native FP16 behind an experimental switch with fused-rounding checks, output-modifier fallback, and isolated cache keys. Choose between this and pipeline warm-up from a representative profile.
 
 Keep resolution, effects, mip selection, lighting, and shader accuracy fixed when comparing builds. Use authorized workloads or generated fixtures. The reported Cool Fox 25 FPS remains unverified at comparable fidelity. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for blockers and [ROADMAP.md](ROADMAP.md) for longer-term gates.
+
+To reproduce the known stride failure from the workspace root:
+
+```powershell
+$env:VICTORY_D3D12_NVIDIA='1'
+cargo test --release --locked -p victory-shader --features host --lib a_heap_buffer_read_by_element_takes_the_views_stride -- --nocapture
+```
+
+Confirm that the test prints the RTX 5070 Ti Laptop GPU as its hardware adapter.
