@@ -89,7 +89,7 @@ reported 11,944 MiB dedicated memory, Shader Model 6.8, 32-lane waves and
 native 16-bit shader operations. The [benchmark table](../BENCHMARKS.md#vertex-alpha-comparison-2026-11-26)
 covers generated CPU texture copies.
 
-The final locked Release workspace suite at 56b50f9 recorded 804
+The final locked Release workspace suite at `f56b50f9` recorded 804
 passes, zero failures and 14 inherited ignores. An additional diagnostics run on the
 accepted source exercised the generated round trip on the WARP direct queue
 and with both copy lanes enabled. The copy-queue run recorded 12 uploads and
