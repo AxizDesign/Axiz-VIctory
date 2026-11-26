@@ -14,4 +14,5 @@
 - Aligned descriptor heap sizes with the translator bound, retained the original assertions, and measured reusable null templates on the RTX. The descriptor work extends `codex/texture-copy`.
 - Stacked `codex/blackwell-shaders` on the descriptor branch. It adds constant-dot fixes and bounded memoization, identifies the validation adapter, initializes the mandatory root dword and corrects the gather input view. The compiled source is `01806bde`.
 - Verified that all five original problem tests run successfully on the RTX. The remaining structured read failure also reproduced on the preserved baseline with only the test-adapter selector applied. The zero-count root-constant crash reproduced there as well and the current dispatch passes.
+- The full Release workspace run with NVIDIA selected recorded 878 passes, one failure and 13 ignored tests, excluding the nested fixture runner. All-features Clippy passed. The single failing shader assertion remained enabled.
 - Measured native FP16 in a separate source checkout. See [benchmarks](BENCHMARKS.md) for GPU timestamps, memory calculations and the shader compilation microbenchmark.
