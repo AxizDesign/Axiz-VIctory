@@ -190,7 +190,20 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            if crate::switch::on("VICTORY_D3D12_NVIDIA") {
+                match nvidia_device() {
+                    Ok(Some(nvidia)) => device = Some(nvidia),
+                    Ok(None) => {
+                        tracing::warn!("no compatible NVIDIA adapter; using the default D3D12 adapter");
+                    }
+                    Err(error) => tracing::warn!(
+                        %error, "NVIDIA adapter enumeration failed; using the default D3D12 adapter"
+                    ),
+                }
+            }
+            if device.is_none() {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -267,6 +280,42 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(Presentation::default()),
         })
     }
+}
+
+/// Create a D3D12 device on the first NVIDIA adapter that supports level 12_0.
+fn nvidia_device() -> windows::core::Result<Option<ID3D12Device>> {
+    const NVIDIA_VENDOR_ID: u32 = 0x10de;
+    // SAFETY: DXGI queries and D3D12 device creation with valid out pointers.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        for index in 0.. {
+            let adapter = match factory.EnumAdapters1(index) {
+                Ok(adapter) => adapter,
+                Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(error) => return Err(error),
+            };
+            let desc = adapter.GetDesc1()?;
+            if desc.VendorId != NVIDIA_VENDOR_ID
+                || desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+            {
+                continue;
+            }
+            let mut device = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                && device.is_some()
+            {
+                let end = desc
+                    .Description
+                    .iter()
+                    .position(|&ch| ch == 0)
+                    .unwrap_or(desc.Description.len());
+                let name = String::from_utf16_lossy(&desc.Description[..end]);
+                tracing::info!(adapter = %name, "host device on NVIDIA");
+                return Ok(device);
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Diagnostics: our process's private commit and working set, bytes.
@@ -650,6 +699,29 @@ pub(crate) mod tests {
         Compositor::new(&host.device, DXGI_FORMAT_R8G8B8A8_UNORM)
             .expect("create compositor root signature and both pipeline states");
         eprintln!("PresentX compositor initialized");
+    }
+
+    #[test]
+    fn nvidia_preference_selects_the_nvidia_device() {
+        if !crate::switch::on("VICTORY_D3D12_NVIDIA")
+            || (cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP"))
+        {
+            return;
+        }
+        let host = host().expect("a host D3D12 device");
+        let Some(nvidia) = nvidia_device().unwrap() else {
+            return; // exercises the default device when NVIDIA is absent
+        };
+        // SAFETY: LUID queries on live D3D12 devices.
+        unsafe {
+            let selected = host.device.GetAdapterLuid();
+            let expected = nvidia.GetAdapterLuid();
+            assert_eq!(
+                (selected.HighPart, selected.LowPart),
+                (expected.HighPart, expected.LowPart)
+            );
+            eprintln!("host D3D12 device matches the NVIDIA adapter LUID");
+        }
     }
 
     #[test]

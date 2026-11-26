@@ -181,6 +181,14 @@ Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
 the translated shaders do not require it at runtime.
 
+## NVIDIA adapter selection
+
+Set `VICTORY_D3D12_NVIDIA=1` to prefer an NVIDIA adapter on a hybrid system.
+The runtime logs the selected NVIDIA device or reports fallback to the
+system default. The switch works in release and diagnostics builds.
+The diagnostics WARP switch takes priority. See
+[NVIDIA compatibility](NVIDIA_COMPATIBILITY.md) for the verified host.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
