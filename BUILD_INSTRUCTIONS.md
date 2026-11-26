@@ -18,6 +18,7 @@ See the [architecture](docs/architecture.md) and [asset policy](docs/asset-polic
 | Previous candidate release | `target/baseline/0b366c6b/victory.exe` | `7dd9a868959d6389596a1824e04a199c474ab630` |
 | Previous candidate diagnostics | `target/diag/victory.exe` | `7dd9a868959d6389596a1824e04a199c474ab630` |
 | Blackwell candidate release | `target/validated/01806bde/victory.exe` | `01806bde5bf056557637b7e629f5aedb1ff0dc60` |
+| Residency candidate release | `target/validated/887b1c72/victory.exe` | `887b1c72b97eda25664277888d60c99b9e72e22f` |
 
 The local builds dated 2026-11-26 retain matching PDB files. They depend on Windows D3D12 for GPU operation. The diagnostics profile adds instrumentation and should be used separately from release frame-pacing captures.
 
