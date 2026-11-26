@@ -85,6 +85,12 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
         } else {
             hardware_adapter(&factory).map_err(err)?
         };
+        #[cfg(test)]
+        if !warp {
+            let desc = adapter.GetDesc1().map_err(err)?;
+            let name = String::from_utf16_lossy(&desc.Description);
+            eprintln!("shader D3D12 adapter: {}", name.trim_end_matches('\0'));
+        }
         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
         let device = device.ok_or("no device")?;
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -135,6 +141,8 @@ fn on_software_adapter(device: &ID3D12Device) -> bool {
 /// basic render driver report no dedicated video memory, which is what this
 /// asks for as well.
 fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapter1> {
+    let prefer_nvidia = std::env::var_os("VICTORY_D3D12_NVIDIA").is_some_and(|value| value != "0");
+    let mut first_hardware = None;
     // SAFETY: plain DXGI adapter enumeration.
     unsafe {
         for index in 0.. {
@@ -143,12 +151,16 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
             };
             let desc = adapter.GetDesc1()?;
             let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
-            if !software && desc.DedicatedVideoMemory > 0 {
+            if software || desc.DedicatedVideoMemory == 0 {
+                continue;
+            }
+            if !prefer_nvidia || desc.VendorId == 0x10de {
                 return Ok(adapter);
             }
+            first_hardware.get_or_insert(adapter);
         }
     }
-    Err(windows::core::Error::new(
+    first_hardware.ok_or_else(|| windows::core::Error::new(
         windows::Win32::Foundation::E_FAIL,
         "no hardware adapter",
     ))
@@ -164,7 +176,8 @@ impl Host {
             .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The first hardware adapter, preferring NVIDIA with
+    /// `VICTORY_D3D12_NVIDIA=1`, or WARP with `warp` or `VICTORY_WARP=1`.
     /// A software default adapter (a machine without a GPU, as CI) is
     /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
