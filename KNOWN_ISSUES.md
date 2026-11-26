@@ -1,0 +1,7 @@
+# Known issues
+
+- Upstream CPU texture and descriptor behavior can be tested with generated fixtures. Representative gameplay timing, image fidelity, the dominant frame bottleneck and sustained stability remain unmeasured on the target system.
+- Upstream `dynamic_slots_are_held_until_released` asserts that the actual host heap reaches `HEAP_VIEWS`. `lists_share_a_table_and_copies_keep_their_views` asserts that allocated pairs are past a hard-coded dynamic slot boundary. Both failed on the pinned machine before the texture change. Investigate the host-dependent heap sizing and where the shader gets its index bound together. [Upstream NVIDIA descriptor-limit report](https://github.com/Marvisak/VIctory/issues/1835)
+- Three other upstream hardware tests failed before the texture change. The null-buffer dispatch and 64-bit image atomic tests returned an invalid parameter error. The hardware fused dot-product test returned a different result bit pattern. These paths need independent adapter and capability checks.
+- The repository's [asset policy](docs/asset-policy.md) identifies the inherited BCPack table as outside the upstream GPL license. The candidate adds source and synthetic measurement tooling. The local executable retains the upstream dependency and is kept local.
+- External reports include GPU device removal entering the world on other NVIDIA setups. A synthetic texture throughput result cannot resolve that issue. [Upstream RTX 5070 Ti report](https://github.com/Marvisak/VIctory/issues/1216)
