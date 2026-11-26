@@ -164,6 +164,9 @@ pub struct Stage {
     pub root_srvs: Vec<u8>,
     #[serde(default)]
     pub root_uavs: Vec<u8>,
+    /// Texture-table positions whose half values are carried as integer bits.
+    #[serde(default)]
+    pub half_views: Vec<(u8, u32)>,
     /// Immediate samplers (`s<n>`): the console's four sampler words.
     pub samplers: Vec<[u32; 4]>,
     /// Which of them the shader compares with.

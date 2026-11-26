@@ -1098,10 +1098,9 @@ impl HostHeap {
 
     /// Copies an immutable CPU-side template over the shader-visible heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
-        use victory_shader::emit::HEAP_SAMPLERS;
         static VIEWS: Mutex<Option<ID3D12DescriptorHeap>> = Mutex::new(None);
         static SAMPLERS: Mutex<Option<ID3D12DescriptorHeap>> = Mutex::new(None);
-        let (template, slots) = if self.sampler { (&SAMPLERS, HEAP_SAMPLERS) } else { (&VIEWS, 1 << 16) };
+        let (template, slots) = if self.sampler { (&SAMPLERS, D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE) } else { (&VIEWS, 1 << 16) };
         let Some(host) = host() else { return Ok(()) };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {

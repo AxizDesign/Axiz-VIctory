@@ -202,6 +202,7 @@ pub fn run(description: &Path, out: &Path, wave64: Wave64Mode) -> Result<()> {
             root_cbvs: shader.root_cbvs.clone(),
             root_srvs: shader.root_srvs.clone(),
             root_uavs: shader.root_uavs.clone(),
+            half_views: shader.half_views.clone(),
             samplers: shader.samplers.clone(),
             comparison_samplers: shader
                 .static_samplers
