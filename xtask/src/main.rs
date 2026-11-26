@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod frame_stats;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,12 +27,20 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Summarize a one-column frametime_ms CSV from one capture.
+    FrameStats {
+        input: PathBuf,
+        /// Frames strictly above this interval count as stutters.
+        #[arg(long, default_value_t = 50.0)]
+        stutter_ms: f64,
+    },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::FrameStats { input, stutter_ms } => frame_stats::run(&input, stutter_ms),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

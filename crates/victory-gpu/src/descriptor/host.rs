@@ -19,8 +19,7 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// Dynamic slots past `count` (none in sampler heaps).
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -84,10 +83,6 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
-/// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
-
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -95,9 +90,16 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
 
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// Keep this much transient capacity even when the title fills the heap.
 const MIN_DYNAMIC: u32 = 1 << 16;
+/// Leave room for persistent pairs, the raw null views, and the clamp slot.
+const RESERVED_VIEWS: u32 = 1024;
+
+fn view_ranges(requested: u32) -> (u32, u32) {
+    let end = victory_shader::emit::HEAP_VIEWS - RESERVED_VIEWS;
+    let title = requested.min(end - MIN_DYNAMIC);
+    (title, DYNAMIC.min(end - title))
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -119,16 +121,29 @@ impl HostHeap {
                     })
             }
         };
-        // Every slot a shader can index (title slots, also past a capped
-        // heap, and dynamic ones): shaders read the table as a root view,
-        // which has no bounds, at indices clamped below `HEAP_VIEWS`.
+        let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
+        let (count, extra, total) = if sampler {
+            (count.min(samplers), 0, samplers)
+        } else {
+            let (title, dynamic) = view_ranges(count);
+            (title, dynamic, views)
+        };
+        let heap = match make(total) {
+            Ok(heap) => heap,
+            Err(error) => {
+                tracing::warn!(%error, count, sampler, "no host descriptor heap");
+                return None;
+            }
+        };
+        // Root views are unbounded. Back every index the shader can produce
+        // with storage, including the null slots at the end.
         let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
+            .then(|| host.upload_buffer(u64::from(views) * 4))
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
         let marks = (!sampler)
             .then(|| {
-                let bytes = u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 8;
+                let bytes = u64::from(views) * 8;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 crate::host::name(&buffer, || "view marks".into());
                 // Every slot unmarked (all ones) until a view is made there.
@@ -137,38 +152,6 @@ impl HostHeap {
                 Some((buffer, data as usize))
             })
             .flatten();
-        // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
-        // Translated shaders clamp their indices below `HEAP_VIEWS` or
-        // `HEAP_SAMPLERS`: slots up to there exist and stay null.
-        let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
-        let (heap, count, extra) = if sampler {
-            match make(count.max(samplers)) {
-                Ok(heap) => (heap, count, 0),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
-            }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
-            (heap, count, DYNAMIC)
-        } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
-            }
-        };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
@@ -178,9 +161,7 @@ impl HostHeap {
         };
         tracing::debug!(count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
-        let (gpu, total) = unsafe {
-            (heap.GetGPUDescriptorHandleForHeapStart().ptr, heap.GetDesc().NumDescriptors)
-        };
+        let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
             u64::from(total) * u64::from(step),
@@ -198,10 +179,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
-                null if !sampler && null > count + extra && null < total => null - 1,
-                _ => total,
-            },
+            pairs_end: victory_shader::emit::NULL_BUFFER_VIEW - 1,
             strides,
             marks,
             addresses: std::sync::OnceLock::new(),
@@ -223,46 +201,56 @@ impl HostHeap {
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
         let null = victory_shader::emit::NULL_BUFFER_VIEW;
-        if !sampler && null > count + extra && null < total {
+        if !sampler {
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
-        } else if !sampler {
-            tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
         }
         Some(h)
     }
 
-    /// Makes the first `total` slots null: one null slot in a CPU-side heap,
-    /// doubled by copies to a block, the block copied over the heap.
+    /// Copies an immutable CPU-side template over the shader-visible heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
-        const BLOCK: u32 = 1 << 16;
+        use victory_shader::emit::HEAP_SAMPLERS;
+        static VIEWS: Mutex<Option<ID3D12DescriptorHeap>> = Mutex::new(None);
+        static SAMPLERS: Mutex<Option<ID3D12DescriptorHeap>> = Mutex::new(None);
+        let (template, slots) = if self.sampler { (&SAMPLERS, HEAP_SAMPLERS) } else { (&VIEWS, 1 << 16) };
         let Some(host) = host() else { return Ok(()) };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
-            let block: ID3D12DescriptorHeap =
-                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: BLOCK,
-                    ..Default::default()
-                })?;
-            let start = block.GetCPUDescriptorHandleForHeapStart();
-            let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
-                ptr: start.ptr + (i * self.step) as usize,
+            let block = {
+                let mut cached = template.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(block) = cached.as_ref() {
+                    block.clone()
+                } else {
+                    let block: ID3D12DescriptorHeap =
+                        host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: kind,
+                            NumDescriptors: slots,
+                            ..Default::default()
+                        })?;
+                    let start = block.GetCPUDescriptorHandleForHeapStart();
+                    if self.sampler {
+                        null_sampler(start);
+                    } else {
+                        null_view(start);
+                    }
+                    let mut filled = 1;
+                    while filled < slots {
+                        let dst = D3D12_CPU_DESCRIPTOR_HANDLE {
+                            ptr: start.ptr + (filled * self.step) as usize,
+                        };
+                        let n = filled.min(slots - filled);
+                        host.device.CopyDescriptorsSimple(n, dst, start, kind);
+                        filled += n;
+                    }
+                    *cached = Some(block.clone());
+                    block
+                }
             };
-            if self.sampler {
-                null_sampler(start);
-            } else {
-                null_view(start);
-            }
-            let mut filled = 1;
-            while filled < BLOCK {
-                let n = filled.min(BLOCK - filled);
-                host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
-                filled += n;
-            }
+            let start = block.GetCPUDescriptorHandleForHeapStart();
             let mut done = 0;
             while done < total {
-                let n = BLOCK.min(total - done);
+                let n = slots.min(total - done);
                 host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                 done += n;
             }
@@ -2211,6 +2199,38 @@ mod tests {
         assert_eq!(unsafe { past.read_unaligned() }, mark);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn view_ranges_keep_null_and_pair_slots_outside_dynamic() {
+        let end = victory_shader::emit::HEAP_VIEWS - RESERVED_VIEWS;
+        assert_eq!(view_ranges(0), (0, DYNAMIC));
+        assert_eq!(view_ranges(end - DYNAMIC), (end - DYNAMIC, DYNAMIC));
+        assert_eq!(view_ranges(end - DYNAMIC + 1), (end - DYNAMIC + 1, DYNAMIC - 1));
+        assert_eq!(view_ranges(u32::MAX), (end - MIN_DYNAMIC, MIN_DYNAMIC));
+        assert!(end + 2 < victory_shader::emit::NULL_BUFFER_VIEW);
+    }
+
+    #[test]
+    #[ignore = "synthetic D3D12 heap creation benchmark"]
+    fn host_heap_creation_throughput() {
+        assert!(host().is_some(), "a host D3D12 device is required");
+        for (sampler, count) in [(true, 128), (false, 4_096), (false, 262_144)] {
+            drop(HostHeap::new(sampler, count).expect("warm-up heap"));
+            let mut durations = [std::time::Duration::ZERO; 21];
+            for duration in &mut durations {
+                let start = std::time::Instant::now();
+                let heap = HostHeap::new(sampler, count).expect("benchmark heap");
+                *duration = start.elapsed();
+                drop(heap);
+            }
+            durations.sort_unstable();
+            eprintln!(
+                "sampler={sampler} title_slots={count} median_us={} p90_us={}",
+                durations[10].as_micros(),
+                durations[18].as_micros()
+            );
+        }
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
