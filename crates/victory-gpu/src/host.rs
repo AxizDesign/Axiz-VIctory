@@ -640,7 +640,20 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            use victory_shader::emit::host::{nvidia_device, prefer_nvidia};
+            if prefer_nvidia() {
+                match nvidia_device() {
+                    Ok(Some((selected, adapter))) => {
+                        tracing::info!(%adapter, "host device on NVIDIA");
+                        device = Some(selected);
+                    }
+                    Ok(None) => tracing::warn!("no compatible NVIDIA adapter; using the default D3D12 adapter"),
+                    Err(error) => tracing::warn!(%error, "NVIDIA enumeration failed; using the default D3D12 adapter"),
+                }
+            }
+            if device.is_none() {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the

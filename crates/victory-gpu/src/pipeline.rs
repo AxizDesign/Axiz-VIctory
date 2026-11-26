@@ -249,10 +249,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// made" would be a dropped stage). One that cannot be made turns the
 /// builder off for the rest of the run.
 ///
-/// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
-/// the whole builder and the host side of title memory by address
-/// (`memory.rs`) working on a card; nothing reads the structures before
-/// the programs that walk them translate.
+/// Hosts can disable this path with VICTORY_BVH_BUILDER=0.
 #[cfg(windows)]
 struct Builder {
     pipelines: Vec<Arc<make::Pending>>,
@@ -337,7 +334,7 @@ pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// (`VICTORY_BVH_HOLD=1`; off by default).
 ///
 /// The structure builder does not run (see [`Builder`]: only with
-/// `VICTORY_BVH_BUILDER=1`, and then only whole, which a host of 32-lane
+/// the builder enabled, and then only whole, which a host of 32-lane
 /// waves does not manage yet). The title's ray-traced passes run all the
 /// same: 64 programs of its shader pack test rays against structure nodes
 /// (ray-traced shadows, screen probes, reflections, the irradiance cache;
@@ -473,7 +470,7 @@ pub(crate) fn builder_live() -> bool {
 
 /// Says, at the builder's first dropped dispatches while it is not asked
 /// for, how many of its pipelines the title has created and how many of
-/// them the host has: what `VICTORY_BVH_BUILDER=1` would find
+/// them the host has: what the enabled builder would find
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 fn builder_census() {
@@ -498,7 +495,7 @@ fn builder_census() {
         made,
         making,
         refused,
-        "the ray-tracing structure builder is off (VICTORY_BVH_BUILDER=1 asks for it): its pipelines the title has created, by whether the host has them; it runs only with none refused"
+        "the ray-tracing structure builder is off (VICTORY_BVH_BUILDER=0 turns it off): its pipelines the title has created, by whether the host has them; it runs only with none refused"
     );
 }
 
@@ -513,11 +510,11 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
-/// Whether the structure builder is asked for (`VICTORY_BVH_BUILDER=1`).
+/// Whether the structure builder is enabled. Keep ray tracing on by default.
 #[cfg(windows)]
 fn builder_asked() -> bool {
     static ASKED: OnceLock<bool> = OnceLock::new();
-    *ASKED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+    *ASKED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "0"))
 }
 
 /// Why the structure builder's stages do not run, for the frame report.
@@ -527,7 +524,7 @@ pub(crate) fn builder_why() -> String {
         let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.off.unwrap_or("its programs are being made")
     } else {
-        "not asked for (VICTORY_BVH_BUILDER=1 asks for it)"
+        "disabled (VICTORY_BVH_BUILDER=0)"
     };
     format!("a stage of the ray-tracing structure builder, which is off: {why}")
 }

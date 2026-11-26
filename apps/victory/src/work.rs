@@ -11,7 +11,7 @@ pub enum Work {
     /// Less on the graphics card, and less of its memory: for cards with
     /// little of it. More memory is copied and compared by the processor.
     Cpu,
-    /// As measured on an RTX 5070.
+    /// Copy-queue readback with the standard memory budgets.
     Balanced,
     /// More on the graphics card: buffer copies behind the work in flight,
     /// changed bytes by its copy engine, more of the title's memory in its
@@ -19,38 +19,29 @@ pub enum Work {
     Gpu,
 }
 
-/// What every choice has. The switches of soldsawn/victory-nvidia-8gb's
-/// launcher, as measured (2026-11-25, RTX 5070, Series X profile).
-/// `SKIP_WC_COMPARE` leaves shader writes to write-combining memory on the
-/// card: 9 MB a frame come back instead of 68; what another copy of the
-/// same memory needs is still fetched (`VICTORY_SKIP_WC_SHARED`).
+/// Submission, copying and buffering settings shared by all presets.
 const ALL: &[(&str, &str)] = &[
     ("VICTORY_ASYNC_SUBMIT", "1"),
     ("VICTORY_INDIRECT_WINDOW", "1"),
-    ("VICTORY_INDIRECT_WINDOW_DRAWS", "1"),
     ("VICTORY_INDIRECT_GATHER", "1"),
     ("VICTORY_CLAMP_WAITS", "0"),
     ("VICTORY_JOIN_PARTS", "1"),
     ("VICTORY_BACK_OWN_VIEW", "1"),
-    ("VICTORY_GUARD_HOLES_FRAME", "1"),
     ("VICTORY_HEAP_WORKER", "1"),
     ("VICTORY_ALIAS_ONCE", "1"),
-    ("VICTORY_TEXTURE_NO_WAIT", "1"),
+    ("VICTORY_TEXTURE_NO_WAIT", "0"),
     ("VICTORY_COPY_PLAIN", "1"),
-    ("VICTORY_SKIP_WC_COMPARE", "1"),
     ("VICTORY_WIDE_TEXTURES", "1"),
     ("VICTORY_DISK_CORES", "slow"),
     ("VICTORY_XMEM_PERSISTENT_VIEW", "1"),
-    ("VICTORY_PIPELINE_WAIT_MS", "24"),
 ];
 
 const CPU: &[(&str, &str)] = &[
     ("VICTORY_QUEUE2", "1"),
     ("VICTORY_CARD_BUFFERS_MB", "256"),
-    ("VICTORY_TEXTURE_DROP_MIPS", "2"),
 ];
 
-const BALANCED: &[(&str, &str)] = &[("VICTORY_QUEUE2", "1"), ("VICTORY_TEXTURE_DROP_MIPS", "1")];
+const BALANCED: &[(&str, &str)] = &[("VICTORY_QUEUE2", "1")];
 
 const GPU: &[(&str, &str)] = &[
     ("VICTORY_QUEUE2", "3"),
@@ -62,7 +53,6 @@ const GPU: &[(&str, &str)] = &[
     ("VICTORY_WIDE_COMPARE", "1"),
     ("VICTORY_CARD_REHASH_RUNS", "1"),
     ("VICTORY_CARD_WINDOWS_MB", "512"),
-    ("VICTORY_TEXTURE_DROP_MIPS", "1"),
 ];
 
 impl Work {
@@ -104,6 +94,8 @@ mod tests {
             names.dedup();
             assert_eq!(names.len(), all, "{work:?}");
             assert!(names.iter().all(|n| n.starts_with("VICTORY_")));
+            assert!(!names.contains(&"VICTORY_TEXTURE_DROP_MIPS"));
+            assert!(!names.contains(&"VICTORY_SKIP_WC_COMPARE"));
         }
     }
 

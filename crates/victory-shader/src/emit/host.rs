@@ -62,6 +62,38 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether this process explicitly prefers a hardware NVIDIA adapter.
+pub fn prefer_nvidia() -> bool {
+    std::env::var_os("VICTORY_D3D12_NVIDIA").is_some_and(|value| value != "0")
+}
+
+/// A feature-level 12_0 NVIDIA device and its adapter name, if available.
+pub fn nvidia_device() -> windows::core::Result<Option<(ID3D12Device, String)>> {
+    // SAFETY: DXGI enumeration and D3D12 creation use live objects and valid out pointers.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        for index in 0.. {
+            let adapter = match factory.EnumAdapters1(index) {
+                Ok(adapter) => adapter,
+                Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(error) => return Err(error),
+            };
+            let desc = adapter.GetDesc1()?;
+            if desc.VendorId != 0x10de || desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let mut device = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                && let Some(device) = device
+            {
+                let name = String::from_utf16_lossy(&desc.Description);
+                return Ok(Some((device, name.trim_end_matches('\0').to_owned())));
+            }
+        }
+    }
+    Ok(None)
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -85,7 +117,14 @@ impl Host {
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                if prefer_nvidia() && let Some((selected, _adapter)) = nvidia_device().map_err(err)? {
+                    #[cfg(test)]
+                    eprintln!("shader D3D12 adapter: {_adapter}");
+                    device = Some(selected);
+                }
+                if device.is_none() {
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                }
                 // A machine without a graphics card gives the software
                 // adapter as its default device (a hosted test runner,
                 // whose first adapter is a display stub that cannot make a

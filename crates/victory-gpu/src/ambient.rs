@@ -11,7 +11,7 @@
 //! -9.75). The title's own lighting then applies it with the surfaces'
 //! colors. Raised, not added: the result is the next frame's history.
 //!
-//! `VICTORY_AMBIENT=<level>` sets it (0.6 by default, 0 for none); `off`
+//! `VICTORY_AMBIENT=<level>` opts into it (0 for none); `off`
 //! keeps the title's own output.
 //! shortcut: the same light everywhere, from everywhere; not used while the
 //! ray-tracing structure builder runs (`crate::pipeline::builder_live`).
@@ -35,10 +35,6 @@ pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 /// integers): root parameter and place in its table.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 
-/// 0.6 looked balanced in run a2. `VICTORY_AMBIENT=off` leaves what the
-/// title's resolve wrote; 0 is no indirect diffuse light at all.
-const DEFAULT: f32 = 0.6;
-
 /// The floor; `None` if off.
 pub(crate) fn level() -> Option<f32> {
     static LEVEL: OnceLock<f32> = OnceLock::new();
@@ -47,7 +43,7 @@ pub(crate) fn level() -> Option<f32> {
         if set.trim() == "off" {
             return -1.0;
         }
-        set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0).unwrap_or(DEFAULT)
+        set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l > 0.0).unwrap_or(-1.0)
     });
     (level >= 0.0).then_some(level)
 }

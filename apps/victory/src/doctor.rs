@@ -46,6 +46,7 @@ struct Gpu {
     wave_lanes: Option<(u32, u32)>,
     int64: bool,
     rovs: bool,
+    native_16bit: bool,
 }
 
 /// What an adapter lacks for a run.
@@ -192,7 +193,11 @@ fn draws(adapter: &Adapter) -> bool {
 fn adapters() -> Result<bool> {
     println!("Graphics");
     let adapters = list()?;
-    let wanted = std::env::var("VICTORY_ADAPTER").ok();
+    let wanted = if victory_shader::emit::host::prefer_nvidia() {
+        Some("NVIDIA".to_owned())
+    } else {
+        std::env::var("VICTORY_ADAPTER").ok()
+    };
     let Some(taken) = chosen(&adapters, wanted.as_deref()) else {
         println!("  FAIL  no adapter here gives a Direct3D 12 device at feature level 12.0");
         return Ok(false);
@@ -211,6 +216,15 @@ fn adapters() -> Result<bool> {
         match &adapter.gpu {
             Err(e) => println!("    note  no Direct3D 12 device at feature level 12.0: {e}"),
             Ok(gpu) => {
+                let (major, minor) = gpu.shader_model;
+                let waves = gpu.wave_lanes.map_or_else(
+                    || "unsupported".to_owned(),
+                    |(min, max)| format!("{min}-{max}"),
+                );
+                println!(
+                    "    D3D12 shader model {major}.{minor}, wave lanes {waves}, native 16-bit {}",
+                    gpu.native_16bit
+                );
                 for (level, text) in lacks(gpu) {
                     let level = match level {
                         _ if i != taken => "note",
@@ -296,6 +310,8 @@ fn read(device: &ID3D12Device) -> Gpu {
             .then_some((waves.WaveLaneCountMin, waves.WaveLaneCountMax)),
         int64: waves.Int64ShaderOps.as_bool(),
         rovs: base.ROVsSupported.as_bool(),
+        native_16bit: feature::<D3D12_FEATURE_DATA_D3D12_OPTIONS4>(device, D3D12_FEATURE_D3D12_OPTIONS4)
+            .is_some_and(|options| options.Native16BitShaderOpsSupported.as_bool()),
     }
 }
 
@@ -345,6 +361,7 @@ mod tests {
             wave_lanes: Some((32, 32)),
             int64: true,
             rovs: true,
+            native_16bit: false,
         }
     }
 
