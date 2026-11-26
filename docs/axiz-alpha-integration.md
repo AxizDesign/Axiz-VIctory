@@ -89,14 +89,21 @@ reported 11,944 MiB dedicated memory, Shader Model 6.8, 32-lane waves and
 native 16-bit shader operations. The [benchmark table](../BENCHMARKS.md#vertex-alpha-comparison-2026-11-26)
 covers generated CPU texture copies.
 
-The initial integrated Release workspace suite passed 804 tests, with 14
-ignored by existing test attributes. An additional diagnostics run on the
+The final locked Release workspace suite at 56b50f9 recorded 804
+passes, zero failures and 14 inherited ignores. An additional diagnostics run on the
 accepted source exercised the generated round trip on the WARP direct queue
 and with both copy lanes enabled. The copy-queue run recorded 12 uploads and
 12 readbacks, with no landing-buffer misses. The separate in-flight write
 race test reproduced the intermediate readback and verified the corrected
 final bytes. These results establish correctness for the tested cases on
 WARP. They provide no hardware queue timings.
+
+The Vertex baseline predates the prior Axiz branch's structured-view stride
+fixture, `a_heap_buffer_read_by_element_takes_the_views_stride`. Its NVIDIA
+failure remains open on the prior branch. The Vertex pass count is for the
+Vertex test inventory and does not establish that the earlier failure is fixed.
+Port the generated fixture to Vertex's resource-binding model before using
+that case as an alpha release gate.
 
 ## Alpha gate
 
