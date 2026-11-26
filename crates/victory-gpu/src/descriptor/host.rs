@@ -2208,7 +2208,7 @@ mod tests {
         assert_eq!(view_ranges(end - DYNAMIC), (end - DYNAMIC, DYNAMIC));
         assert_eq!(view_ranges(end - DYNAMIC + 1), (end - DYNAMIC + 1, DYNAMIC - 1));
         assert_eq!(view_ranges(u32::MAX), (end - MIN_DYNAMIC, MIN_DYNAMIC));
-        assert!(end + 2 <= victory_shader::emit::NULL_BUFFER_VIEW - 1);
+        assert!(end + 2 < victory_shader::emit::NULL_BUFFER_VIEW);
     }
 
     #[test]
