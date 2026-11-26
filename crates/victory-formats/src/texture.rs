@@ -689,14 +689,17 @@ impl Layout {
             return Err(Error::TooSmall);
         }
         if self.desc.swizzle == Swizzle::LINEAR {
+            let tiled_pitch = m.pitch as usize * n;
             for z in 0..depth {
                 let base = (u64::from(first + z) * self.slice_size + m.offset) as usize;
+                let linear_base = z as usize * depth_pitch;
+                // Only active rows with no padding on either side form a span.
+                if tiled_pitch == bytes && row_pitch == bytes {
+                    copy.span(base, linear_base, slice_bytes);
+                    continue;
+                }
                 for y in 0..m.height as usize {
-                    copy.span(
-                        base + y * m.pitch as usize * n,
-                        z as usize * depth_pitch + y * row_pitch,
-                        bytes,
-                    );
+                    copy.span(base + y * tiled_pitch, linear_base + y * row_pitch, bytes);
                 }
             }
             return Ok(());
@@ -1449,6 +1452,44 @@ mod tests {
         assert_eq!(
             layout.tile(&mut tiled, 0, 0, &linear, usize::MAX, 0),
             Err(Error::TooSmall)
+        );
+    }
+
+    #[test]
+    fn contiguous_linear_rows_respect_mip_and_depth_gaps() {
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 3,
+            ..desc(256, 5, 2, 1, Swizzle::LINEAR)
+        })
+        .unwrap();
+        let row = 256;
+        let active = row * 5;
+        let pitch = active + 13;
+        let len = 2 * pitch + active;
+        let linear: Vec<_> = (0..len).map(|i| (i ^ (i >> 8)) as u8).collect();
+        let mut tiled = vec![0xcc; layout.size as usize];
+        let mut expected = tiled.clone();
+        let mut back = vec![0xcc; len];
+
+        layout.tile(&mut tiled, 0, 0, &linear, row, pitch).unwrap();
+        for z in 0..3 {
+            let offset = layout.offset(0, 0, 0, z).unwrap() as usize;
+            let start = z as usize * pitch;
+            expected[offset..][..active].copy_from_slice(&linear[start..][..active]);
+        }
+        assert_eq!(tiled, expected);
+
+        layout.detile(&tiled, 0, 0, &mut back, row, pitch).unwrap();
+        for z in 0..3 {
+            let start = z * pitch;
+            assert_eq!(back[start..][..active], linear[start..][..active]);
+        }
+        assert!(back[active..pitch].iter().all(|&byte| byte == 0xcc));
+        assert!(
+            back[pitch + active..2 * pitch]
+                .iter()
+                .all(|&byte| byte == 0xcc)
         );
     }
 
