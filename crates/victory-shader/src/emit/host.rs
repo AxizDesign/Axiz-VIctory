@@ -1375,12 +1375,17 @@ impl Host {
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetComputeRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        // Even stages without user data get one dword in the
+                        // root signature. A zero-count call crashes on NVIDIA.
+                        let data = if data.is_empty() { &[0][..] } else { data.as_slice() };
+                        list.SetComputeRoot32BitConstants(
+                            *param,
+                            data.len() as u32,
+                            data.as_ptr().cast(),
+                            0,
+                        );
+                    }
                     Root::Table { sampler, index } => {
                         let (h, size) = if *sampler {
                             (&samplers, sampler_size)
