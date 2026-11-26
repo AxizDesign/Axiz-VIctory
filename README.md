@@ -1,4 +1,16 @@
-# VIctory
+# Axiz-VIctory
+
+Axiz-VIctory is a fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory) focused on NVIDIA performance and compatibility while preserving rendering quality. Current development targets the GeForce RTX 5070 Ti Laptop GPU with 12 GB of VRAM.
+
+The draft branches cover texture copies, Blackwell shader fixes, and texture residency. Synthetic tests and benchmarks track those changes. Gameplay frame times on the target GPU are still unmeasured.
+
+- [Development progress](https://github.com/AxizDesign/Axiz-VIctory/pull/3)
+- [Benchmark results](https://github.com/AxizDesign/Axiz-VIctory/blob/c9ad62ca/BENCHMARKS.md)
+- [Continuation checkpoint](https://github.com/AxizDesign/Axiz-VIctory/blob/c9ad62ca/CHECKPOINT.md)
+
+---
+
+## Upstream VIctory overview
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
