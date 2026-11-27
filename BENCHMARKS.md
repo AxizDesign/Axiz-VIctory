@@ -140,3 +140,10 @@ for submit-to-settle measurements and the hardware byte checks.
 See [streaming and frame-time stability](docs/streaming-stability.md) for
 generated 128 MiB RTX streaming, queue comparisons, cold and cached PSO
 creation, and the speculative scheduler replay.
+
+## Mixed-frame pipeline latency
+
+The [mixed-frame measurements](docs/mixed-frame-latency.md) cover 120
+generated frames, 32 MiB streamed per frame, compute, graphics, pipeline
+creation bursts, rendered-byte validation, latency tails and sampled
+residency. They include separate cold and warm single-request controls.

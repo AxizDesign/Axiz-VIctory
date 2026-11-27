@@ -74,3 +74,10 @@ The [streaming integration record](docs/streaming-stability.md) tracks
 Cool Fox heap-growth backoff (`ab75ac3e`), the new empty-heap reclamation
 policy, and memory-gated speculative PSO helpers. It also records the
 deferred Belobug texture upload prelude and Cool Fox bindless changes.
+
+## Exact-key D3D12 pipeline coalescing
+
+`382b5524` adds original Axiz PSO work sharing around Vertex's persistent
+D3D12 pipeline library. `af2be548` keeps it opt-in after the single-request
+control. See [mixed-frame results](docs/mixed-frame-latency.md). This change
+uses no newly imported fork implementation.

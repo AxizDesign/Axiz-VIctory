@@ -65,3 +65,11 @@ The executable and matching PDB are archived at `target/validated/4e0a324d/`.
 The executable SHA-256 is
 `83ddf8ca33d2c04a5a8e3483aa2f5a97681b74b6cb4af5f28a083252b736f34a`.
 The preceding candidate remains at `target/validated/45049c1b/`.
+
+## Mixed-frame latency candidate
+
+Release source `af2be548` builds with `cargo build --release --locked -p victory`.
+The executable and matching PDB are under `target/validated/af2be548/`.
+Executable SHA-256
+`1ac1287f69277b3a09161d72b9d75bf9bb6410b2c7c4f097305bd2b108ebba53`.
+The previous `target/validated/4e0a324d/` Release is preserved.
