@@ -2228,6 +2228,112 @@ mod title_memory_tests {
         }
     }
 
+    /// Run deliberately with VICTORY_D3D12_NVIDIA=1 and --ignored.
+    /// Two formatted copies of the same guest bytes are primed first.
+    /// The consumers are recorded before those bytes change again.
+    #[test]
+    #[ignore = "repro for submission-time refresh of two views of the same memory"]
+    fn two_pre_recorded_texture_views_see_the_new_guest_bytes() {
+        use crate::{object, resource};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        let host = crate::host::host().expect("D3D12");
+        let desc = |format| {
+            let words = [3u32, 0, 0, 0, 512, 0, 512, (4 << 16) | 1, format, 1, 0, 0, 0, 0];
+            // SAFETY: a plain 56-byte texture description.
+            unsafe { std::mem::transmute::<_, resource::ResourceDesc>(words) }
+        };
+        let mut bytes = vec![0x31u8; resource::texture_layout(&desc(28)).unwrap().size as usize];
+        let make = |format| {
+            let mut image = std::ptr::null();
+            assert_eq!(
+                resource::create_at_address(
+                    std::ptr::null(),
+                    bytes.as_ptr() as u64,
+                    &desc(format),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::from_ref(&ID3D12Resource::IID).cast(),
+                    &mut image,
+                ),
+                object::S_OK
+            );
+            image
+        };
+        let (a, b) = (make(28), make(30));
+        for image in [a, b] {
+            let stage = super::staging(image, resource::host_resource(image).unwrap(), 0).unwrap();
+            let mut last = stage.last.lock().unwrap();
+            assert_eq!(stage.refresh_unlocked(&mut last, bytes.len()), bytes.len());
+            // SAFETY: refreshed mapping of a live staging buffer.
+            assert_eq!(unsafe { stage.data.read() }, 0x31);
+        }
+        let record = |image| {
+            let texture = resource::host_resource(image).unwrap();
+            let list = host.new_list().expect("command list");
+            let readback = host.read_back_buffer(1 << 20).unwrap();
+            super::upload(&list, image, texture);
+            crate::list::ensure_state(&list, image, 0x800);
+            // SAFETY: resources outlive the submission and the footprints
+            // cover the first mip of a generated RGBA texture.
+            unsafe {
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    ..Default::default()
+                };
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: texture.GetDesc().Format,
+                                Width: 512, Height: 512, Depth: 1, RowPitch: 2048,
+                            },
+                        },
+                    },
+                };
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+            crate::list::ensure_state(&list, image, 0);
+            list.close();
+            (list, readback)
+        };
+        let both = || [record(a), record(b)];
+        let run = |pair: [(crate::host::HostList, ID3D12Resource); 2]| {
+            host.execute(&[&pair[0].0, &pair[1].0]);
+            pair.map(|(_, output)| {
+                let mut data = std::ptr::null_mut();
+                // SAFETY: two completed readbacks.
+                unsafe {
+                    output.Map(0, None, Some(&mut data)).unwrap();
+                    let value = data.cast::<u8>().read();
+                    output.Unmap(0, None);
+                    value
+                }
+            })
+        };
+        let initial = run(both());
+        assert_eq!(initial, [0x31; 2], "prime both texture copies");
+        assert_eq!(run(both()), [0x31; 2], "settle the priming uploads");
+        for image in [a, b] {
+            let stage = super::staging(image, resource::host_resource(image).unwrap(), 0).unwrap();
+            use std::sync::atomic::Ordering::Relaxed;
+            assert!(stage.uploaded.load(Relaxed) && !stage.dirty.load(Relaxed));
+        }
+        let queued = both();
+        bytes.fill(0x62);
+        let queued_result = run(queued);
+        let refreshed = run(both());
+        for image in [a, b] {
+            object::slot::<extern "system" fn(object::This) -> u32>(image, 0x10)(image);
+        }
+        assert_eq!(refreshed, [0x62; 2], "later lists should see the refresh");
+        assert_eq!(queued_result, [0x62; 2], "recording before the CPU write must not sample stale aliases");
+    }
+
     /// The texture both device-loss runs named last (16 texels wide, 4 or 8
     /// high, format 10, layout 0x100, console flags 0x300000; its memory
     /// began 0x300 into a page in run 73 and 0x700 in run 72, and here also
