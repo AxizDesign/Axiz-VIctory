@@ -519,7 +519,7 @@ pub(crate) fn pipeline(
     static ON: OnceLock<bool> = OnceLock::new();
     static ACTIVE: OnceLock<InFlight<ID3D12PipelineState>> = OnceLock::new();
     let build = || load_or_create(name, load, create);
-    if *ON.get_or_init(|| std::env::var_os("VICTORY_PSO_COALESCE").is_none_or(|v| v != "0")) {
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_PSO_COALESCE").is_some_and(|v| v == "1")) {
         ACTIVE.get_or_init(InFlight::new).get_or_try_build(name, build)
     } else {
         build()
