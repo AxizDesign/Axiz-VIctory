@@ -365,10 +365,8 @@ struct Section {
     /// The section's size in bytes.
     size: usize,
     /// One bit per 64 KiB page, set once committed through the persistent
-    /// view. A saved call, not a guarantee: `commit` is idempotent, so the
-    /// DirectStorage workers may write this concurrently and a lost race
-    /// costs one redundant call. It records this view's own commits only;
-    /// the temporary path's are not recorded, by design.
+    /// view or a title mapping. A concurrent commit can only cause a
+    /// redundant call. The temporary write path does not record commits.
     committed: Box<[AtomicU64]>,
     /// Whether a warn has been said for a write that fell back to a
     /// temporary view, so a run with the switch on can tell which sections
@@ -461,8 +459,7 @@ impl Section {
         mapped.as_ref().map(|base| base.0)
     }
 
-    /// Whether all of pages `[start, start + count)` are committed in the
-    /// persistent view.
+    /// Whether all of pages `[start, start + count)` have been committed in the section.
     fn committed_all(&self, start: usize, count: usize) -> bool {
         let Some(end) = start.checked_add(count) else {
             return false;
@@ -472,8 +469,8 @@ impl Section {
         })
     }
 
-    /// Records pages `[start, start + count)` as committed in the persistent
-    /// view. A lost race only costs a call, so relaxed is enough.
+    /// Records committed pages of the section. A lost race only costs a
+    /// redundant system call, so relaxed is enough.
     fn mark_committed(&self, start: usize, count: usize) {
         for page in start..start + count {
             self.committed[page / 64].fetch_or(1u64 << (page % 64), Ordering::Relaxed);
@@ -1123,6 +1120,14 @@ fn merged(mut pieces: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     runs
 }
 
+/// Reuse confirmed section commits and exact placeholders. The fallback
+/// preserves the original Windows calls for diagnosing mapping failures.
+fn lean_mapping() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_MAP_LEAN").is_none_or(|v| v != "0"));
+    *ON
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -1131,7 +1136,11 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    let lock_started = victory_gpu::framelog::on().then(std::time::Instant::now);
     let mut physical = physical();
+    if let Some(started) = lock_started {
+        victory_gpu::framelog::add(victory_gpu::framelog::T::RemapPhysicalWaitUs, started.elapsed().as_micros() as u64);
+    }
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
@@ -1139,7 +1148,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // bytes go on.
     let (from, to) = reach(&physical, base, n * PAGE);
     let _changing = victory_gpu::title_memory_remapping(from, to - from);
-    unmap(&mut physical, base, n * PAGE);
+    let exact_placeholder = unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
     }
@@ -1161,7 +1170,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map(&mut physical, base + i * PAGE, run * PAGE, first, exact_placeholder && run == n) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -1209,7 +1218,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let (start, end) = reach(&physical, to, len);
     let _changing = victory_gpu::title_memory_remapping(start, end - start);
-    unmap(&mut physical, to, len);
+    let exact_placeholder = unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
@@ -1227,7 +1236,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        if !map(&mut physical, to + k, PAGE, slice, exact_placeholder && len == PAGE) {
             return false;
         }
     }
@@ -1236,28 +1245,48 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
-fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
-    let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
-        MapViewOfFile3(
-            slice.section.handle,
-            GetCurrentProcess(),
-            base as *const c_void,
-            (slice.index * PAGE) as u64,
-            len,
-            MEM_REPLACE_PLACEHOLDER,
-            PAGE_READWRITE,
-            std::ptr::null_mut(),
-            0,
-        )
+fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice, exact_placeholder: bool) -> bool {
+    use victory_gpu::framelog::{self, T};
+    let started = framelog::on().then(std::time::Instant::now);
+    let map_view = || {
+        // SAFETY: the view replaces only an exact placeholder.
+        unsafe {
+            MapViewOfFile3(
+                slice.section.handle,
+                GetCurrentProcess(),
+                base as *const c_void,
+                (slice.index * PAGE) as u64,
+                len,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
     };
+    let count = len / PAGE;
+    let reuse = lean_mapping()
+        && len.is_multiple_of(PAGE)
+        && slice.index.checked_add(count).is_some_and(|end| end <= slice.section.size / PAGE);
+    let mut view = if exact_placeholder && reuse {
+        map_view()
+    } else {
+        MEMORY_MAPPED_VIEW_ADDRESS { Value: std::ptr::null_mut() }
+    };
+    if view.Value as usize != base {
+        // SAFETY: splits only the placeholder. Splitting an exact
+        // placeholder fails harmlessly, leaving it ready for map_view.
+        unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+        if started.is_some() {
+            framelog::add(T::RemapSplitCalls, 1);
+        }
+        view = map_view();
+    }
+    let mapped = started.map(|started| {
+        let now = std::time::Instant::now();
+        framelog::add(T::RemapMapUs, (now - started).as_micros() as u64);
+        now
+    });
     if view.Value as usize != base {
         tracing::warn!(
             address = format_args!("{base:#x}"),
@@ -1267,7 +1296,24 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    let committed_ok = if reuse && slice.section.committed_all(slice.index, count) {
+        true
+    } else {
+        if started.is_some() && !on_wine() {
+            framelog::add(T::RemapCommitCalls, 1);
+        }
+        let committed = commit(base, len);
+        if committed && reuse {
+            slice.section.mark_committed(slice.index, count);
+        }
+        committed
+    };
+    let committed = mapped.map(|mapped| {
+        let now = std::time::Instant::now();
+        framelog::add(T::RemapCommitUs, (now - mapped).as_micros() as u64);
+        now
+    });
+    if !committed_ok {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -1281,6 +1327,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         slice.section.handle as usize,
         (slice.index * PAGE) as u64,
     );
+    if let Some(committed) = committed {
+        framelog::add(T::RemapNotesUs, committed.elapsed().as_micros() as u64);
+    }
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
@@ -1360,13 +1409,15 @@ fn reach(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
-/// are mapped again outside it.
-fn unmap(physical: &mut Physical, base: usize, len: usize) {
+/// are mapped again outside it. Returns whether the range is now exactly
+/// one placeholder from a successfully unmapped view.
+fn unmap(physical: &mut Physical, base: usize, len: usize) -> bool {
+    use victory_gpu::framelog::{self, T};
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
     if len == 0 {
-        return;
+        return false;
     }
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
@@ -1381,6 +1432,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .into_iter()
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
+    let mut exact_placeholder = false;
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
@@ -1394,9 +1446,15 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
+        let started = framelog::on().then(std::time::Instant::now);
         victory_gpu::title_memory_remapped(at, size);
+        let noted = started.map(|started| {
+            let now = std::time::Instant::now();
+            framelog::add(T::RemapNotesUs, (now - started).as_micros() as u64);
+            now
+        });
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        let gone = unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -1405,14 +1463,26 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        if gone != 0 && at == base && size == len {
+            exact_placeholder = true;
+        }
+        if let Some(noted) = noted {
+            framelog::add(T::RemapUnmapUs, noted.elapsed().as_micros() as u64);
+            let outside = base.saturating_sub(at) + (at + size).saturating_sub(end);
+            if outside != 0 {
+                framelog::add(T::RemapCuts, 1);
+                framelog::add(T::RemapCutBytes, outside as u64);
+            }
+        }
         if at < base {
-            map(physical, at, base - at, slice.clone());
+            map(physical, at, base - at, slice.clone(), false);
         }
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+            map(physical, end, at + size - end, Slice { index, ..slice }, false);
         }
     }
+    exact_placeholder
 }
 
 /// The oldest layout we know; newer titles pass other flag values (Minecraft
@@ -1798,6 +1868,64 @@ mod tests {
         assert!(reader.join().expect("the reader never faulted") > 0);
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    #[ignore = "generated Windows streaming profile"]
+    fn generated_remap_profile() {
+        use std::time::Instant;
+
+        const PAGES: usize = 372;
+        const FRAMES: usize = 120;
+        let pages = allocate(PAGES);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(), PAGES * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        let addr = |page: usize| base.wrapping_byte_add(page * PAGE);
+        for (i, page) in pages.iter().enumerate() {
+            assert_eq!(XMemMapPhysicalPages(addr(i), 1, page), addr(i));
+            // SAFETY: each whole section page has been committed.
+            unsafe {
+                addr(i).cast::<u32>().write(i as u32);
+                addr(i).wrapping_byte_add(PAGE - 4).cast::<u32>().write(!(i as u32));
+            }
+        }
+
+        let mut times = Vec::new();
+        let cpu_start = victory_gpu::framelog::thread_times();
+        for frame in 1..=FRAMES + 12 {
+            let start = Instant::now();
+            for slot in 0..PAGES {
+                let index = (slot + frame) % PAGES;
+                let to = addr(slot);
+                assert_eq!(XMemMapPhysicalPages(to, 1, &pages[index]), to);
+                // SAFETY: the requested page has just been remapped.
+                unsafe {
+                    assert_eq!(to.cast::<u32>().read(), index as u32);
+                    assert_eq!(to.wrapping_byte_add(PAGE - 4).cast::<u32>().read(), !(index as u32));
+                }
+            }
+            if frame > 12 {
+                times.push(start.elapsed().as_nanos());
+            }
+        }
+        let (user, kernel) = victory_gpu::framelog::thread_times();
+        times.sort_unstable();
+        println!(
+            "remap_profile lean={} frame_log={} frames={FRAMES} changes/frame={PAGES} total_ms={:.3} p95_ms={:.3} p99_ms={:.3} thread_user_ms={:.3} thread_kernel_ms={:.3}",
+            lean_mapping(), victory_gpu::framelog::on(), times.iter().sum::<u128>() as f64 / 1e6,
+            times[113] as f64 / 1e6, times[118] as f64 / 1e6,
+            (user - cpu_start.0) as f64 / 1e3, (kernel - cpu_start.1) as f64 / 1e3,
+        );
+
+        assert_eq!(XMemMapPhysicalPages(base, PAGES, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(PAGES, pages.as_ptr()), 1);
+        // SAFETY: the fixture's placeholder range is entirely unmapped.
+        unsafe {
+            assert_ne!(VirtualFree(base, PAGES * PAGE, MEM_RELEASE | 1), 0);
+            assert_ne!(VirtualFree(base, 0, MEM_RELEASE), 0);
+        }
     }
 
     #[test]

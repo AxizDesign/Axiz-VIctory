@@ -508,12 +508,22 @@ fn system_memory() -> (u64, u64) {
     (m.ullAvailPhys, m.ullAvailPageFile)
 }
 
-/// Whether the address space is walked for the memory map line
-/// ([`log_memory_map`]). On by default (this module is in diagnostics
-/// builds only); `VICTORY_MEMORY_MAP=0` leaves the walk out.
-fn memory_map() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MAP").is_none_or(|v| v != "0"))
+/// Every how many memory lines (one each 5 s) the address space is walked
+/// for the memory map line ([`log_memory_map`]): `VICTORY_MEMORY_MAP=<n>`,
+/// 60 if unset (about every 5 minutes; 6 before), `0` leaves the walk out.
+/// (This module is in diagnostics builds only.)
+///
+/// The walk asks Windows about every region, 250,000 of them in a street
+/// (0.9 s), and its questions hold the process's memory map: the submitting
+/// thread's write-watch askings and the title's faults wait meanwhile (run
+/// lane2-0: two askings of 11 and 13 ms, each ending with one of the walk's
+/// questions).
+fn memory_map() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| match std::env::var("VICTORY_MEMORY_MAP") {
+        Ok(v) => v.trim().parse().unwrap_or(60),
+        Err(_) => 60,
+    })
 }
 
 /// Asks which of the pages in `asked` (address, answer) are in physical
@@ -725,10 +735,11 @@ fn log_memory() {
         h.log_video_memory("with the memory line");
     }
     // What else holds memory: the map, on a thread of its own, with every
-    // sixth line; and what the shader table and the pipeline library keep.
+    // configured interval; and what the shader table and the pipeline library keep.
     static LINES: AtomicU64 = AtomicU64::new(0);
     static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if memory_map() && LINES.fetch_add(1, Relaxed) % 6 == 5 && !WALKING.swap(true, Relaxed) {
+    let every = memory_map();
+    if every > 0 && LINES.fetch_add(1, Relaxed) % every == every - 1 && !WALKING.swap(true, Relaxed) {
         let walk = std::thread::Builder::new().name("victory-memory-map".into()).spawn(|| {
             log_memory_map();
             WALKING.store(false, Relaxed);
