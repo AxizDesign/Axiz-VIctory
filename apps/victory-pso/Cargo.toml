@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 victory-core.workspace = true
+victory-pipeline.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 anyhow.workspace = true
 clap.workspace = true

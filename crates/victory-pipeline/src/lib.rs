@@ -10,8 +10,10 @@
 //! a game update or a converter fix only redoes what changed.
 
 mod cache;
+mod in_flight;
 
 pub use cache::{Cache, CacheKey};
+pub use in_flight::InFlight;
 
 /// A deterministic transformation of one input into one output.
 pub trait Converter: Send + Sync {

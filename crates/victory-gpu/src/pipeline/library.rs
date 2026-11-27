@@ -514,6 +514,23 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    use victory_pipeline::InFlight;
+
+    static ON: OnceLock<bool> = OnceLock::new();
+    static ACTIVE: OnceLock<InFlight<ID3D12PipelineState>> = OnceLock::new();
+    let build = || load_or_create(name, load, create);
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_PSO_COALESCE").is_none_or(|v| v != "0")) {
+        ACTIVE.get_or_init(InFlight::new).get_or_try_build(name, build)
+    } else {
+        build()
+    }
+}
+
+fn load_or_create(
+    name: &str,
+    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);

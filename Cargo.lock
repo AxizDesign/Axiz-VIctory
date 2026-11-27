@@ -747,6 +747,7 @@ dependencies = [
  "tempfile",
  "toml",
  "victory-core",
+ "victory-pipeline",
  "victory-shader",
  "windows",
  "zlib-rs",
