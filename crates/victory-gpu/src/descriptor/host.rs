@@ -3113,6 +3113,7 @@ fn buffer_uav(
 }
 
 fn supports_typed_uav(format: DXGI_FORMAT) -> bool {
+    use std::collections::HashMap;
     static CACHE: std::sync::LazyLock<Mutex<HashMap<i32, bool>>> =
         std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
     if let Some(&supported) = CACHE
