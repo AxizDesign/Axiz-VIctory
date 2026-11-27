@@ -461,6 +461,27 @@ fn slow_lane_limit() -> usize {
     })
 }
 
+/// Helpers consume only background work and never take slots from the
+/// original worker pool. Stop admitting new jobs before host memory is scarce.
+fn precache_helpers() -> usize {
+    let enabled = std::env::var_os("VICTORY_PIPELINE_HELPERS").is_some_and(|v| v == "1");
+    if enabled && slow_lane_limit() != usize::MAX
+        && std::thread::available_parallelism().is_ok_and(|n| n.get() >= 16)
+    {
+        2
+    } else {
+        0
+    }
+}
+
+fn precache_room() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    // SAFETY: a sized output structure local to this thread.
+    let read = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+    read && status.ullAvailPhys >= 8 << 30 && status.ullAvailPageFile >= 12 << 30
+}
+
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     slow: VecDeque<Arc<Pending>>,
@@ -516,7 +537,7 @@ impl Queue {
             .and_then(|(at, _)| self.requested.remove(at))
             .or_else(|| unclaimed(&mut self.early));
         if p.is_none() && self.slow_now < slow_limit {
-            p = unclaimed(&mut self.slow);
+            p = self.pop_slow();
             if let Some(p) = &p {
                 p.was_slow.store(true, Ordering::Relaxed);
                 self.slow_now += 1;
@@ -526,10 +547,18 @@ impl Queue {
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
+
+    fn pop_slow(&mut self) -> Option<Arc<Pending>> {
+        let p = std::iter::from_fn(|| self.slow.pop_front())
+            .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)?;
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        Some(p)
+    }
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
+static SLOW_AVAILABLE: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -552,6 +581,9 @@ fn start(p: &Arc<Pending>, priority: u8) {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
         AVAILABLE.notify_one();
+        if slow {
+            SLOW_AVAILABLE.notify_all();
+        }
     }
 }
 
@@ -562,6 +594,36 @@ fn next() -> Arc<Pending> {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Helper workers wait independently, so they cannot consume a wakeup for
+/// an on-demand worker. A timed retry only runs with queued work.
+fn next_precache() -> Arc<Pending> {
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if queue.slow.is_empty() {
+            queue = SLOW_AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+            continue;
+        }
+        drop(queue);
+        let room = precache_room();
+        queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if room && let Some(p) = queue.pop_slow() {
+            return p;
+        }
+        if !queue.slow.is_empty() {
+            queue = SLOW_AVAILABLE.wait_timeout(queue, Duration::from_millis(250))
+                .unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+}
+
+fn finish() {
+    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        drained();
+    } else {
+        super::library::save(false);
     }
 }
 
@@ -589,17 +651,33 @@ fn workers() -> bool {
                             queue.slow_now -= 1;
                             AVAILABLE.notify_one();
                         }
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
+                        finish();
                     }
                 });
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
             } else {
                 running = true;
+            }
+        }
+        if running {
+            for i in 0..precache_helpers() {
+                let spawned = std::thread::Builder::new()
+                    .name(format!("victory-pipeline-precache-{i}"))
+                    .spawn(|| {
+                        // SAFETY: a plain call on the current thread.
+                        unsafe {
+                            use windows::Win32::System::Threading::*;
+                            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                        }
+                        loop {
+                            next_precache().make();
+                            finish();
+                        }
+                    });
+                if let Err(error) = spawned {
+                    tracing::warn!(%error, "no speculative pipeline helper");
+                }
             }
         }
         running
@@ -769,20 +847,20 @@ mod tests {
     /// compiles and a draw that requests a pipeline one tick later.
     #[test]
     fn a_demand_job_uses_a_reserved_worker_with_all_output_preserved() {
-        fn replay(classify: bool) -> (u64, u64, Vec<usize>) {
+        fn replay(classify: bool, helpers: usize) -> (u64, u64, Vec<usize>) {
             let jobs: Vec<_> = (0..17).map(|_| Arc::new(Pending::new(Vec::new(), None))).collect();
             let mut queue = Queue::new();
             for p in &jobs[..16] {
                 assert_eq!(queue.push(p, EARLY, classify), Some(true));
             }
-            let mut active = Vec::<(usize, u64)>::new();
+            let mut active = Vec::<(usize, u64, bool)>::new();
             let mut completed = Vec::new();
             let mut demand_completed = 0;
             for tick in 0..1_000 {
                 if tick == 1 {
                     assert_eq!(queue.push(&jobs[16], REQUESTED, false), Some(true));
                 }
-                active.retain(|&(job, end)| {
+                active.retain(|&(job, end, _)| {
                     if end != tick {
                         return true;
                     }
@@ -799,22 +877,28 @@ mod tests {
                     completed.sort_unstable();
                     return (demand_completed - 1, tick, completed);
                 }
-                while active.len() < 8 {
+                while active.iter().filter(|job| !job.2).count() < 8 {
                     let Some(p) = queue.pop(2) else { break };
                     let job = jobs.iter().position(|j| Arc::ptr_eq(j, &p)).unwrap();
-                    active.push((job, tick + if job == 16 { 1 } else { 100 }));
+                    active.push((job, tick + if job == 16 { 1 } else { 100 }, false));
+                }
+                while active.iter().filter(|job| job.2).count() < helpers {
+                    let Some(p) = queue.pop_slow() else { break };
+                    let job = jobs.iter().position(|j| Arc::ptr_eq(j, &p)).unwrap();
+                    active.push((job, tick + 100, true));
                 }
             }
             panic!("synthetic workload did not drain");
         }
 
-        let baseline = replay(false);
-        let candidate = replay(true);
+        let baseline = replay(false, 0);
+        let previous = replay(true, 0);
+        let candidate = replay(true, 2);
         assert_eq!(baseline.2, (0..17).collect::<Vec<_>>());
         assert_eq!(candidate.2, baseline.2);
-        assert_eq!((baseline.0, candidate.0), (100, 1));
-        assert_eq!((baseline.1, candidate.1), (201, 800));
-        eprintln!("demand latency: {} -> {} ticks; total: {} -> {} ticks",
-            baseline.0, candidate.0, baseline.1, candidate.1);
+        assert_eq!((baseline.0, previous.0, candidate.0), (100, 1, 1));
+        assert_eq!((baseline.1, previous.1, candidate.1), (201, 800, 400));
+        eprintln!("quarter cap to helpers: demand {} -> {} ticks; drain {} -> {} ticks",
+            previous.0, candidate.0, previous.1, candidate.1);
     }
 }
