@@ -545,6 +545,18 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+fn submission_fence_passed(completed: u64, value: u64) -> bool {
+    completed != u64::MAX && completed >= value
+}
+
+#[test]
+fn removed_device_fence_cannot_publish_submission_completion() {
+    assert!(!submission_fence_passed(2, 3));
+    assert!(submission_fence_passed(3, 3));
+    assert!(submission_fence_passed(4, 3));
+    assert!(!submission_fence_passed(u64::MAX, 3));
+}
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
@@ -5517,6 +5529,25 @@ impl Host {
         }
     }
 
+    /// A signalled event is not enough: device removal also wakes fence
+    /// events, and a failed wait must not publish completion or readback.
+    fn wait_for_submission(&self, value: u64) -> windows::core::Result<()> {
+        use windows::Win32::Foundation::{E_FAIL, WAIT_OBJECT_0};
+        // SAFETY: the submission lock protects this event and fence value.
+        unsafe {
+            self.fence.SetEventOnCompletion(value, self.event)?;
+            working(false);
+            let waited = WaitForSingleObject(self.event, INFINITE);
+            working(true);
+            let completed = self.fence.GetCompletedValue();
+            if waited != WAIT_OBJECT_0 || !submission_fence_passed(completed, value) {
+                self.device.GetDeviceRemovedReason()?;
+                return Err(E_FAIL.into());
+            }
+        }
+        Ok(())
+    }
+
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
@@ -5673,19 +5704,15 @@ impl Host {
             if flights > 0 {
                 submitting(2, flights);
                 let waiting = std::time::Instant::now();
-                // SAFETY: the fence and event are ours, under the
-                // submission lock; `submitted` is the last value signalled.
-                unsafe {
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            working(false);
-                            WaitForSingleObject(self.event, INFINITE);
-                            stood(waiting);
-                            working(true);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
-                    }
+                if let Err(error) = self.wait_for_submission(*submitted) {
+                    let runs: Vec<_> = items.iter().filter_map(|item| match item {
+                        Late::Run(flight) => Some(flight),
+                        _ => None,
+                    }).flat_map(|flight| flight.order.iter().map(|&i| flight.lists[i].host())).collect();
+                    fail(format_args!("late submission fence {submitted} failed: {error}{}",
+                        self.removal_data(&runs)));
                 }
+                stood(waiting);
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -5963,24 +5990,17 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
+            // SAFETY: closed lists; the fence is ours under the submission lock.
+            let signalled = unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        working(false);
-                        WaitForSingleObject(self.event, INFINITE);
-                        stood(started);
-                        working(true);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
+                self.queue.Signal(&self.fence, *submitted)
+            };
+            if let Err(error) = signalled.and_then(|()| self.wait_for_submission(*submitted)) {
+                fail(format_args!("direct submission fence {submitted} failed: {error}{}{}",
+                    self.removal_data(runs), last_notes(runs)));
             }
+            stood(started);
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
