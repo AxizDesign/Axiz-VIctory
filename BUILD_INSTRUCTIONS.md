@@ -57,3 +57,11 @@ The archived executable and matching PDB are in `target/validated/45049c1b/`.
 Executable SHA-256
 `7624d956a03303582efb98ac7c445d451c87754c2cadd5dc3f8e71f75a684839`.
 The earlier Vertex integration Release remains in `target/validated/f56b50f9/`.
+
+## Streaming stability candidate
+
+Build source `4e0a324d` uses `cargo build --release --locked -p victory`.
+The executable and matching PDB are archived at `target/validated/4e0a324d/`.
+The executable SHA-256 is
+`83ddf8ca33d2c04a5a8e3483aa2f5a97681b74b6cb4af5f28a083252b736f34a`.
+The preceding candidate remains at `target/validated/45049c1b/`.

@@ -134,3 +134,9 @@ scheduling tradeoff. They are neither GPU compile timings nor frame times.
 
 See [RTX queue validation](docs/pipeline-scheduling-integration.md#rtx-queue-validation)
 for submit-to-settle measurements and the hardware byte checks.
+
+## Streaming stability
+
+See [streaming and frame-time stability](docs/streaming-stability.md) for
+generated 128 MiB RTX streaming, queue comparisons, cold and cached PSO
+creation, and the speculative scheduler replay.

@@ -67,3 +67,10 @@ See the [pipeline scheduling integration record](docs/pipeline-scheduling-integr
 for the Belobug and CGBJ archive hashes, public source pins, license review
 and exact authors. The candidate adds slow speculative pipeline scheduling
 and a local-only DXGI pressure query for residency decisions.
+
+## Streaming stability
+
+The [streaming integration record](docs/streaming-stability.md) tracks
+Cool Fox heap-growth backoff (`ab75ac3e`), the new empty-heap reclamation
+policy, and memory-gated speculative PSO helpers. It also records the
+deferred Belobug texture upload prelude and Cool Fox bindless changes.
