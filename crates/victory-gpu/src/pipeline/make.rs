@@ -31,6 +31,7 @@ pub(crate) struct Pending {
     /// Draws and dispatches that asked for it and found it not made: the
     /// workers make the most wanted one first.
     asked: AtomicU64,
+    was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -109,6 +110,7 @@ impl Pending {
             left_out,
             queue_state: AtomicU8::new(NOT_QUEUED),
             asked: AtomicU64::new(0),
+            was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
             key,
             used: AtomicBool::new(false),
@@ -118,7 +120,14 @@ impl Pending {
 
     fn make(&self) {
         let _ = self.begun.set(Instant::now());
-        self.make_with(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.make_with(|| {
+            let began = Instant::now();
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            if made.is_some() {
+                super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            }
+            made
+        });
     }
 
     /// A panic on the way is a pipeline the host does not have: let out, it
@@ -436,8 +445,26 @@ const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
 
+fn worker_count() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+}
+
+/// The maximum number of speculative slow builds that can run at once.
+fn slow_lane_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
+            usize::MAX
+        } else {
+            (worker_count() / 4).max(1)
+        }
+    })
+}
+
 struct Queue {
     early: VecDeque<Arc<Pending>>,
+    slow: VecDeque<Arc<Pending>>,
+    slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
 }
 
@@ -445,13 +472,15 @@ impl Queue {
     const fn new() -> Self {
         Self {
             early: VecDeque::new(),
+            slow: VecDeque::new(),
+            slow_now: 0,
             requested: VecDeque::new(),
         }
     }
 
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
-    fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
+    fn push(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
             return None;
@@ -459,6 +488,8 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED {
             self.requested.push_back(p.clone());
+        } else if slow {
+            self.slow.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
         }
@@ -468,7 +499,7 @@ impl Queue {
     /// The most asked for of the requested ones (the first of equals), then
     /// the early ones in order. In the order of the first request, one that
     /// thousands of draws a frame want waited behind hundreds wanted once.
-    fn pop(&mut self) -> Option<Arc<Pending>> {
+    fn pop(&mut self, slow_limit: usize) -> Option<Arc<Pending>> {
         let mut most: Option<(usize, u64)> = None;
         for (at, p) in self.requested.iter().enumerate() {
             let asked = p.asked.load(Ordering::Relaxed);
@@ -476,11 +507,22 @@ impl Queue {
                 most = Some((at, asked));
             }
         }
-        let p = most.and_then(|(at, _)| self.requested.remove(at)).or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
+        // An early entry can have been promoted and claimed already.
+        let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
+            std::iter::from_fn(|| list.pop_front())
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+        };
+        let mut p = most
+            .and_then(|(at, _)| self.requested.remove(at))
+            .or_else(|| unclaimed(&mut self.early));
+        if p.is_none() && self.slow_now < slow_limit {
+            p = unclaimed(&mut self.slow);
+            if let Some(p) = &p {
+                p.was_slow.store(true, Ordering::Relaxed);
+                self.slow_now += 1;
+            }
+        }
+        let p = p?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -501,8 +543,11 @@ fn start(p: &Arc<Pending>, priority: u8) {
         }
         return;
     }
+    let slow = priority == EARLY
+        && slow_lane_limit() != usize::MAX
+        && super::library::slow(&p.key);
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(new) = queue.push(p, priority) {
+    if let Some(new) = queue.push(p, priority, slow) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
@@ -513,7 +558,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
 fn next() -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
+        if let Some(p) = queue.pop(slow_lane_limit()) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -525,7 +570,7 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = worker_count();
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -537,7 +582,13 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        let p = next();
+                        p.make();
+                        if p.was_slow.load(Ordering::Relaxed) {
+                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                            queue.slow_now -= 1;
+                            AVAILABLE.notify_one();
+                        }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -651,14 +702,14 @@ mod tests {
         let (once, often, also_once, unasked) = (new(1), new(900), new(1), new(0));
         let mut queue = Queue::new();
         for p in [&unasked, &once, &also_once, &often] {
-            assert_eq!(queue.push(p, REQUESTED), Some(true));
+            assert_eq!(queue.push(p, REQUESTED, false), Some(true));
         }
         // More draws ask while it waits.
         also_once.asked.fetch_add(5, Ordering::Relaxed);
         for p in [&often, &also_once, &once, &unasked] {
-            assert!(Arc::ptr_eq(&queue.pop().unwrap(), p));
+            assert!(Arc::ptr_eq(&queue.pop(1).unwrap(), p));
         }
-        assert!(queue.pop().is_none());
+        assert!(queue.pop(1).is_none());
     }
 
     #[test]
@@ -678,16 +729,92 @@ mod tests {
         let requested = Arc::new(Pending::new(Vec::new(), None));
         let mut queue = Queue::new();
 
-        assert_eq!(queue.push(&earlier, EARLY), Some(true));
-        assert_eq!(queue.push(&promoted, EARLY), Some(true));
-        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
-        assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
-        assert_eq!(queue.push(&promoted, REQUESTED), None);
+        assert_eq!(queue.push(&earlier, EARLY, false), Some(true));
+        assert_eq!(queue.push(&promoted, EARLY, false), Some(true));
+        assert_eq!(queue.push(&requested, REQUESTED, false), Some(true));
+        assert_eq!(queue.push(&promoted, REQUESTED, false), Some(false));
+        assert_eq!(queue.push(&promoted, REQUESTED, false), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
-        assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        assert!(Arc::ptr_eq(&queue.pop(1).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(1).unwrap(), &promoted));
+        assert_eq!(queue.push(&promoted, REQUESTED, false), None);
+        assert!(Arc::ptr_eq(&queue.pop(1).unwrap(), &earlier));
+        assert!(queue.pop(1).is_none());
+    }
+
+    #[test]
+    fn pipelines_known_to_take_long_leave_workers_for_the_others() {
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let (long, longer, asked, quick) = (new(), new(), new(), new());
+        let mut queue = Queue::new();
+        for p in [&long, &longer, &asked] {
+            assert_eq!(queue.push(p, EARLY, true), Some(true));
+        }
+        assert_eq!(queue.push(&quick, EARLY, false), Some(true));
+        // The quick one first, then one long one at a time; one a draw asks
+        // for waits for nobody.
+        assert!(Arc::ptr_eq(&queue.pop(1).unwrap(), &quick));
+        assert!(Arc::ptr_eq(&queue.pop(1).unwrap(), &long));
+        assert!(queue.pop(1).is_none());
+        assert_eq!(queue.push(&asked, REQUESTED, true), Some(false));
+        assert!(Arc::ptr_eq(&queue.pop(1).unwrap(), &asked));
+        assert!(!asked.was_slow.load(Ordering::Relaxed));
+        assert!(queue.pop(1).is_none());
+        queue.slow_now -= 1;
+        assert!(Arc::ptr_eq(&queue.pop(1).unwrap(), &longer));
+        assert!(queue.pop(1).is_none());
+    }
+
+    /// A generated workload with eight agents, sixteen slow speculative
+    /// compiles and a draw that requests a pipeline one tick later.
+    #[test]
+    fn a_demand_job_uses_a_reserved_worker_with_all_output_preserved() {
+        fn replay(classify: bool) -> (u64, u64, Vec<usize>) {
+            let jobs: Vec<_> = (0..17).map(|_| Arc::new(Pending::new(Vec::new(), None))).collect();
+            let mut queue = Queue::new();
+            for p in &jobs[..16] {
+                assert_eq!(queue.push(p, EARLY, classify), Some(true));
+            }
+            let mut active = Vec::<(usize, u64)>::new();
+            let mut completed = Vec::new();
+            let mut demand_completed = 0;
+            for tick in 0..1_000 {
+                if tick == 1 {
+                    assert_eq!(queue.push(&jobs[16], REQUESTED, false), Some(true));
+                }
+                active.retain(|&(job, end)| {
+                    if end != tick {
+                        return true;
+                    }
+                    if jobs[job].was_slow.load(Ordering::Relaxed) {
+                        queue.slow_now -= 1;
+                    }
+                    if job == 16 {
+                        demand_completed = tick;
+                    }
+                    completed.push(job);
+                    false
+                });
+                if completed.len() == jobs.len() {
+                    completed.sort_unstable();
+                    return (demand_completed - 1, tick, completed);
+                }
+                while active.len() < 8 {
+                    let Some(p) = queue.pop(2) else { break };
+                    let job = jobs.iter().position(|j| Arc::ptr_eq(j, &p)).unwrap();
+                    active.push((job, tick + if job == 16 { 1 } else { 100 }));
+                }
+            }
+            panic!("synthetic workload did not drain");
+        }
+
+        let baseline = replay(false);
+        let candidate = replay(true);
+        assert_eq!(baseline.2, (0..17).collect::<Vec<_>>());
+        assert_eq!(candidate.2, baseline.2);
+        assert_eq!((baseline.0, candidate.0), (100, 1));
+        assert_eq!((baseline.1, candidate.1), (201, 800));
+        eprintln!("demand latency: {} -> {} ticks; total: {} -> {} ticks",
+            baseline.0, candidate.0, baseline.1, candidate.1);
     }
 }
