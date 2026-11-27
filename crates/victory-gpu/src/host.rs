@@ -9496,13 +9496,14 @@ cbuffer What : register(b0) { uint to; uint from; uint add; uint spin; };
 RWByteAddressBuffer memory : register(u0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
-void main() {
+void main(uint3 group : SV_GroupID) {
+    uint lane_offset = group.x * 65536u;
     uint h = 0u;
     [loop]
     for (uint i = 0u; i < spin; i++) {
-        h = (h ^ memory.Load(from)) * 0x01000193u;
+        h = (h ^ memory.Load(from + lane_offset)) * 0x01000193u;
     }
-    memory.Store(to, memory.Load(from) + add + (h & 0u));
+    memory.Store(to + lane_offset, memory.Load(from + lane_offset) + add + (h & 0u));
 }
 "#;
 
@@ -9529,19 +9530,24 @@ void main() {
             return;
         }
         const PIECE: usize = 64 << 10;
-        const LEN: usize = 4 << 20;
-        const ROUNDS: usize = 12;
+        let streaming = nvidia && std::env::var_os("VICTORY_TEST_STREAMING").is_some_and(|v| v == "1");
+        let (len, rounds, parts, batch) = if streaming {
+            (128 << 20, 48, 16, 6)
+        } else {
+            (4 << 20, 12, 1, 12)
+        };
+
         // "Title memory": write-watched, as the title's is.
         // SAFETY: a plain allocation of our own.
-        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
+        let title = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
         assert!(!title.is_null());
         let dword = |at: usize| unsafe { title.add(at).cast::<u32>() };
-        for i in 0..LEN / 4 {
+        for i in 0..len / 4 {
             // SAFETY: inside the allocation.
             unsafe { dword(i * 4).write_volatile(0x5A00_0000 | i as u32) };
         }
-        crate::shadow::register(0x51_5151, title as u64, LEN as u64);
-        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
+        crate::shadow::register(0x51_5151, title as u64, len as u64);
+        let shadow = crate::shadow::find(title as u64, len as u64).expect("a host copy");
         if !shadow.carded() {
             assert!(!nvidia, "the opt-in test requires a card-backed buffer");
             eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
@@ -9568,17 +9574,21 @@ void main() {
         // shader adds k to it and stores the sum in piece 30+k, a range
         // declared as shader-written. Nothing is waited for between the
         // rounds where submissions are sent ahead.
-        let from = |k: usize| (1 + k) * PIECE + 4 * k + 64;
-        let to = |k: usize| (30 + k) * PIECE + 8 * k + 128;
+        let from = |k: usize| (1 + k * parts) * PIECE + 4 * k + 64;
+        let to = |k: usize| (1 + rounds * parts + k * parts) * PIECE + 8 * k + 128;
         let titles = |k: usize| 0x0100_0000 + 0x1000 * k as u32 + 7;
         let mut lists = Vec::new();
-        let began = std::time::Instant::now();
-        for k in 0..ROUNDS {
+        let mut began = std::time::Instant::now();
+        let mut times = Vec::new();
+        let mut peak_local = 0;
+        for k in 0..rounds {
             // SAFETY: inside the allocation.
-            unsafe { dword(from(k)).write_volatile(titles(k)) };
+            for i in 0..parts {
+                unsafe { dword(from(k) + i * PIECE).write_volatile(titles(k) + i as u32) };
+            }
             let list = host.new_list().expect("a host list");
-            shadow.refresh(&list, title as u64, LEN as u64);
-            shadow.gpu_writes(&list, (title as usize + (30 + k) * PIECE) as u64, PIECE as u64);
+            shadow.refresh(&list, title as u64, len as u64);
+            shadow.gpu_writes(&list, (title as usize + to(k) - to(k) % PIECE) as u64, (parts * PIECE) as u64);
             // SAFETY: an open list; the copy's buffer, with unordered
             // access; the shader's own root signature.
             unsafe {
@@ -9587,7 +9597,7 @@ void main() {
                 let constants = [to(k) as u32, from(k) as u32, k as u32, 30_000];
                 list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
                 list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
-                list.list.Dispatch(1, 1, 1);
+                list.list.Dispatch(parts as u32, 1, 1);
             }
             list.close();
             if late() {
@@ -9596,25 +9606,34 @@ void main() {
                 host.execute(&[&list]);
             }
             lists.push(list);
+            if (k + 1) % batch == 0 {
+                settle_now(WHY_SYNC);
+                times.push(began.elapsed().as_secs_f64() * 1e3);
+                lists.clear();
+                if streaming {
+                    let [_, used] = host.local_video_memory().expect("local memory sample");
+                    peak_local = peak_local.max(used);
+                }
+                began = std::time::Instant::now();
+            }
         }
-        settle_now(WHY_SYNC);
-        let elapsed_ms = began.elapsed().as_secs_f64() * 1e3;
-        eprintln!("queue2_tests: submit to settle for {ROUNDS} rounds: {elapsed_ms:.3} ms");
-        for k in 0..ROUNDS {
-            // SAFETY: inside the allocation.
-            let (sum, kept) = unsafe { (dword(to(k)).read_volatile(), dword(from(k)).read_volatile()) };
-            assert_eq!(kept, titles(k), "round {k}: the title's own dword changed");
-            assert_eq!(
-                sum,
-                titles(k) + k as u32,
-                "round {k}: the shader read {:#x} where the title had written {:#x}, or its write did not come back",
-                sum.wrapping_sub(k as u32),
-                titles(k)
-            );
+        eprintln!("queue2_tests: submit to settle for {batch} rounds per window (ms): {times:?}; peak sampled local {} MiB", peak_local >> 20);
+        for k in 0..rounds {
+            for i in 0..parts {
+                let want = titles(k) + i as u32;
+                // SAFETY: inside the allocation after the batches have settled.
+                let (sum, kept) = unsafe {
+                    (dword(to(k) + i * PIECE).read_volatile(), dword(from(k) + i * PIECE).read_volatile())
+                };
+                assert_eq!(kept, want, "round {k}, part {i}: the title's own dword changed");
+                assert_eq!(sum, want + k as u32, "round {k}, part {i}: upload or readback differed");
+            }
         }
         // Nothing else moved.
-        let touched: std::collections::HashSet<usize> = (0..ROUNDS).flat_map(|k| [from(k), to(k)]).collect();
-        for i in (0..LEN / 4).filter(|i| !touched.contains(&(i * 4))) {
+        let touched: std::collections::HashSet<usize> = (0..rounds)
+            .flat_map(|k| (0..parts).flat_map(move |i| [from(k) + i * PIECE, to(k) + i * PIECE]))
+            .collect();
+        for i in (0..len / 4).filter(|i| !touched.contains(&(i * 4))) {
             // SAFETY: inside the allocation.
             let got = unsafe { dword(i * 4).read_volatile() };
             assert_eq!(got, 0x5A00_0000 | i as u32, "dword {i} of title memory changed");
@@ -9637,7 +9656,7 @@ void main() {
         } else {
             eprintln!("queue2_tests: the direct queue alone (late {}, relay {})", late(), relay());
         }
-        drop(lists);
+
     }
 
     /// `memory[to] = first` at once; then `spin` steps, each a store to
