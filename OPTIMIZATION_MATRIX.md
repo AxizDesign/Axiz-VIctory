@@ -60,3 +60,10 @@ Cool Fox uses asynchronous submission, a copy queue with deferred descriptor pub
 | Axiz-VIctory `887b1c72` | Skip sorting active texture ages when the eviction policy only selects idle textures. Preserve idle order and stable least-recently-used ordering under pressure. |
 | [Linox-IDK/LNX-victory at c04e6159](https://github.com/Linox-IDK/LNX-victory/tree/c04e6159c1452a24afa73e205a52b31bf0e9d24a), GPL-3.0-or-later | A separate low-VRAM NVIDIA reference. Its headline FPS uses a Series S/FSR profile, so that profile was excluded from this fidelity-preserving pass. |
 | [XCL at b49be183](https://github.com/xcl-dev/xcl/tree/b49be1836844fe0b0cdb3211dce3cb7fb4e21ac7), GPL-2.0-only | Separate HLSL-to-DXIL pipeline and offline compute pipelines. Its NVIDIA reference distinguishes 3D gameplay from the menu-inclusive average. Architecture reference only. |
+
+## Pipeline scheduling candidate
+
+See the [pipeline scheduling integration record](docs/pipeline-scheduling-integration.md)
+for the Belobug and CGBJ archive hashes, public source pins, license review
+and exact authors. The candidate adds slow speculative pipeline scheduling
+and a local-only DXGI pressure query for residency decisions.

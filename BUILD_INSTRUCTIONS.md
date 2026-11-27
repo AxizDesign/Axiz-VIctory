@@ -49,3 +49,11 @@ cargo build --release --locked -p victory
 & ./target/release/victory.exe doctor
 cargo test --release --locked --workspace --no-fail-fast -- --test-threads=1
 ```
+
+## Pipeline scheduling candidate
+
+Source `45049c1b` builds with `cargo build --release --locked -p victory`.
+The archived executable and matching PDB are in `target/validated/45049c1b/`.
+Executable SHA-256
+`7624d956a03303582efb98ac7c445d451c87754c2cadd5dc3f8e71f75a684839`.
+The earlier Vertex integration Release remains in `target/validated/f56b50f9/`.

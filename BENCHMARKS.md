@@ -121,3 +121,16 @@ structure and takes a separate branch only for contiguous linear planes. The
 padded cases moved slightly in this run. The measured gains apply to these
 synthetic CPU copies. Gameplay frame time, queue overlap and residency have
 no comparable measurements in this table.
+
+## Pipeline scheduling candidate (2026-11-27)
+
+The generated scheduler replay uses the production queue, eight simulated
+workers, sixteen speculative jobs at 100 virtual ticks each and one
+one-tick demand job submitted on tick 1. With the previous FIFO precache
+policy the demand job completed 100 ticks after request. With the slow lane
+it completed in one tick. Total drain time was 201 versus 800 ticks. Both
+runs completed the exact same jobs. These controlled ticks measure the
+scheduling tradeoff. They are neither GPU compile timings nor frame times.
+
+See [RTX queue validation](docs/pipeline-scheduling-integration.md#rtx-queue-validation)
+for submit-to-settle measurements and the hardware byte checks.
