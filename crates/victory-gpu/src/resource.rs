@@ -1927,8 +1927,15 @@ pub(crate) fn let_go_idle() {
     // rest, and runs g14 and g15 let go 85,000 and 101,000 of them (g12:
     // 36,000), many made again moments later (fxceless issue 1080 sees the
     // same on a card that is really full: surfaces that flash black).
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.local_video_memory()).map(|[budget, used]| {
-        [budget, used.saturating_sub(HEAP_FREE.load(Relaxed))]
+    let budget = crate::host::host().and_then(|h| h.local_video_memory());
+    let free = HEAP_FREE.load(Relaxed);
+    if free != 0
+        && budget.is_some_and(|[budget, used]| budget != 0 && used >= budget.saturating_sub(budget / 10))
+    {
+        trim_empty_heaps();
+    }
+    let idle_ms = crate::host::vram_idle_ms(budget.map(|[budget, used]| {
+        [budget, used.saturating_sub(free)]
     }));
     // `VICTORY_TEXTURE_IDLE_MS`: the rest before a copy is let go while the
     // card is under 75 % of its budget (5,000 unless set); a half of it from
@@ -2357,6 +2364,60 @@ unsafe impl Send for TextureHeap {}
 #[cfg(windows)]
 static TEXTURE_HEAPS: std::sync::Mutex<Vec<Option<TextureHeap>>> = std::sync::Mutex::new(Vec::new());
 
+/// Cool Fox's refused-growth backoff (ab75ac3e), scoped to the two
+/// alignment classes. Existing placed ranges bypass it.
+#[cfg(windows)]
+#[derive(Default)]
+struct HeapGrowth {
+    retry_at: u64,
+}
+
+#[cfg(windows)]
+impl HeapGrowth {
+    fn grow<T>(&mut self, now: u64, make: impl FnOnce() -> Option<T>) -> Option<T> {
+        if now < self.retry_at {
+            return None;
+        }
+        let block = make();
+        if block.is_none() {
+            self.retry_at = now.saturating_add(500);
+        }
+        block
+    }
+}
+
+/// Takes only completely free heaps. The caller drops the COM objects
+/// after releasing the heap table lock.
+#[cfg(windows)]
+fn trim_empty_heaps() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Relaxed);
+    if now.saturating_sub(last) < 250
+        || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err()
+    {
+        return;
+    }
+    let gone = {
+        let mut heaps = TEXTURE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gone = Vec::new();
+        for slot in heaps.iter_mut() {
+            if let Some(heap) = slot.as_ref() {
+                let size = texture_heap(heap.align);
+                if heap.ranges.room() == size {
+                    HEAP_FREE.fetch_sub(size, Relaxed);
+                    HEAPED[1].fetch_add(1, Relaxed);
+                    gone.extend(slot.take());
+                }
+            }
+        }
+        gone
+    };
+    drop(gone);
+}
+
 /// Since the start: heaps made, heaps given back, textures placed in them
 /// and of those the ones on 4 KiB; now: textures let go that something
 /// still holds.
@@ -2542,14 +2603,21 @@ fn heaped_texture(
                     Alignment: 0,
                     Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
                 };
-                let mut made: Option<ID3D12Heap> = None;
-                // SAFETY: plain creation of a heap; the out pointer is ours.
-                if let Err(e) = unsafe { host.device.CreateHeap(&raw const heap_desc, &raw mut made) } {
-                    tracing::warn!(error = %e, heaps = heaps.len(), "no heap for plain textures");
-                    return None;
-                }
+                static GROWTH: std::sync::Mutex<[HeapGrowth; 2]> =
+                    std::sync::Mutex::new([HeapGrowth { retry_at: 0 }, HeapGrowth { retry_at: 0 }]);
+                let mut growth = GROWTH.lock().unwrap_or_else(|e| e.into_inner());
+                let heap = growth[usize::from(align == PLAIN)].grow(crate::host::now_ms(), || {
+                    let mut made: Option<ID3D12Heap> = None;
+                    // SAFETY: plain creation of a heap; the out pointer is ours.
+                    if let Err(e) = unsafe { host.device.CreateHeap(&raw const heap_desc, &raw mut made) } {
+                        tracing::warn!(error = %e, heaps = heaps.len(), "no heap for plain textures");
+                        return None;
+                    }
+                    made
+                })?;
+                drop(growth);
                 let mut fresh = TextureHeap {
-                    heap: made?,
+                    heap,
                     align,
                     ranges: crate::ranges::Ranges::new(size),
                 };
@@ -3850,6 +3918,20 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_texture_heap_growth_is_retried_once_after_half_a_second() {
+        let mut growth = super::HeapGrowth::default();
+        let calls = std::cell::Cell::new(0);
+        let refuse = || { calls.set(calls.get() + 1); None::<u32> };
+        for now in [12, 13, 14, 200, 511] {
+            assert_eq!(growth.grow(now, refuse), None);
+        }
+        assert_eq!(calls.get(), 1);
+        assert_eq!(growth.grow(512, || Some(9)), Some(9));
+        assert_eq!(growth.grow(513, || Some(10)), Some(10));
     }
 
     #[test]
