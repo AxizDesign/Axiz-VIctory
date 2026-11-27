@@ -619,29 +619,64 @@ impl TextureQueue {
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
-        }
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+    fn due_with_census(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+        let mut retry = Vec::new();
+        let mut fresh = Vec::new();
+        let mut counts = [self.slots.len() as u64, 0, 0, 0, 0];
+        for (&slot, waiting) in &self.slots {
+            if waiting.mapped > 0 {
+                counts[3] += 1;
+            } else if waiting.looks > 0 {
+                counts[2] += 1;
+            }
+            if waiting.due <= frame {
+                counts[1] += 1;
+                counts[4] = counts[4].max(frame.saturating_sub(waiting.written));
+                if max > 0 {
+                    let entries = if waiting.looks > 0 || waiting.mapped > 0 { &mut retry } else { &mut fresh };
+                    entries.push((slot, waiting.write));
+                }
             }
         }
-        order.truncate(max);
-        order
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        if max < retry.len() {
+            retry.select_nth_unstable_by(max, newest_first);
+            retry.truncate(max);
+        }
+        retry.sort_unstable_by(newest_first);
+
+        // Order only the fresh writes that will be served. Partition the
+        // newest prefix first, then take the oldest suffix of what remains.
+        let take = (max - retry.len()).min(fresh.len());
+        if take == 0 {
+            return (retry, counts);
+        }
+        let newest_count = take.div_ceil(2);
+        let oldest_count = take / 2;
+        if newest_count < fresh.len() {
+            fresh.select_nth_unstable_by(newest_count, newest_first);
+        }
+        let (newest, rest) = fresh.split_at_mut(newest_count);
+        let split = rest.len() - oldest_count;
+        if oldest_count > 0 && split > 0 {
+            rest.select_nth_unstable_by(split, newest_first);
+        }
+        let oldest = &mut rest[split..];
+        newest.sort_unstable_by(newest_first);
+        oldest.sort_unstable_by(newest_first);
+        retry.reserve(take);
+        for (i, &entry) in newest.iter().enumerate() {
+            retry.push(entry);
+            if i < oldest_count {
+                retry.push(oldest[oldest_count - 1 - i]);
+            }
+        }
+        (retry, counts)
+    }
+
+    #[cfg(test)]
+    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.due_with_census(frame, max).0
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -739,23 +774,9 @@ impl TextureQueue {
         self.slots.get(&index).map_or(0, |w| w.mapped)
     }
 
-    /// For the frame line: slots in the queue; of them due at `frame`;
-    /// waiting for their memory (looked at, never uploaded); uploaded in
-    /// part; and the frames the oldest due one has waited since its write.
+    #[cfg(test)]
     fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
-        for w in self.slots.values() {
-            if w.mapped > 0 {
-                c[3] += 1;
-            } else if w.looks > 0 {
-                c[2] += 1;
-            }
-            if w.due <= frame {
-                c[1] += 1;
-                c[4] = c[4].max(frame.saturating_sub(w.written));
-            }
-        }
-        c
+        self.due_with_census(frame, 0).1
     }
 }
 
@@ -1229,11 +1250,11 @@ impl HostHeap {
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
     /// with its write number, in the order to serve them
-    /// ([`TextureQueue::due`]), and the queue's counts
-    /// ([`TextureQueue::census`]).
+    /// ([`TextureQueue::due_with_census`]), and the queue's counts
+    /// for the frame log.
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        textures.due_with_census(frame, max)
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -4900,6 +4921,98 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
 
     /// Memory the runtime maps under a slot's texture makes the slot due
     /// again from the next frame; a stale slot leaves the queue.
+    #[test]
+    fn bounded_texture_selection_preserves_the_full_queue_order() {
+        let mut queue = TextureQueue::default();
+        for i in 0..257 {
+            let slot = (i * 109) % 257;
+            queue.written(slot, i as u64 % 7, i as u64 % 13, false);
+            let write = queue.writes;
+            match i % 5 {
+                0 => queue.later(slot, write, i as u64 % 11, 8),
+                1 => queue.partly(slot, write, i as u64 % 9, 256),
+                2 => queue.hold(slot, write, 20),
+                _ => {}
+            }
+        }
+        queue.changed(3, 4, 5);
+        queue.room(10);
+
+        for frame in [0, 3, 9, 20] {
+            let mut ordered: Vec<_> = queue.slots.iter().filter(|(_, entry)| entry.due <= frame).collect();
+            ordered.sort_unstable_by_key(|(_, entry)| std::cmp::Reverse(entry.write));
+            let (retry, fresh): (Vec<_>, Vec<_>) =
+                ordered.into_iter().partition(|(_, entry)| entry.looks > 0 || entry.mapped > 0);
+            let mut expected: Vec<_> = retry.iter().map(|&(&slot, entry)| (slot, entry.write)).collect();
+            let mut fresh: std::collections::VecDeque<_> = fresh.into();
+            while let Some((&slot, entry)) = fresh.pop_front() {
+                expected.push((slot, entry.write));
+                if let Some((&slot, entry)) = fresh.pop_back() {
+                    expected.push((slot, entry.write));
+                }
+            }
+            for quota in [0, 1, 2, 3, 16, 64, 127, 200, 257, 300] {
+                let (due, census) = queue.due_with_census(frame, quota);
+                assert_eq!(due, expected[..quota.min(expected.len())], "frame {frame}, quota {quota}");
+                assert_eq!(census[1] as usize, expected.len());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "generated CPU streaming profile"]
+    fn generated_cpu_streaming_profile() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SLOTS: u32 = 15_897;
+        const AWAITING: u32 = 13_877;
+        const CHANGES: u32 = 372;
+        const FRAMES: u64 = 120;
+        const QUOTA: usize = 4096;
+        let mut queue = TextureQueue::default();
+        for i in 0..SLOTS {
+            let slot = (i * 7919) % SLOTS;
+            queue.written(slot, 0, 0, false);
+            if i < AWAITING {
+                queue.later(slot, queue.writes, i as u64 % 8, 16);
+            }
+        }
+        assert_eq!(queue.census(0)[2], AWAITING as u64);
+
+        let mut times = Vec::new();
+        let (mut update, mut select) = (0, 0);
+        let mut checksum = 0u64;
+        for frame in 1..=FRAMES + 12 {
+            let start = Instant::now();
+            for i in 0..CHANGES {
+                let slot = ((frame as u32 * CHANGES + i) * 7919) % SLOTS;
+                queue.changed(slot, frame, frame + 1);
+            }
+            let after_updates = Instant::now();
+            let (due, census) = queue.due_with_census(frame, QUOTA);
+            let after_select = Instant::now();
+            let served = due.iter().take(372);
+            for &(slot, write) in served {
+                checksum = checksum.wrapping_mul(31).wrapping_add(write ^ u64::from(slot));
+                queue.later(slot, write, frame, 16);
+            }
+            black_box(census);
+            if frame > 12 {
+                times.push(start.elapsed().as_nanos());
+                update += (after_updates - start).as_nanos();
+                select += (after_select - after_updates).as_nanos();
+            }
+        }
+        times.sort_unstable();
+        let stats = |rank: usize| times[rank - 1] as f64 / 1e6;
+        println!(
+            "cpu_streaming slots={SLOTS} changes/frame={CHANGES} frames={FRAMES} checksum={checksum} total_ms={:.3} p95_ms={:.3} p99_ms={:.3} updates_ms={:.3} selection_ms={:.3}",
+            times.iter().sum::<u128>() as f64 / 1e6,
+            stats(114), stats(119), update as f64 / 1e6, select as f64 / 1e6,
+        );
+    }
+
     #[test]
     fn remapped_memory_makes_its_texture_slots_due() {
         let Some(heap) = HostHeap::new(false, 8) else {
