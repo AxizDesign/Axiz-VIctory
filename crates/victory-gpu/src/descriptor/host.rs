@@ -3084,6 +3084,10 @@ fn buffer_uav(
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
+    if !raw && desc.Format != DXGI_FORMAT_UNKNOWN && !supports_typed_uav(desc.Format) {
+        left_null("unsupported typed UAV format", true, address, len, element, first);
+        return None;
+    }
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let why = if raw { "raw, refused by the host" } else { "refused by the host" };
@@ -3108,6 +3112,40 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+fn supports_typed_uav(format: DXGI_FORMAT) -> bool {
+    static CACHE: std::sync::LazyLock<Mutex<HashMap<i32, bool>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    if let Some(&supported) = CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&format.0)
+    {
+        return supported;
+    }
+    let supported = host().is_some_and(|h| {
+        let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: query writes its own `D3D12_FEATURE_DATA_FORMAT_SUPPORT` struct.
+        let ok = unsafe {
+            h.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut data).cast(),
+                    size_of_val(&data) as u32,
+                )
+                .is_ok()
+        };
+        ok && data.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(format.0, supported);
+    supported
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -3126,7 +3164,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         d.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
     };
     let own = d.Format.0 as u32;
-    if !allowed || DEPTH_FORMATS.iter().any(|&(typed, _)| typed == own) {
+    if !allowed || (unordered && d.SampleDesc.Count != 1) || DEPTH_FORMATS.iter().any(|&(typed, _)| typed == own) {
         if unordered {
             crate::resource::DEPTH_UNORDERED[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -3150,7 +3188,11 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        return !typeless && (!unordered || supports_typed_uav(d.Format));
+    }
+    if unordered && family(view) == view && family(view + 1) == view {
+        once!(view, own, "typeless format in texture UAV descriptor");
+        return false;
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
@@ -3158,7 +3200,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         if let Some(format) = format {
             *format = d.Format;
         }
-        return true;
+        return !unordered || supports_typed_uav(d.Format);
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
@@ -3168,6 +3210,11 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         && !typeless
     {
         *format = d.Format;
+    }
+    let resolved = if typeless { DXGI_FORMAT(view as i32) } else { d.Format };
+    if unordered && !supports_typed_uav(resolved) {
+        once!(format = resolved.0, "unsupported typed texture UAV format");
+        return false;
     }
     true
 }
@@ -4360,6 +4407,34 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         unsafe { host.device.CreateShaderResourceView(texture, None, heap.cpu(0)) };
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn typeless_texture_uav_is_rejected_before_a_driver_call() {
+        let host = host().expect("a D3D12 device");
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16, Height: 16, DepthOrArraySize: 1, MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: standalone synthetic texture with a legal heap and resource description.
+        unsafe { host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COMMON, None, &mut texture) }.unwrap();
+        let texture = texture.unwrap();
+        let mut typed = DXGI_FORMAT_R8G8B8A8_UNORM;
+        assert!(fits(&texture, Some(&mut typed), true));
+        let mut typeless = desc.Format;
+        assert!(!fits(&texture, Some(&mut typeless), true), "a typeless UAV reached the driver-facing path");
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
