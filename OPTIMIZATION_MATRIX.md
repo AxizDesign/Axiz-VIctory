@@ -81,3 +81,17 @@ deferred Belobug texture upload prelude and Cool Fox bindless changes.
 D3D12 pipeline library. `af2be548` keeps it opt-in after the single-request
 control. See [mixed-frame results](docs/mixed-frame-latency.md). This change
 uses no newly imported fork implementation.
+
+## D3D12 runtime stability
+
+- Ported fever308's cached UAV capability query from
+  `28f070b5f27af419d96abb91933a176f65d0627d` (GPL-3.0-or-later). The NVIDIA
+  fixture confirmed that the old path accepted a typeless texture UAV.
+  The fixed path rejects it before descriptor creation and accepts the
+  matching supported typed view.
+- Ported FictionHub's first-uncompleted breadcrumb formatter and test
+  from `787c7b43a7ed8664f4bd92a30b96066ce5eddd88` (GPL-3.0-or-later).
+- Axiz changes enable full state and synchronized queue validation when GBV
+  is requested and check direct fence completion before publishing results.
+  Neither the observed device hang nor the preceding over-limit descriptor
+  access has been reproduced with the generated workloads.

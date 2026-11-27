@@ -73,3 +73,32 @@ The executable and matching PDB are under `target/validated/af2be548/`.
 Executable SHA-256
 `1ac1287f69277b3a09161d72b9d75bf9bb6410b2c7c4f097305bd2b108ebba53`.
 The previous `target/validated/4e0a324d/` Release is preserved.
+
+## D3D12 stability candidate
+
+Build from the current checkout with `cargo build --release --locked -p victory`.
+The relocation to `C:\Games\GTA6\Axiz-VIctory` requires no source-path override.
+Put generated reports and title files outside this checkout.
+
+For D3D12 debug-layer and GPU-based validation, install the official Windows
+Graphics Tools optional feature from an administrator PowerShell.
+
+```powershell
+Add-WindowsCapability -Online -Name "Tools.Graphics.DirectX~~~~0.0.1.0"
+```
+
+The Rust toolchain, MSVC linker and Windows SDK suffice for Release and
+diagnostics builds. Cargo fetches the Rust dependencies from the lockfile.
+Use an isolated test process so DRED and validation are requested before
+D3D12 creates its first device.
+
+```powershell
+$env:VICTORY_D3D12_NVIDIA = '1'
+$env:VICTORY_D3D12_DRED = '1'
+$env:VICTORY_D3D12_GBV = '1'
+cargo test --profile diag --locked -p victory-gpu --features diagnostics descriptor::host::tests -- --test-threads=1 --nocapture
+```
+
+The local Release is archived at target/validated/8d4a69f7/victory.exe
+with its PDB. The diagnostics executable is at target/stability/diag/victory.exe.
+The prior target/validated/af2be548 archive remains available.
