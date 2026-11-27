@@ -593,42 +593,42 @@ fn create() -> windows::core::Result<Host> {
     crate::spread::start();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
-        // The debug layer only in builds with diagnostics.
-        let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+        let gbv = cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_D3D12_GBV").is_some_and(|v| v != "0");
+        let debug = gbv || cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_D3D12_DEBUG").is_some_and(|v| v != "0");
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
-                Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
-                Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
-            }
-            // GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range
-            // descriptor heap indices and the like become messages naming
-            // the command instead of page faults. Without state tracking
-            // (directly indexed textures are not transitioned).
-            if std::env::var_os("VICTORY_D3D12_GBV").is_some()
-                && let Some(l) = &layer
-            {
-                if let Ok(d1) = l.cast::<ID3D12Debug1>() {
-                    d1.SetEnableGPUBasedValidation(true);
+                Ok(()) => {
+                    if let Some(layer) = layer {
+                        layer.EnableDebugLayer();
+                        if gbv {
+                            match layer.cast::<ID3D12Debug1>() {
+                                Ok(validation) => {
+                                    validation.SetEnableGPUBasedValidation(true);
+                                    validation.SetEnableSynchronizedCommandQueueValidation(true);
+                                    tracing::info!("full GPU-based and synchronized queue validation enabled");
+                                }
+                                Err(error) => tracing::warn!(%error, "GPU-based validation interface unavailable"),
+                            }
+                        }
+                    }
                 }
-                if let Ok(d2) = l.cast::<ID3D12Debug2>() {
-                    d2.SetGPUBasedValidationFlags(
-                        D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING,
-                    );
-                }
-                tracing::info!("GPU-based validation on");
+                Err(error) => tracing::warn!(%error, "D3D12 debug layer unavailable; check Windows Graphics Tools"),
             }
         }
-        // Diagnostics: device-removed data (the command that faulted, the
-        // faulting address), read when the device is removed.
         if dred_on() {
-            let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
-                && let Some(dred) = dred
-            {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            let mut settings: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
+            match D3D12GetDebugInterface(&mut settings) {
+                Ok(()) => {
+                    if let Some(settings) = settings {
+                        settings.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        settings.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        tracing::info!("DRED breadcrumbs and page faults requested before device creation");
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "DRED settings unavailable before device creation"),
             }
         }
         let mut device: Option<ID3D12Device> = None;
@@ -1384,7 +1384,7 @@ fn record_twin_copy(
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|v| v != "0")
     })
 }
 
@@ -6161,10 +6161,9 @@ impl Host {
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
                     let history =
                         std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
-                    text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
-                    ));
+                    if let Some(line) = stopped_command(history, done, p.BreadcrumbCount) {
+                        text.push_str(&line);
+                    }
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
                     // The k-th marker command is the k-th note.
@@ -9189,6 +9188,67 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
 /// barriers overlaps on the GPU), by kind, and what the markers just
 /// before them say (`HostList::note_op`: diagnostics builds with
 /// device-removed data on).
+/// The stop line for a list with `done` breadcrumbs completed. Microsoft
+/// documents `pLastBreadcrumbValue` as the *number* of completed ops: the
+/// last one that finished is at `done - 1`, and `history[done]` is the
+/// first that had not completed. The old "stopped at command {done} of
+/// {count}" read as one-based numbering and was taken to name the last
+/// completed command, so say both explicitly, with zero-based indices.
+/// `None` when the runtime reports no such command in `history`.
+fn stopped_command(
+    history: &[D3D12_AUTO_BREADCRUMB_OP],
+    done: u32,
+    count: u32,
+) -> Option<String> {
+    if done >= count || done as usize >= history.len() {
+        return None;
+    }
+    let op = history[done as usize].0;
+    Some(if done == 0 {
+        format!("; no command completed of {count}; the first uncompleted is command index 0 (op {op})")
+    } else {
+        let last = done - 1;
+        let last_op = history[last as usize].0;
+        format!(
+            "; {done} of {count} commands completed, last at index {last} (op {last_op}); the first uncompleted is command index {done} (op {op})"
+        )
+    })
+}
+
+#[cfg(test)]
+mod breadcrumbs {
+    use super::stopped_command;
+    use windows::Win32::Graphics::Direct3D12::D3D12_AUTO_BREADCRUMB_OP;
+
+    /// The op named is the first one that had *not* completed, at a
+    /// zero-based index. This holds when none ran and when the last
+    /// breadcrumb is the one that stopped the list.
+    #[test]
+    fn the_named_op_is_the_first_command_that_had_not_completed() {
+        let op = D3D12_AUTO_BREADCRUMB_OP;
+        let history = [op(46), op(3), op(15), op(6)];
+
+        assert_eq!(
+            stopped_command(&history, 0, 4).as_deref(),
+            Some("; no command completed of 4; the first uncompleted is command index 0 (op 46)")
+        );
+        assert_eq!(
+            stopped_command(&history, 1, 4).as_deref(),
+            Some("; 1 of 4 commands completed, last at index 0 (op 46); the first uncompleted is command index 1 (op 3)")
+        );
+        assert_eq!(
+            stopped_command(&history, 3, 4).as_deref(),
+            Some("; 3 of 4 commands completed, last at index 2 (op 15); the first uncompleted is command index 3 (op 6)")
+        );
+
+        // A finished list has no stop command; nor does a driver that
+        // reports more breadcrumbs than it handed us, or u32::MAX.
+        assert_eq!(stopped_command(&history, 4, 4), None);
+        assert_eq!(stopped_command(&history, 4, 8), None);
+        assert_eq!(stopped_command(&history, u32::MAX, 4), None);
+    }
+}
+
 fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
     let barrier = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
     let from = history[..done].iter().rposition(barrier).map_or(0, |b| b + 1);
