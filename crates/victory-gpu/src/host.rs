@@ -120,11 +120,11 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
-pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
+pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 2]>) -> u64 {
     const NORMAL_MS: u64 = 5_000;
     const MODERATE_MS: u64 = 2_500;
     const HIGH_MS: u64 = 1_000;
-    let Some([budget, used, ..]) = video_memory else {
+    let Some([budget, used]) = video_memory else {
         return NORMAL_MS;
     };
     if budget == 0 {
@@ -8996,13 +8996,23 @@ impl Host {
         groups
     }
 
+    /// Residency decisions need only the dedicated segment. A failure to
+    /// query the shared segment must not hide valid local pressure.
+    pub(crate) fn local_video_memory(&self) -> Option<[u64; 2]> {
+        self.query_video_memory(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)
+            .map(|info| [info.Budget, info.CurrentUsage])
+    }
+
+    fn query_video_memory(&self, segment: DXGI_MEMORY_SEGMENT_GROUP) -> Option<DXGI_QUERY_VIDEO_MEMORY_INFO> {
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: DXGI writes the result to the live structure.
+        unsafe { self.adapter.as_ref()?.QueryVideoMemoryInfo(0, segment, &mut info) }.ok()?;
+        Some(info)
+    }
+
     fn query_video_memory_groups(&self) -> [Option<DXGI_QUERY_VIDEO_MEMORY_INFO>; 2] {
-        [DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL].map(|segment| {
-            let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-            // SAFETY: DXGI writes the result to the live structure.
-            unsafe { self.adapter.as_ref()?.QueryVideoMemoryInfo(0, segment, &mut info) }.ok()?;
-            Some(info)
-        })
+        [DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL]
+            .map(|segment| self.query_video_memory(segment))
     }
 
     /// Both of the system's memory groups for this process, in bytes: for
@@ -9429,18 +9439,18 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         use super::vram_idle_ms;
         let gib = 1024 * 1024 * 1024;
         // Normal (< 75%)
-        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib])), 5_000);
+        assert_eq!(vram_idle_ms(Some([100, 74])), 5_000);
         // Moderate (75%..85%)
-        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
-        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
+        assert_eq!(vram_idle_ms(Some([100, 75])), 2_500);
+        assert_eq!(vram_idle_ms(Some([100, 84])), 2_500);
         // High (>= 85%, including over-budget)
-        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
+        assert_eq!(vram_idle_ms(Some([100, 85])), 1_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib])), 1_000);
         // Missing or zero budget falls back to normal
         assert_eq!(vram_idle_ms(None), 5_000);
-        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([0, 100])), 5_000);
     }
 
     #[test]
@@ -9497,21 +9507,25 @@ void main() {
 "#;
 
     #[test]
-    fn warp_title_bytes_go_up_and_shader_writes_come_back_whatever_the_queues() {
+    fn title_bytes_go_up_and_shader_writes_come_back_whatever_the_queues() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let nvidia = std::env::var_os("VICTORY_TEST_NVIDIA_QUEUES").is_some_and(|v| v == "1");
         let Some(host) = host() else {
+            assert!(!nvidia, "the opt-in NVIDIA test requires a usable device");
             return;
         };
-        // Never on a real card.
-        // SAFETY: a plain query.
-        let software = host
-            .adapter
-            .as_ref()
-            .and_then(|a| unsafe { a.GetDesc1() }.ok())
-            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
-        if !software {
-            eprintln!("queue2_tests: skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
+        // SAFETY: plain queries on the adapter and device.
+        let desc = host.adapter.as_ref().and_then(|a| unsafe { a.GetDesc1() }.ok());
+        if nvidia {
+            assert!(desc.is_some_and(|d| d.VendorId == 0x10de
+                && d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0),
+                "the opt-in NVIDIA test requires VICTORY_D3D12_NVIDIA=1 and a hardware NVIDIA device");
+            let [budget, used] = host.local_video_memory().expect("a DXGI local-memory sample");
+            assert!(budget > 0, "a non-zero local GPU budget");
+            eprintln!("queue2_tests: local budget {} MiB, used {} MiB before the workload", budget >> 20, used >> 20);
+        } else if !desc.is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+            eprintln!("queue2_tests: skipped, use VICTORY_D3D12_WARP=1 with diagnostics");
             return;
         }
         const PIECE: usize = 64 << 10;
@@ -9529,6 +9543,7 @@ void main() {
         crate::shadow::register(0x51_5151, title as u64, LEN as u64);
         let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
         if !shadow.carded() {
+            assert!(!nvidia, "the opt-in test requires a card-backed buffer");
             eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
             return;
         }
@@ -9557,6 +9572,7 @@ void main() {
         let to = |k: usize| (30 + k) * PIECE + 8 * k + 128;
         let titles = |k: usize| 0x0100_0000 + 0x1000 * k as u32 + 7;
         let mut lists = Vec::new();
+        let began = std::time::Instant::now();
         for k in 0..ROUNDS {
             // SAFETY: inside the allocation.
             unsafe { dword(from(k)).write_volatile(titles(k)) };
@@ -9582,6 +9598,8 @@ void main() {
             lists.push(list);
         }
         settle_now(WHY_SYNC);
+        let elapsed_ms = began.elapsed().as_secs_f64() * 1e3;
+        eprintln!("queue2_tests: submit to settle for {ROUNDS} rounds: {elapsed_ms:.3} ms");
         for k in 0..ROUNDS {
             // SAFETY: inside the allocation.
             let (sum, kept) = unsafe { (dword(to(k)).read_volatile(), dword(from(k)).read_volatile()) };

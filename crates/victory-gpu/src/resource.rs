@@ -1573,12 +1573,12 @@ pub(crate) fn room() -> bool {
     // Placed textures nothing holds any more give their ranges back here
     // too: with no room nothing is placed, which is where else it is done.
     sweep_leaving(false);
-    match crate::host::host().and_then(|h| h.video_memory()) {
+    match crate::host::host().and_then(|h| h.local_video_memory()) {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
+        Some([budget, used]) => {
             // What is free in the heaps of plain textures is room, though
             // the system counts it as in use.
             let used = used.saturating_sub(HEAP_FREE.load(Relaxed));
@@ -1927,8 +1927,8 @@ pub(crate) fn let_go_idle() {
     // rest, and runs g14 and g15 let go 85,000 and 101,000 of them (g12:
     // 36,000), many made again moments later (fxceless issue 1080 sees the
     // same on a card that is really full: surfaces that flash black).
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()).map(|[budget, used, a, b]| {
-        [budget, used.saturating_sub(HEAP_FREE.load(Relaxed)), a, b]
+    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.local_video_memory()).map(|[budget, used]| {
+        [budget, used.saturating_sub(HEAP_FREE.load(Relaxed))]
     }));
     // `VICTORY_TEXTURE_IDLE_MS`: the rest before a copy is let go while the
     // card is under 75 % of its budget (5,000 unless set); a half of it from
@@ -2528,7 +2528,7 @@ fn heaped_texture(
                 let size = texture_heap(align);
                 // Not past the line the texture queue keeps: the caller
                 // makes a committed texture then.
-                if let Some([budget, used, ..]) = host.video_memory()
+                if let Some([budget, used]) = host.local_video_memory()
                     && used + size > budget / 100 * 97
                 {
                     return None;

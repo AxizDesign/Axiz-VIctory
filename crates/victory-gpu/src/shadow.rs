@@ -317,7 +317,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
     let hundredths = if card_room_kept_on() { 97 } else { 80 };
-    if let Some([budget, used, ..]) = host.video_memory()
+    if let Some([budget, used]) = host.local_video_memory()
         && used + size > budget / 100 * hundredths
     {
         // Said, with the numbers it was decided by: run 193 made 31 copies
@@ -392,7 +392,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    if let Some([budget, used, ..]) = host.video_memory()
+    if let Some([budget, used]) = host.local_video_memory()
         && used + size > budget / 10 * 8
     {
         return None;
