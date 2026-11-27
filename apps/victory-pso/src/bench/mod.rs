@@ -8,6 +8,7 @@
 
 mod draws;
 mod gpu;
+mod mixed;
 mod pipelines;
 mod present;
 mod resources;
@@ -43,6 +44,8 @@ pub enum Group {
     Pipelines,
     /// Resource, view and barrier costs.
     Resources,
+    /// Generated streaming, compute, graphics and concurrent PSO demand.
+    Mixed,
     /// A swap chain. Opens a small window for a few seconds, so it only
     /// runs when asked for by name.
     Present,
@@ -87,6 +90,7 @@ pub struct Stat {
     pub min: f64,
     pub median: f64,
     pub p95: f64,
+    pub p99: f64,
 }
 
 impl Stat {
@@ -104,6 +108,7 @@ impl Stat {
                 (v[v.len() / 2 - 1] + v[v.len() / 2]) / 2.0
             }),
             p95: round(v[p95]),
+            p99: round(v[(v.len() * 99).div_ceil(100) - 1]),
         })
     }
 }
@@ -451,18 +456,19 @@ pub fn run(o: &Options) -> Result<()> {
         "gpu idle",
         "wall/each"
     );
-    let groups: [(Group, &str, fn(&mut Bench) -> Result<()>); 6] = [
+    let groups: [(Group, &str, fn(&mut Bench) -> Result<()>); 7] = [
         (Group::Draws, "draws", draws::run),
         (Group::Upload, "upload", upload::run),
         (Group::Sync, "sync", sync::run),
         (Group::Pipelines, "pipelines", pipelines::run),
         (Group::Resources, "resources", resources::run),
+        (Group::Mixed, "mixed", mixed::run),
         (Group::Present, "present", present::run),
     ];
     let mut failed = None;
     for (group, name, run) in groups {
         let wanted = if o.only.is_empty() {
-            group != Group::Present
+            !matches!(group, Group::Present | Group::Mixed)
         } else {
             o.only.contains(&group)
         };
