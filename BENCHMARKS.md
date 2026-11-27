@@ -147,3 +147,8 @@ The [mixed-frame measurements](docs/mixed-frame-latency.md) cover 120
 generated frames, 32 MiB streamed per frame, compute, graphics, pipeline
 creation bursts, rendered-byte validation, latency tails and sampled
 residency. They include separate cold and warm single-request controls.
+
+## CPU streaming
+
+See the [CPU streaming report](docs/cpu-streaming.md) for the Windows remap
+and texture-backlog results, diagnostics controls and NVIDIA regression run.

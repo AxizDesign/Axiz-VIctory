@@ -95,3 +95,17 @@ uses no newly imported fork implementation.
   is requested and check direct fence completion before publishing results.
   Neither the observed device hang nor the preceding over-limit descriptor
   access has been reproduced with the generated workloads.
+
+## CPU streaming
+
+- Original Axiz change `419adcd2` bounds texture selection and combines
+  selection with the queue census. It preserves the existing service order.
+- `5d7cacd6` adapts the section commit and placeholder reuse in
+  `49d71266b25f8d432cfc86ec3d27c304a5191e66` (Belobug and Cool Fox,
+  `local <local@localhost>`, GPL-3.0-or-later).
+- The same commit incorporates remap instrumentation from fxceless
+  `d8986cd7b8392f85478f5675933c59712519e163` and the diagnostic walk cadence
+  from Belobug `fb28d49e959359cb20992e5c5533a647cb408054`
+  (`local <local@localhost>`). Both components are GPL-3.0-or-later.
+- The [CPU streaming report](docs/cpu-streaming.md) records the benchmarks,
+  exact baseline, imported code and remaining profiling gaps.
